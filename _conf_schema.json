@@ -69,7 +69,7 @@
     "description": "检索执行模式",
     "type": "string",
     "options": ["basic", "auto", "rerank"],
-    "hint": "basic=本地；auto=有 Rerank 就用，失败回退；rerank=强制尝试 Rerank。",
+    "hint": "basic=本地关键词；auto=有 Rerank 就用（推荐先配 Rerank），失败回退本地；rerank=强制尝试。Embedding 是另一路补充，默认关，live 到 2500 才自动用。",
     "default": "auto"
   },
   "embedding_enabled": {
@@ -94,7 +94,7 @@
   "rerank_provider_id": {
     "description": "Rerank 提供商",
     "type": "string",
-    "hint": "留空则使用当前可用的第一个 Rerank Provider。",
+    "hint": "留空则使用当前可用的第一个 Rerank Provider。有预算时优先配这一项，通常比 Embedding 更能提升召回。",
     "default": "",
     "_special": "select_provider"
   },

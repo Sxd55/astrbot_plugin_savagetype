@@ -12,6 +12,7 @@ from .archive import (
     backup_db,
     compact_summarized_timeline,
     expire_persona_drafts,
+    expire_status_facts,
     fold_preference_slots,
     import_jsonl,
     import_transcript_events,
@@ -477,6 +478,7 @@ class SavageTypeService:
             )
             merged += 1
         folded = fold_preference_slots(self.store)
+        expired_status = expire_status_facts(self.store)
         retain_days = int(self.config.get("sleep_timeline_retain_days") or 30)
         compacted = compact_summarized_timeline(self.store, retain_days=retain_days)
         archived = archive_low_value(
@@ -492,6 +494,7 @@ class SavageTypeService:
         result = {
             "merged_duplicates": merged,
             "folded_preferences": folded,
+            "expired_status": expired_status,
             "compacted_timeline": compacted,
             "archived_low_value": archived,
             "expired_persona_drafts": expired,

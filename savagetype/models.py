@@ -49,6 +49,8 @@ class Fact:
     reason: str = ""
     persona_id: str = ""
     slot_key_value: str = ""
+    expires_at: int = 0
+    write_op: str = ""
 
     def slot_key(self) -> str:
         from .slots import canonical_attribute, canonical_subject

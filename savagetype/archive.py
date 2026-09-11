@@ -280,6 +280,19 @@ def archive_low_value(store: Store, min_age_days: int = 30, max_confidence: floa
     return n
 
 
+def expire_status_facts(store: Store, limit: int = 200) -> int:
+    now = now_ts()
+    rows = store.query(
+        "SELECT id FROM facts WHERE status='live' AND expires_at>0 AND expires_at<? ORDER BY expires_at ASC LIMIT ?",
+        (now, limit),
+    )
+    n = 0
+    for row in rows:
+        store.update_fact(int(row["id"]), status="archived", reason="status_ttl_expired")
+        n += 1
+    return n
+
+
 def _topic_key(text: str) -> str:
     from .util import normalize_slot
 

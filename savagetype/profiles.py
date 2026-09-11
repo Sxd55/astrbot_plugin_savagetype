@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .models import Fact
-from .util import clip, normalize_slot
+from .util import clip, normalize_slot, now_ts
 
 
 ATTR_LABELS = {
@@ -28,6 +28,8 @@ def build_profile(speaker_id: str, facts: list[Fact], speaker_name: str = "") ->
     name = speaker_name
     for fact in facts:
         if fact.speaker_id != sid or fact.status != "live":
+            continue
+        if getattr(fact, "expires_at", 0) and fact.expires_at > 0 and fact.expires_at < now_ts():
             continue
         if not name:
             name = fact.speaker_name or sid

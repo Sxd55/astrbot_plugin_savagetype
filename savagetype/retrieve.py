@@ -312,6 +312,8 @@ class Retriever:
     ) -> str:
         if fact.status != "live":
             return "not_live"
+        if getattr(fact, "expires_at", 0) and fact.expires_at > 0 and fact.expires_at < now_ts():
+            return "expired"
         if persona_id and fact.persona_id and fact.persona_id != persona_id:
             return "other_persona"
         ids = set(speaker_ids or [speaker_id]) | {"", "bot_self"}

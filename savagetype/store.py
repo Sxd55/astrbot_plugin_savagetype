@@ -126,6 +126,10 @@ class Store:
             self.execute("ALTER TABLE facts ADD COLUMN persona_id TEXT NOT NULL DEFAULT ''")
         if "slot_key" not in fact_cols:
             self.execute("ALTER TABLE facts ADD COLUMN slot_key TEXT NOT NULL DEFAULT ''")
+        if "expires_at" not in fact_cols:
+            self.execute("ALTER TABLE facts ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0")
+        if "write_op" not in fact_cols:
+            self.execute("ALTER TABLE facts ADD COLUMN write_op TEXT NOT NULL DEFAULT ''")
         tl_cols = self._table_cols("timeline")
         if "persona_id" not in tl_cols:
             self.execute("ALTER TABLE timeline ADD COLUMN persona_id TEXT NOT NULL DEFAULT ''")
@@ -321,8 +325,8 @@ class Store:
                 subject, attribute, value, content, speaker_id, speaker_name, bot_id, window_tag,
                 status, confidence, evidence, mention_policy, first_person, explicit_correction,
                 source, created_at, updated_at, superseded_by, supersedes, fingerprint, embedding,
-                access_count, last_accessed, reason, persona_id, slot_key
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                access_count, last_accessed, reason, persona_id, slot_key, expires_at, write_op
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 payload["subject"],
                 payload["attribute"],
@@ -350,6 +354,8 @@ class Store:
                 payload.get("reason", ""),
                 persona_id,
                 slot_key,
+                int(payload.get("expires_at", 0) or 0),
+                str(payload.get("write_op") or ""),
             ),
         )
         if bump:
@@ -873,4 +879,6 @@ class Store:
             reason=row["reason"] or "",
             persona_id=row["persona_id"] if "persona_id" in keys else "",
             slot_key_value=row["slot_key"] if "slot_key" in keys else "",
+            expires_at=int(row["expires_at"] or 0) if "expires_at" in keys else 0,
+            write_op=row["write_op"] if "write_op" in keys else "",
         )

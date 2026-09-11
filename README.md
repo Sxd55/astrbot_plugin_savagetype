@@ -2,7 +2,7 @@
 
 Savage Type 是面向 AstrBot 的全局人格记忆中枢。Savage 只是插件名。身份和语气永远读 AstrBot 当前人格；本插件只负责记住事实、处理改口、在需要时把少量相关记忆注入本轮对话。不改写人格文件，不做日程和主动陪伴。
 
-当前版本 `v2.6.0`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
+当前版本 `v2.7.0`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
 
 要求 AstrBot `>= 4.22.0`。
 
@@ -16,7 +16,7 @@ Savage Type 是面向 AstrBot 的全局人格记忆中枢。Savage 只是插件�
 
 1. 用户说话、Bot 回复进入时间线。原文不当长期记忆。
 2. 未总结条数达到阈值（默认 8）后自动抽取；也可在面板点「抽取事实」立刻抽。启发式能抓住「我喜欢 / 不喜欢 / 叫我」；配了总结模型时额外走 LLM。
-3. 抽出来的是 live 事实。同一人格、同一说话人、同一规范化槽（例如喜欢/口味都算 likes）发生冲突时：新的生效，旧的直接删除。高证据旧事实被单次非纠正说法挑战时，先进「待确认覆盖」。玩笑、转述、不确定不会覆盖。
+3. 抽出来的是 live 事实。同一人格、同一说话人、同一规范化槽发生冲突时：新的生效，旧的直接删除。高证据旧事实被单次非纠正说法挑战时，先进「待确认覆盖」。玩笑、转述、不确定不会覆盖。短暂状态（加班、感冒）带 TTL，过期后不再注入；约定说「做完了」会 close 归档。
 4. 下一轮 LLM 请求前，按当前这句话检索，把核心事实、本轮相关、必要时的黑话释义 / 表达样本 / 人格草稿打成临时记忆包注入。低信息消息（嗯、好、哈哈哈）几乎不召回。
 5. 注入包走 `req.extra_user_content_parts`，并 `mark_as_temp()`，不改 `system_prompt`，避免打爆前缀缓存。超预算时核心事实按行尽量塞，黑话 / few-shot / 草稿整块丢，不从中间截标签。
 
@@ -67,9 +67,11 @@ AstrBot WebUI → 插件 → Savage Type → 拓展页。常用能力都做成�
 
 设置里的「记忆白名单」。留空不限制。填写群号或 QQ，逗号分隔后，只有名单内的群聊 / 私聊会采集和注入。
 
-## Embedding
+## 检索：先 Rerank，Embedding 后上
 
-默认关。可手开。live 事实达到 2500（`embedding_auto_threshold`，0=从不自动）时自动用向量补充召回，但不会改掉配置开关。没有 Embedding Provider 只提示、不强开。Rerank 在检索模式 `auto` 下有 Provider 才用。
+检索模式默认 `auto`：有 Rerank Provider 就用，失败回退本地关键词。有预算时**先配 Rerank**，通常比 Embedding 更能提升召回。
+
+Embedding 默认关。可手开。live 事实达到 2500（`embedding_auto_threshold`，0=从不自动）时自动用向量补充召回，但不会改掉配置开关。没有 Embedding Provider 只提示、不强开。
 
 ## 命令（管理员部分需要管理员）
 

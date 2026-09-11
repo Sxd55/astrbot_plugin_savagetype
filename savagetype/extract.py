@@ -9,15 +9,18 @@ from .contradiction import ContradictionEngine, looks_correction, looks_first_pe
 from .models import TimelineEvent
 from .slots import apply_slot
 from .store import Store
-from .util import DIRECTIVE_RE, FIRST_PERSON_RE, PREF_PATTERNS, REMEMBER_RE, clip, fingerprint, now_ts, safe_json_extract
+from .util import CLOSE_RE, DIRECTIVE_RE, FIRST_PERSON_RE, PREF_PATTERNS, REMEMBER_RE, STATUS_NOW_RE, clip, fingerprint, now_ts, safe_json_extract
 
 EXTRACT_PROMPT = """你是记忆整理器。只从对话里抽取稳定事实，不要文风、不要黑话、不要新人格。
 输出 JSON 数组，每项字段：
-subject, attribute, value, content, confidence(0-1), first_person(bool), explicit_correction(bool), mention_policy(mention|tone|uncertain)
+subject, attribute, value, content, confidence(0-1), first_person(bool), explicit_correction(bool), mention_policy(mention|tone|uncertain), write_op(create|update|close|ignore), ttl_seconds
 规则：
-- attribute 只能是：likes, dislikes, name, identity, habit, promise, note
+- attribute 只能是：likes, dislikes, name, identity, habit, promise, note, status
 - 「不喜欢/不再喜欢 X」必须写成 attribute=likes、value 以「不」开头（例如 不hiphop）。不要用 dislikes，也不要另写 note。
 - dislikes 只用于讨厌、受不了、生理反感，不是「不喜欢」。
+- status 只用于短暂当前状态（加班、感冒、这周很忙），必须带 ttl_seconds（默认 259200=3天）。
+- write_op=close：用户说约定/未完成事项已经做完或取消，用来归档已有 promise/habit，不要新建。
+- write_op=ignore：玩笑、一次性情绪、不够格记住。
 - subject：当前说话人自己的事实用 self；Bot 自己用 bot；其他人用稳定名字。
 - 只记当前说话人用第一人称明确说出的关于自己的偏好、称呼、约定、身份、习惯、纠正。
 - 必须带「我/俺/咱」这类自述，或「记住/记下来」这类指示。闲聊、别人的事、转述不要记。
@@ -101,8 +104,35 @@ class Extractor:
                 )
                 if looks_correction(text):
                     payload["explicit_correction"] = 1
+                if attr == "status":
+                    payload["ttl_seconds"] = 3 * 86400
+                    payload["write_op"] = "create"
                 out.append(payload)
                 break
+            if CLOSE_RE.search(text):
+                payload = self._payload(
+                    ev,
+                    subject="self",
+                    attribute="promise",
+                    value=clip(text, 40),
+                    content=clip(text, 120),
+                    confidence=0.8,
+                )
+                payload["write_op"] = "close"
+                payload["explicit_correction"] = 1
+                out.append(payload)
+            elif STATUS_NOW_RE.search(text) and FIRST_PERSON_RE.search(text):
+                payload = self._payload(
+                    ev,
+                    subject="self",
+                    attribute="status",
+                    value=clip(STATUS_NOW_RE.search(text).group(0), 40),
+                    content=clip(text, 120),
+                    confidence=0.7,
+                )
+                payload["ttl_seconds"] = 3 * 86400
+                payload["write_op"] = "create"
+                out.append(payload)
         return out
 
     async def extract_llm(self, events: list[TimelineEvent]) -> list[dict[str, Any]]:
@@ -148,6 +178,8 @@ class Extractor:
                         "evidence": evidence_ids[:6],
                         "source": "llm",
                         "persona_id": getattr(speaker, "persona_id", "") or "",
+                        "write_op": str(item.get("write_op") or "create"),
+                        "ttl_seconds": int(item.get("ttl_seconds") or 0),
                     },
                 )
             )

@@ -81,8 +81,21 @@ class ContradictionEngine:
         explicit = bool(payload.get("explicit_correction")) or looks_correction(source_text)
         payload["first_person"] = int(first_person)
         payload["explicit_correction"] = int(explicit)
+        op = str(payload.get("write_op") or "create").strip().lower()
+        if op not in {"create", "update", "close", "ignore"}:
+            op = "create"
+        payload["write_op"] = op
+        if payload.get("attribute") == "status" and not int(payload.get("expires_at") or 0):
+            payload["expires_at"] = now_ts() + int(payload.get("ttl_seconds") or 3 * 86400)
+
+        if op == "ignore":
+            return {"action": "ignored", "reason": payload.get("reason") or "extractor_ignore"}
 
         if looks_like_joke(source_text) and not explicit:
+            payload["status"] = STATUS_PENDING
+            payload["reason"] = "joke_or_banter"
+            pending_id = self.store.add_pending(0, payload, "joke_or_banter")
+            return {"action": "ignored_joke", "pending_id": pending_id}
             payload["status"] = STATUS_PENDING
             payload["reason"] = "joke_or_banter"
             pending_id = self.store.add_pending(0, payload, "joke_or_banter")
@@ -103,8 +116,19 @@ class ContradictionEngine:
             speaker_ids=self.store.speaker_ids_for(str(payload.get("speaker_id") or "")),
         )
         if existing is None:
+            if op == "close":
+                return {"action": "ignored", "reason": "close_without_existing"}
             fact_id = self.store.add_fact(payload)
             return {"action": "insert", "fact_id": fact_id}
+
+        if op == "close":
+            self.store.update_fact(
+                existing.id,
+                status="archived",
+                reason=payload.get("reason") or "closed",
+                write_op="close",
+            )
+            return {"action": "closed", "fact_id": existing.id}
 
         if not values_conflict(existing.value, payload["value"]):
             merged = self._merge_same(existing, payload)

@@ -652,6 +652,31 @@ class CoreTest(unittest.TestCase):
         other = build_profile("u2", facts)
         self.assertFalse(other["lines"])
 
+    def test_status_ttl_and_close_ignore(self):
+        from savagetype.archive import expire_status_facts
+        from savagetype.util import now_ts
+
+        r = self.engine.ingest(
+            _payload(attribute="status", value="加班", content="我这周加班", ttl_seconds=60),
+            "我这周加班",
+        )
+        self.assertEqual(r["action"], "insert")
+        fact = self.store.get_fact(r["fact_id"])
+        self.assertGreater(fact.expires_at, now_ts())
+        self.store.update_fact(fact.id, expires_at=now_ts() - 10)
+        self.assertEqual(expire_status_facts(self.store), 1)
+        self.assertEqual(self.store.get_fact(fact.id).status, "archived")
+
+        p = self.engine.ingest(_payload(attribute="promise", value="寄快递", content="记住我要寄快递"), "记住我要寄快递")
+        closed = self.engine.ingest(
+            _payload(attribute="promise", value="寄快递", content="快递做完了", write_op="close"),
+            "快递做完了",
+        )
+        self.assertEqual(closed["action"], "closed")
+        self.assertEqual(self.store.get_fact(p["fact_id"]).status, "archived")
+        ignored = self.engine.ingest(_payload(value="x", content="哈哈", write_op="ignore"), "哈哈")
+        self.assertEqual(ignored["action"], "ignored")
+
 
 if __name__ == "__main__":
     unittest.main()
