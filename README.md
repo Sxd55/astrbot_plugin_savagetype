@@ -1,100 +1,131 @@
 # astrbot_plugin_savagetype
 
-Savage Type 是面向 AstrBot 的**全局人格记忆中枢**。Savage 只是插件名。身份和语气永远读 AstrBot 当前人格；本插件只负责记住事实、处理改口、在需要时把少量相关记忆注入本轮对话。
+Savage Type 是面向 AstrBot 的全局人格记忆中枢。Savage 只是插件名。身份和语气永远读 AstrBot 当前人格；本插件只负责记住事实、处理改口、在需要时把少量相关记忆注入本轮对话。不改写人格文件，不做日程和主动陪伴。
 
 当前版本 `v2.5.2`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
 
 要求 AstrBot `>= 4.22.0`。
 
-## 它做什么
+## 它解决什么问题
 
-- 用户消息和 Bot 回复进入时间线，原文不当长期记忆。
-- 时间线达到阈值后抽取稳定事实（启发式始终可用；配置了总结模型时额外走 LLM）。
-- 同一说话人、同一规范化槽（`persona` + 说话人 + subject + attribute）冲突时：**新的 live，旧的 superseded 归档**，可回滚。不硬删除。`口味/喜欢` 会撞在同一槽上。
-- 事实绑定当前 AstrBot 人格，换人格不会把上一套补丁层带过去。
-- 全局一份库，检索默认偏向当前说话人（含别名）。只有当前问题明显点到别人的名字时才拉那个人的条目。
-- 注入走 `req.extra_user_content_parts`，并 `mark_as_temp()`，不改 `system_prompt`。包装说明已压短。低信息消息几乎不召回；普通闲聊也可能带一条改口摘要。
-- 检索：本地关键词 + 可选 Embedding + 可选 Rerank（`basic` / `auto` / `rerank`）。
-- 检测到 `memory_companion` / LivingMemory 时跳过重叠的采集或注入；检测到 `self_learning` 时跳过黑话/few-shot/人格草稿，只保留事实层。
-- v2 学习面：黑话释义、真实 user→bot few-shot、人格增量草稿，一律进审查队列，批准后才注入。
-- v2.2：聊天记录文本导入、JSONL 换机导入（导入前自动备份、指纹去重）、睡眠维护会压缩已总结时间线、归档低价值事实、过期人格草稿。
-- v2.3：同名说话人归并建议（不自动合并）、审查项带质量分、LLM 真实 Token 入账、`savagetype_navigate` 最多 3 步多跳召回。
+对话记录不等于记忆。本插件把消息先写入时间线，再抽成稳定事实；主链请求前只注入本轮真正相关的一小包资料。当前用户消息始终是主任务，记忆只是辅助。
 
-## v2 学习面
+一条记忆会带说话人 QQ / 平台 id、昵称、人格 id。检索默认偏向当前说话人；只有问题里明显点到别人的名字时才拉那个人的条目。私聊和群聊共用一份库，用白名单控制哪些窗口会采集和注入。
 
-- 黑话：停用词、命令、URL 先丢掉，再按次数问模型；普通词释义直接丢。注入整词匹配，`yy` 不会撞 `yyds`。每轮最多 3 条。驳回过的词默认不再提审。
-- few-shot：同一说话人、约 90 秒内的邻接对；命令/工具回执丢掉；近重指纹合并。批准后每轮最多 2 条，句式打散。
-- 人格草稿：冷却写入数据库；对照当前人格摘要，身份句或和人设重复度过高则丢。已批准草稿默认 14 天有效。**不写回** AstrBot 人格文件。
-- 注入超预算时整块丢弃（核心事实按行尽量塞，黑话 / few-shot / 草稿整块丢），不再从中间截断标签。
-- 人格草稿会读当前 AstrBot 人格正文做对照；few-shot 要求同一窗口、同一说话人回合。
-- 驳回的黑话会从统计表清掉，避免反复提审。
+## 数据怎么流动
 
-## 矛盾覆盖护栏
+1. 用户说话、Bot 回复进入时间线。原文不当长期记忆。
+2. 未总结条数达到阈值（默认 8）后自动抽取；也可在面板点「抽取事实」立刻抽。启发式能抓住「我喜欢 / 不喜欢 / 叫我」；配了总结模型时额外走 LLM。
+3. 抽出来的是 live 事实。同一人格、同一说话人、同一规范化槽（例如喜欢/口味都算 likes）发生冲突时：新的生效，旧的直接删除。高证据旧事实被单次非纠正说法挑战时，先进「待确认覆盖」。玩笑、转述、不确定不会覆盖。
+4. 下一轮 LLM 请求前，按当前这句话检索，把核心事实、本轮相关、必要时的黑话释义 / 表达样本 / 人格草稿打成临时记忆包注入。低信息消息（嗯、好、哈哈哈）几乎不召回。
+5. 注入包走 `req.extra_user_content_parts`，并 `mark_as_temp()`，不改 `system_prompt`，避免打爆前缀缓存。超预算时核心事实按行尽量塞，黑话 / few-shot / 草稿整块丢，不从中间截标签。
 
-冲突槽是「同一人格 + 说话人（含别名）+ 规范化 subject + 规范化 attribute」。例如 `用户/口味` 与 `self/likes` 视为同一槽。
+数据目录：`AstrBot/data/plugin_data/astrbot_plugin_savagetype/`。更新插件不会覆盖这个库。
 
-- 本人自述或明确纠正 → 新事实立刻生效，旧条目标 `superseded`。
-- 玩笑/反话、转述、不确定 → 不覆盖；转述最多写成 uncertain。
-- 高置信且已被用过的旧事实，被单次非纠正说法挑战 → 进待确认，不立刻换。
-- 主链只读 `live`。用户提起旧说法时，注入里可带一条改口摘要。
+## 面板（推荐日常都用这里）
 
-## 安装
+AstrBot WebUI → 插件 → Savage Type → 拓展页。常用能力都做成按钮，不必打 `/stype`。
 
-把本目录放到 AstrBot 插件目录，目录名保持：
+工作台顶栏：
 
-```text
-astrbot_plugin_savagetype
-```
+- 刷新：重新加载计数、列表、注入快照。
+- 抽取事实：立刻把未总结时间线压成事实，不等满 8 条。
+- 维护：睡眠整理。合并同一槽重复、把旧的 likes/dislikes/note 折进同一条、压缩过期已总结时间线、归档低价值事实、过期人格草稿。
+- 跑一轮学习：从对话里挖黑话候选、user→bot 样本、人格草稿，全部进审查队列，批准后才注入。
+- 导出 JSONL：下载可移植档案（不含向量索引和 Provider 凭据）。浏览器会弹出保存。
 
-常见位置：`AstrBot/data/plugins/astrbot_plugin_savagetype`
+工作台分区：
 
-数据在 `data/plugin_data/astrbot_plugin_savagetype/`，更新插件不会覆盖库。
+- 记忆显微镜：看、搜、删、手动写入都在这里。每条显示昵称和 QQ。可单条删除或勾选批量删除（归档，不硬抹）。写入时可从已有 QQ 下拉，或手填 id。
+- 学习审查：黑话释义、few-shot、人格草稿的待办。批准后才进主链；驳回后同一指纹默认不再入队。和「待确认覆盖」不是一回事。
+- 待确认覆盖：高证据旧事实被新说法挑战时，在这里确认换还是驳回。
+- 说话人归并：同名不同 QQ 的建议。不会自动合并，要点「映射」。
+- 注入显微镜：最近几轮主链实际注入了什么（路由、QQ、字数、过滤原因）。用来排障，不是学习审查。
+- 聊天导入：把导出的聊天文本或 JSONL 预览后导入。路径默认插件数据目录。
+- 诊断：最近一次接口返回的 JSON，可滚动。排障时看这里。
+- 设置：字段与 AstrBot 插件配置页相同。保存后立刻写回配置文件。
 
-## 命令
+点按钮后屏幕中间会出短暂提示。AstrBot 拓展页在 iframe 里，删除不再弹系统确认框（会被拦，看起来像失败）。
 
-主入口 `/stype`（管理员抽取指令另需管理员权限）：
+## 学习审查是什么
+
+事实会自动写。审查管的是「怎么说」：
+
+- 黑话释义：高频词的含义。只在用户这句话里真出现该词时注入，只解释、不教 Bot 复读。
+- few-shot：真实的「用户一句 → Bot 一句」。批准后当接话参考，不逐字照搬。
+- 人格草稿：根据已批准样本写的不超过 80 字补丁。不写回 AstrBot 人格文件，只当本轮语气提示。默认一天最多生成一次，批准后约 14 天有效。
+
+## 三个后台动作
+
+抽取事实：时间线 → 稳定事实。自动有防抖（默认 45 秒）和失败冷却（默认 180 秒）。LLM 抽取失败不会把时间线标成已总结。
+
+维护：库的打扫。live 多了、改口留下多条重复时点它。
+
+跑一轮学习：只生产审查草稿，不直接改人格、不直接注入。
+
+## 白名单
+
+设置里的「记忆白名单」。留空不限制。填写群号或 QQ，逗号分隔后，只有名单内的群聊 / 私聊会采集和注入。
+
+## Embedding
+
+默认关。可手开。live 事实达到 2500（`embedding_auto_threshold`，0=从不自动）时自动用向量补充召回，但不会改掉配置开关。没有 Embedding Provider 只提示、不强开。Rerank 在检索模式 `auto` 下有 Provider 才用。
+
+## 命令（管理员部分需要管理员）
+
+主入口 `/stype`。
 
 | 命令 | 说明 |
 | --- | --- |
-| `/stype status` | 库规模、采集/注入是否因共存降级 |
-| `/stype search <关键词> [k]` | 当前说话人可见 live 事实 |
+| `/stype status` | 时间线、live 数量、采集/注入是否开启 |
+| `/stype search <关键词>` | 当前说话人可见 live 事实 |
 | `/stype explain <关键词>` | 召回路由、命中和过滤原因 |
-| `/stype add <内容>` | 手动写入 |
+| `/stype add <内容>` | 手动写入（说话人是当前聊天对象） |
 | `/stype recent [n]` | 最近时间线 |
-| `/stype supersede <pending_id>` | 确认待覆盖 |
-| `/stype rollback <fact_id>` | 回滚当前 live，恢复被覆盖的旧事实 |
-| `/stype diagnostics` | 诊断快照 |
-| `/stype extract` | 立刻抽取（管理员，绕过防抖） |
-| `/stype alias <旧id> <主id>` | 说话人归并（管理员） |
-| `/stype aliases` | 已映射别名 + 同名建议（管理员） |
-| `/stype reviews [kind]` | 待审学习项（jargon / fewshot / persona） |
+| `/stype extract` | 立刻抽取 |
+| `/stype sleep` | 维护 |
+| `/stype learn` | 跑一轮学习 |
+| `/stype reviews [kind]` | 待审学习项 |
 | `/stype approve <id>` | 批准学习草稿 |
 | `/stype reject <id>` | 驳回学习草稿 |
-| `/stype learn` | 立刻跑一轮学习（管理员） |
-| `/stype export` | 导出 JSONL 到插件数据目录 |
-| `/stype import 预览 <路径>` | 预览 JSONL 档案 |
-| `/stype import 确认 <路径>` | 备份当前库后导入 JSONL |
-| `/stype sleep` | 睡眠维护（管理员） |
 | `/stype microscope [n]` | 最近注入快照 |
+| `/stype export` | 导出 JSONL 到数据目录 |
+| `/stype import 预览\|确认 <路径>` | 预览或导入 JSONL（确认前会备份当前库） |
+| `/stype alias <旧id> <主id>` | 说话人归并 |
+| `/stype aliases` | 已映射别名 + 同名建议 |
+| `/stype diagnostics` | 诊断快照 |
 
-LLM 工具：`savagetype_recall`、`savagetype_remember`、`savagetype_navigate`。只有 remember 返回 `ok=true` 才允许嘴上说「记住了」。navigate 默认最多 3 步、每步 6 条。
+LLM 工具：`savagetype_recall` 检索，`savagetype_remember` 写入（只有返回 `ok=true` 才算记住），`savagetype_navigate` 多跳召回（最多 3 步、每步 6 条）。模型打开插件页不等于已经写入，要以工具返回或面板 live 列表为准。
 
-## 配置要点
+## 共存
 
-- 总结模型、Embedding、Rerank 都可以留空：抽取回退当前聊天模型；Embedding 默认关；live 事实达到 2500（可改 `embedding_auto_threshold`）时自动启用向量检索，但不会改掉配置里的开关。没有 Embedding Provider 只提示、不强开。Rerank 在 `auto` 下有 Provider 才用。
-- 注入预算默认 800 字。
-- 自动抽取有防抖（默认 45 秒）和失败冷却（默认 180 秒）。LLM 抽取失败时不把时间线标成已总结。
-- `savagetype_remember` 不再默认当成「明确纠正」，高证据旧事实仍会进待确认。
-- `debug_log_injection` 仅排障时打开。注入快照默认写入诊断库，面板「注入显微镜」和 `/stype microscope` 可查；该开关只控制是否打日志。总览里有用量账本（抽取/嵌入/重排次数）。
-- `learning_enabled` 默认开。可单独关黑话 / few-shot / 人格草稿。面板「学习审查」里批准或驳回。
-- 聊天导入只接受粘贴/文件文本，不调用 QQ 接口。面板「备份 / 导入」可预览后再确认。
-- 睡眠维护默认保留 30 天已总结时间线；低置信且很少被访问的事实会归档而不是删除。
+检测到 `memory_companion` / LivingMemory 时跳过重叠的采集或注入。检测到 `self_learning` 时跳过黑话 / few-shot / 人格草稿，只保留事实层。目录里有插件文件不等于 AstrBot 当前启用了它。
+
+## 安装
+
+目录名保持 `astrbot_plugin_savagetype`。可从 GitHub 安装：
+
+https://github.com/Sxd55/astrbot_plugin_savagetype
+
+或拷到 `AstrBot/data/plugins/astrbot_plugin_savagetype` 后重载。
+
+封面图：`_logo.webp`（市场卡片）和 `pages/console/_logo.webp`（拓展页左上角）。
+
+## 离线测试
+
+```text
+python tests/test_core.py -v
+```
+
+只需 Python 3.11+ 标准库。
 
 ## 灵感与边界
 
-- 记忆分层、Embedding/Rerank、分槽召回：参考 [astrbot_plugin_memory_companion](https://github.com/menglimi/astrbot_plugin_memory_companion)
-- 陪伴体系分工（人格状态 vs 长期记忆）：参考 [astrbot_plugin_private_companion](https://github.com/menglimi/astrbot_plugin_private_companion)
-- 稳定层缓存、动态包进用户消息、不回灌历史：参考 [lily](https://github.com/mcxxiu/lily)
-- 学习闭环与审查意识：参考 [astrbot_plugin_self_learning](https://github.com/NickCharlie/astrbot_plugin_self_learning) 的产品思路，**未使用其代码**（该项目为 AGPL-3.0）
+- 记忆分层、Embedding/Rerank、分槽召回：参考 [astrbot_plugin_memory_companion](https://github.com/menglimi/astrbot_plugin_memory_companion) 的产品分工，没有克隆其权限拓扑和陪伴功能。
+- 人格状态 vs 长期记忆：参考 [astrbot_plugin_private_companion](https://github.com/menglimi/astrbot_plugin_private_companion)。本插件不做日程和主动消息。
+- 省 token：参考 [lily](https://github.com/mcxxiu/lily)。动态记忆进用户消息附加块并标临时，不改 system_prompt，不回灌整段历史。
+- 学习审查：参考 [astrbot_plugin_self_learning](https://github.com/NickCharlie/astrbot_plugin_self_learning) 的「先审后用」，未使用其代码（AGPL-3.0）。
 
 AstrBot 插件开发文档：https://docs.astrbot.app/dev/star/plugin-new.html
+
+明确不做：好感/情绪数值、日程与主动陪伴、把草稿写回人格文件、私聊/群聊 ACL 拓扑。
