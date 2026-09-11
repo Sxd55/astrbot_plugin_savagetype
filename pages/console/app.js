@@ -1,5 +1,51 @@
-const bridge = window.AstrBotPluginPage;
 const $ = (id) => document.getElementById(id);
+
+function pluginBase() {
+  const path = window.location.pathname.replace(/\/+$/, "");
+  if (path.endsWith("/console") || path.endsWith("/console/index.html")) {
+    return path.replace(/\/console(?:\/index\.html)?$/, "");
+  }
+  return path;
+}
+
+async function apiGet(route, query = {}) {
+  if (window.AstrBotPluginPage?.apiGet) {
+    return window.AstrBotPluginPage.apiGet(route, query);
+  }
+  const params = new URLSearchParams(query).toString();
+  const url = `${pluginBase()}/${route}${params ? `?${params}` : ""}`;
+  const res = await fetch(url);
+  return res.json();
+}
+
+async function apiPost(route, body = {}) {
+  if (window.AstrBotPluginPage?.apiPost) {
+    return window.AstrBotPluginPage.apiPost(route, body);
+  }
+  const res = await fetch(`${pluginBase()}/${route}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return res.json();
+}
+
+function showError(err) {
+  const box = $("diag");
+  if (box) box.textContent = String(err && err.stack ? err.stack : err);
+  console.error(err);
+}
+
+async function run(label, fn) {
+  try {
+    const r = await fn();
+    if (r !== undefined) $("diag").textContent = JSON.stringify(r, null, 2);
+    return r;
+  } catch (err) {
+    showError(`${label} 失败: ${err}`);
+    return null;
+  }
+}
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => (
@@ -30,24 +76,24 @@ function factItem(f, extra = "", withCheck = false) {
     <div class="lede">QQ/id ${esc(f.speaker_id || "")} · 槽 ${esc(f.slot_key || f.attribute)}</div>
     ${extra}
     <div class="row">
-      <button class="ghost" data-del="${esc(f.id)}">删除此条</button>
+      <button class="ghost" type="button" data-del="${esc(f.id)}">删除此条</button>
     </div>
   </div>`;
 }
 
 function bindDeletes(root) {
   root.querySelectorAll("[data-del]").forEach((btn) => {
-    btn.onclick = async () => {
-      if (!confirm(`归档 #${btn.dataset.del}？不硬删除，可回滚。`)) return;
-      const r = await bridge.apiPost("facts/archive", { ids: [Number(btn.dataset.del)] });
-      $("diag").textContent = JSON.stringify(r, null, 2);
+    btn.onclick = () => run("删除", async () => {
+      if (!confirm(`归档 #${btn.dataset.del}？不硬删除，可回滚。`)) return { ok: false, error: "cancelled" };
+      const r = await apiPost("facts/archive", { ids: [Number(btn.dataset.del)] });
       await reload();
-    };
+      return r;
+    });
   });
 }
 
 async function loadOverview() {
-  const ov = await bridge.apiGet("overview");
+  const ov = await apiGet("overview");
   const c = ov.counts || {};
   $("kpis").innerHTML = [
     ["时间线", c.timeline],
@@ -69,21 +115,21 @@ async function loadOverview() {
     const items = ov.alias_suggestions || [];
     box.innerHTML = items.length
       ? items.map((s) => `<div class="item">同名 ${esc(s.name)}：<code>${esc(s.alias)}</code> → <code>${esc(s.canonical_id)}</code>
-          <button data-alias="${esc(s.alias)}" data-canonical="${esc(s.canonical_id)}">映射</button></div>`).join("")
+          <button type="button" data-alias="${esc(s.alias)}" data-canonical="${esc(s.canonical_id)}">映射</button></div>`).join("")
       : `<p class="lede">没有同名不同 id 的建议。</p>`;
     box.querySelectorAll("[data-alias]").forEach((btn) => {
-      btn.onclick = async () => {
-        await bridge.apiPost("aliases/set", { alias: btn.dataset.alias, canonical_id: btn.dataset.canonical });
+      btn.onclick = () => run("映射", async () => {
+        await apiPost("aliases/set", { alias: btn.dataset.alias, canonical_id: btn.dataset.canonical });
         await reload();
-      };
+      });
     });
   }
   $("diag").textContent = JSON.stringify({ overview: ov, usage }, null, 2);
 }
 
 async function loadFacts() {
-  const live = await bridge.apiGet("facts", { status: "live" });
-  const archived = await bridge.apiGet("facts", { status: "superseded" });
+  const live = await apiGet("facts", { status: "live" });
+  const archived = await apiGet("facts", { status: "superseded" });
   $("archived").innerHTML = (archived.items || []).slice(0, 12).map((f) =>
     factItem(f, f.superseded_by ? `<div class="lede">被 #${esc(f.superseded_by)} 覆盖</div>` : "", false)
   ).join("") || `<p class="lede">没有 superseded 记录。</p>`;
@@ -95,7 +141,7 @@ async function loadFacts() {
 }
 
 async function loadPending() {
-  const data = await bridge.apiGet("pending");
+  const data = await apiGet("pending");
   const items = data.items || [];
   if (!items.length) {
     $("pending").innerHTML = `<p class="lede">没有待确认覆盖。</p>`;
@@ -105,26 +151,26 @@ async function loadPending() {
     <div>#${esc(p.id)} ← old ${esc(p.old_fact_id)} · ${esc(p.reason)}</div>
     <div class="lede">${esc(JSON.stringify(p.new_payload))}</div>
     <div class="row">
-      <button data-confirm="${esc(p.id)}">确认覆盖</button>
-      <button class="ghost" data-reject="${esc(p.id)}">驳回</button>
+      <button type="button" data-confirm="${esc(p.id)}">确认覆盖</button>
+      <button class="ghost" type="button" data-reject="${esc(p.id)}">驳回</button>
     </div>
   </div>`).join("");
   $("pending").querySelectorAll("[data-confirm]").forEach((btn) => {
-    btn.onclick = async () => {
-      await bridge.apiPost("pending/confirm", { id: Number(btn.dataset.confirm) });
+    btn.onclick = () => run("确认覆盖", async () => {
+      await apiPost("pending/confirm", { id: Number(btn.dataset.confirm) });
       await reload();
-    };
+    });
   });
   $("pending").querySelectorAll("[data-reject]").forEach((btn) => {
-    btn.onclick = async () => {
-      await bridge.apiPost("pending/reject", { id: Number(btn.dataset.reject) });
+    btn.onclick = () => run("驳回覆盖", async () => {
+      await apiPost("pending/reject", { id: Number(btn.dataset.reject) });
       await reload();
-    };
+    });
   });
 }
 
 async function loadReviews() {
-  const data = await bridge.apiGet("reviews", { status: "pending" });
+  const data = await apiGet("reviews", { status: "pending" });
   const items = data.items || [];
   const box = $("reviews");
   if (!box) return;
@@ -140,28 +186,28 @@ async function loadReviews() {
     <div class="lede">QQ/id ${esc(r.speaker_id || "")} · ${esc(r.reason)}</div>
     <div class="lede">${esc(JSON.stringify(r.payload))}</div>
     <div class="row">
-      <button data-approve="${esc(r.id)}">批准</button>
-      <button class="ghost" data-reject-review="${esc(r.id)}">驳回</button>
+      <button type="button" data-approve="${esc(r.id)}">批准</button>
+      <button class="ghost" type="button" data-reject-review="${esc(r.id)}">驳回</button>
     </div>
   </div>`).join("");
   box.querySelectorAll("[data-approve]").forEach((btn) => {
-    btn.onclick = async () => {
-      await bridge.apiPost("reviews/set", { id: Number(btn.dataset.approve), status: "approved" });
+    btn.onclick = () => run("批准", async () => {
+      await apiPost("reviews/set", { id: Number(btn.dataset.approve), status: "approved" });
       await reload();
-    };
+    });
   });
   box.querySelectorAll("[data-reject-review]").forEach((btn) => {
-    btn.onclick = async () => {
-      await bridge.apiPost("reviews/set", { id: Number(btn.dataset.rejectReview), status: "rejected" });
+    btn.onclick = () => run("驳回学习", async () => {
+      await apiPost("reviews/set", { id: Number(btn.dataset.rejectReview), status: "rejected" });
       await reload();
-    };
+    });
   });
 }
 
 async function loadMicroscope() {
   const box = $("microscope");
   if (!box) return;
-  const data = await bridge.apiGet("microscope", { n: 8 });
+  const data = await apiGet("microscope", { n: 8 });
   const items = data.items || [];
   if (!items.length) {
     box.innerHTML = `<p class="lede">还没有注入记录。说几句让主链跑起来就会出现。</p>`;
@@ -200,7 +246,7 @@ function fieldControl(key, spec, value) {
       ${hint}</div>`;
   }
   const typ = spec.type === "int" || spec.type === "float" ? "number" : "text";
-  const step = spec.type === "float" ? "0.01" : spec.type === "int" ? "1" : undefined;
+  const step = spec.type === "float" ? "0.01" : spec.type === "int" ? "1" : "";
   const stepAttr = step ? `step="${step}"` : "";
   return `<div class="setting">${label}
     <input id="cfg-${esc(key)}" name="${esc(key)}" type="${typ}" ${stepAttr} value="${esc(value ?? "")}" />
@@ -210,7 +256,7 @@ function fieldControl(key, spec, value) {
 async function loadSettings() {
   const form = $("settings-form");
   if (!form) return;
-  const data = await bridge.apiGet("config");
+  const data = await apiGet("config");
   const schema = data.schema || {};
   const values = data.values || {};
   form.innerHTML = Object.entries(schema).map(([key, spec]) =>
@@ -243,110 +289,115 @@ function showTab(name) {
   document.querySelectorAll(".tabs button").forEach((b) => {
     b.classList.toggle("on", b.dataset.tab === name);
   });
-  if (name === "settings") loadSettings();
+  if (name === "settings") run("加载设置", loadSettings);
 }
 
-await bridge.ready();
-await reload();
+function bindUi() {
+  document.querySelectorAll(".tabs button").forEach((b) => {
+    b.onclick = () => showTab(b.dataset.tab);
+  });
+  $("refresh").onclick = () => run("刷新", reload);
+  $("extract").onclick = () => run("抽取", async () => {
+    const r = await apiPost("extract", {});
+    await reload();
+    return r;
+  });
+  $("sleep").onclick = () => run("维护", async () => {
+    const r = await apiPost("sleep", {});
+    await reload();
+    return r;
+  });
+  $("learn").onclick = () => run("学习", async () => {
+    const r = await apiPost("learn", {});
+    await reload();
+    return r;
+  });
+  $("search").onclick = () => run("检索", async () => {
+    $("hits").dataset.locked = "1";
+    const data = await apiGet("search", {
+      q: $("q").value,
+      speaker_id: $("speaker").value,
+      k: 30,
+    });
+    $("hits").innerHTML = (data.items || []).map((f) => factItem(f, "", true)).join("")
+      || `<p class="lede">没有命中。</p>`;
+    bindDeletes($("hits"));
+    return data;
+  });
+  $("batch-archive").onclick = () => run("批量删除", async () => {
+    const ids = [...$("hits").querySelectorAll(".pick:checked")].map((el) => Number(el.dataset.id));
+    if (!ids.length) return { ok: false, error: "未选择" };
+    if (!confirm(`归档 ${ids.length} 条？不硬删除。`)) return { ok: false, error: "cancelled" };
+    const r = await apiPost("facts/archive", { ids });
+    $("hits").dataset.locked = "";
+    await reload();
+    return r;
+  });
+  $("remember").onclick = () => run("记住", async () => {
+    const content = $("remember-text").value.trim();
+    if (!content) return { ok: false, error: "empty" };
+    const r = await apiPost("remember", {
+      content,
+      speaker_id: $("remember-speaker").value || "manual",
+    });
+    $("remember-text").value = "";
+    await reload();
+    return r;
+  });
+  $("rollback").onclick = () => run("回滚", async () => {
+    const id = Number($("rollback-id").value);
+    if (!id) return { ok: false, error: "missing id" };
+    const r = await apiPost("rollback", { id });
+    await reload();
+    return r;
+  });
+  $("export").onclick = () => run("导出", () => apiGet("export"));
+  $("archive-preview").onclick = () => run("预览档案", async () => {
+    const path = $("archive-path").value.trim();
+    if (!path) return { ok: false, error: "empty path" };
+    return apiPost("archive/preview", { path });
+  });
+  $("archive-import").onclick = () => run("导入档案", async () => {
+    const path = $("archive-path").value.trim();
+    if (!path) return { ok: false, error: "empty path" };
+    const r = await apiPost("archive/import", { path });
+    await reload();
+    return r;
+  });
+  $("chat-preview").onclick = () => run("预览聊天", async () => {
+    const text = $("chat-text").value.trim();
+    if (!text) return { ok: false, error: "empty" };
+    return apiPost("chat/preview", {
+      text,
+      user_names: $("chat-users").value,
+      bot_names: $("chat-bots").value,
+    });
+  });
+  $("chat-import").onclick = () => run("导入聊天", async () => {
+    const text = $("chat-text").value.trim();
+    if (!text) return { ok: false, error: "empty" };
+    const r = await apiPost("chat/import", {
+      text,
+      user_names: $("chat-users").value,
+      bot_names: $("chat-bots").value,
+    });
+    await reload();
+    return r;
+  });
+  $("settings-save").onclick = () => run("保存设置", async () => {
+    const r = await apiPost("config/save", { values: readSettings() });
+    await loadSettings();
+    await reload();
+    return r;
+  });
+}
 
-document.querySelectorAll(".tabs button").forEach((b) => {
-  b.onclick = () => showTab(b.dataset.tab);
-});
+async function boot() {
+  bindUi();
+  if (window.AstrBotPluginPage?.ready) {
+    try { await window.AstrBotPluginPage.ready(); } catch (err) { showError(err); }
+  }
+  await run("刷新", reload);
+}
 
-$("refresh").onclick = reload;
-$("extract").onclick = async () => {
-  const r = await bridge.apiPost("extract", {});
-  $("diag").textContent = JSON.stringify(r, null, 2);
-  await reload();
-};
-$("sleep").onclick = async () => {
-  const r = await bridge.apiPost("sleep", {});
-  $("diag").textContent = JSON.stringify(r, null, 2);
-  await reload();
-};
-$("learn").onclick = async () => {
-  const r = await bridge.apiPost("learn", {});
-  $("diag").textContent = JSON.stringify(r, null, 2);
-  await reload();
-};
-$("search").onclick = async () => {
-  $("hits").dataset.locked = "1";
-  const data = await bridge.apiGet("search", {
-    q: $("q").value,
-    speaker_id: $("speaker").value,
-    k: 30,
-  });
-  $("hits").innerHTML = (data.items || []).map((f) => factItem(f, "", true)).join("")
-    || `<p class="lede">没有命中。</p>`;
-  bindDeletes($("hits"));
-};
-$("batch-archive").onclick = async () => {
-  const ids = [...$("hits").querySelectorAll(".pick:checked")].map((el) => Number(el.dataset.id));
-  if (!ids.length) return;
-  if (!confirm(`归档 ${ids.length} 条？不硬删除。`)) return;
-  const r = await bridge.apiPost("facts/archive", { ids });
-  $("diag").textContent = JSON.stringify(r, null, 2);
-  $("hits").dataset.locked = "";
-  await reload();
-};
-$("remember").onclick = async () => {
-  const content = $("remember-text").value.trim();
-  if (!content) return;
-  await bridge.apiPost("remember", {
-    content,
-    speaker_id: $("remember-speaker").value || "manual",
-  });
-  $("remember-text").value = "";
-  await reload();
-};
-$("rollback").onclick = async () => {
-  const id = Number($("rollback-id").value);
-  if (!id) return;
-  const r = await bridge.apiPost("rollback", { id });
-  $("diag").textContent = JSON.stringify(r, null, 2);
-  await reload();
-};
-$("export").onclick = async () => {
-  const r = await bridge.apiGet("export");
-  $("diag").textContent = JSON.stringify(r, null, 2);
-};
-$("archive-preview").onclick = async () => {
-  const path = $("archive-path").value.trim();
-  if (!path) return;
-  const r = await bridge.apiPost("archive/preview", { path });
-  $("diag").textContent = JSON.stringify(r, null, 2);
-};
-$("archive-import").onclick = async () => {
-  const path = $("archive-path").value.trim();
-  if (!path) return;
-  const r = await bridge.apiPost("archive/import", { path });
-  $("diag").textContent = JSON.stringify(r, null, 2);
-  await reload();
-};
-$("chat-preview").onclick = async () => {
-  const text = $("chat-text").value.trim();
-  if (!text) return;
-  const r = await bridge.apiPost("chat/preview", {
-    text,
-    user_names: $("chat-users").value,
-    bot_names: $("chat-bots").value,
-  });
-  $("diag").textContent = JSON.stringify(r, null, 2);
-};
-$("chat-import").onclick = async () => {
-  const text = $("chat-text").value.trim();
-  if (!text) return;
-  const r = await bridge.apiPost("chat/import", {
-    text,
-    user_names: $("chat-users").value,
-    bot_names: $("chat-bots").value,
-  });
-  $("diag").textContent = JSON.stringify(r, null, 2);
-  await reload();
-};
-$("settings-save").onclick = async () => {
-  const r = await bridge.apiPost("config/save", { values: readSettings() });
-  $("diag").textContent = JSON.stringify(r, null, 2);
-  await loadSettings();
-  await reload();
-};
+boot();
