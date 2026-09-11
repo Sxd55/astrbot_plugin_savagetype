@@ -229,7 +229,7 @@ class SavageTypeService:
         async with self._extract_lock:
             min_messages = int(self.config.get("extract_min_messages") or 8)
             try:
-                result = await self.extractor.maybe_extract(min_messages=min_messages)
+                result = await self.extractor.maybe_extract(min_messages=min_messages, force=force)
                 self._last_extract_at = now_ts()
                 if not result.get("skipped"):
                     self.store.add_usage("extract", ok=True, detail=str(result.get("events") or 0))

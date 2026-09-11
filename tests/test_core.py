@@ -106,6 +106,7 @@ class CoreTest(unittest.TestCase):
             }
         )
         facts = self.extractor.extract_heuristic(self.store.unsummarized(limit=10))
+        self.assertFalse(any(f["attribute"] == "note" for f in facts))
         likes = [f for f in facts if f["attribute"] == "likes"]
         self.assertGreaterEqual(len(likes), 2)
         self.assertFalse(any(f["attribute"] == "dislikes" for f in facts if "hiphop" in f.get("value", "").lower() or "hiphop" in f.get("content", "").lower()))

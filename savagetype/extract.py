@@ -36,9 +36,11 @@ class Extractor:
         self.contradiction = contradiction
         self.llm = llm
 
-    async def maybe_extract(self, min_messages: int = 8) -> dict[str, Any]:
-        events = self.store.unsummarized(limit=max(min_messages, 12))
-        if len(events) < min_messages:
+    async def maybe_extract(self, min_messages: int = 8, force: bool = False) -> dict[str, Any]:
+        events = self.store.unsummarized(limit=max(min_messages, 12) if not force else 80)
+        if not events:
+            return {"ok": True, "skipped": True, "unsummarized": 0}
+        if not force and len(events) < min_messages:
             return {"ok": True, "skipped": True, "unsummarized": len(events)}
         heuristic = self.extract_heuristic(events)
         llm_facts: list[dict[str, Any]] = []
@@ -94,17 +96,6 @@ class Extractor:
                     payload["explicit_correction"] = 1
                 out.append(payload)
                 break
-            if looks_correction(text) and len(text) <= 80:
-                out.append(
-                    self._payload(
-                        ev,
-                        subject="self",
-                        attribute="note",
-                        value=clip(text, 60),
-                        content=clip(text, 120),
-                        confidence=0.8,
-                    )
-                )
         return out
 
     async def extract_llm(self, events: list[TimelineEvent]) -> list[dict[str, Any]]:
