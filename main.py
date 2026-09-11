@@ -38,7 +38,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "2.4.0",
+    "2.5.0",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -618,8 +618,8 @@ class SavageTypePlugin(Star):
         if not content:
             return error_response("missing content", status_code=400)
         speaker = {
-            "speaker_id": str(payload.get("speaker_id") or "manual"),
-            "speaker_name": str(payload.get("speaker_name") or payload.get("speaker_id") or "manual"),
+            "speaker_id": "admin",
+            "speaker_name": "admin",
             "bot_id": "",
             "window_tag": "console",
             "persona_id": str(payload.get("persona_id") or ""),
@@ -687,7 +687,13 @@ class SavageTypePlugin(Star):
     async def page_export(self):
         dest = self.data_dir / "exports" / f"savagetype-{self.store.revision()}.jsonl"
         path = self.service.export_jsonl(dest)
-        return json_response({"path": str(path)})
+        text = path.read_text(encoding="utf-8")
+        return json_response({
+            "ok": True,
+            "filename": path.name,
+            "content": text,
+            "chars": len(text),
+        })
 
     async def page_archive_preview(self):
         payload = await request.json(default={})

@@ -323,12 +323,7 @@ def fold_preference_slots(store: Store) -> int:
                     break
             if keeper is None:
                 continue
-            store.update_fact(
-                extra.id,
-                status="superseded",
-                superseded_by=keeper.id,
-                reason="sleep_fold_preference",
-            )
+            store.delete_fact(extra.id)
             folded += 1
     return folded
 

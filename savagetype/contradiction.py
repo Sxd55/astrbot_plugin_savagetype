@@ -13,7 +13,6 @@ from .util import (
     HEARSAY_RE,
     JOKE_RE,
     STATUS_PENDING,
-    STATUS_SUPERSEDED,
     fingerprint,
     make_slot_key,
     normalize_slot,
@@ -57,7 +56,7 @@ class ContradictionEngine:
         self.high_evidence = high_evidence
 
     def ingest(self, payload: dict[str, Any], source_text: str = "") -> dict[str, Any]:
-        """Write a fact with guarded override. Never hard-deletes."""
+        """Write a fact with guarded override. Conflicting live facts are deleted."""
         payload = apply_slot(dict(payload))
         payload.setdefault("status", "live")
         persona_id = str(payload.get("persona_id") or "")
@@ -143,19 +142,14 @@ class ContradictionEngine:
 
     def supersede(self, old: Fact, payload: dict[str, Any]) -> dict[str, Any]:
         payload = dict(payload)
-        payload["supersedes"] = old.id
         payload["status"] = "live"
         new_id = self.store.add_fact(payload, bump=False)
-        self.store.update_fact(
-            old.id,
-            status=STATUS_SUPERSEDED,
-            superseded_by=new_id,
-            reason=payload.get("reason") or "superseded_by_newer_fact",
-        )
+        self.store.delete_fact(old.id)
         return {
             "action": "supersede",
             "fact_id": new_id,
             "old_fact_id": old.id,
+            "deleted_old": True,
         }
 
     def confirm_pending(self, pending_id: int) -> dict[str, Any]:
@@ -178,23 +172,10 @@ class ContradictionEngine:
         return {"ok": True, "action": "rejected", "pending_id": pending_id}
 
     def rollback(self, fact_id: int) -> dict[str, Any]:
-        current = self.store.get_fact(fact_id)
-        if not current:
-            return {"ok": False, "error": "fact not found"}
-        old_id = current.supersedes
-        if not old_id:
-            return {"ok": False, "error": "no superseded ancestor"}
-        old = self.store.get_fact(old_id)
-        if not old:
-            return {"ok": False, "error": "ancestor missing"}
-        self.store.update_fact(current.id, status=STATUS_SUPERSEDED, reason="rolled_back")
-        self.store.update_fact(
-            old.id,
-            status="live",
-            superseded_by=None,
-            reason="restored_by_rollback",
-        )
-        return {"ok": True, "action": "rollback", "live_fact_id": old.id, "archived_fact_id": current.id}
+        return {
+            "ok": False,
+            "error": "冲突覆盖会删除旧条，无法回滚。请重新手动记住。",
+        }
 
     def _merge_same(self, existing: Fact, payload: dict[str, Any]) -> dict[str, Any]:
         evidence = list(existing.evidence)

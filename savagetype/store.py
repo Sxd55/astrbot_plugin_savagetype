@@ -414,6 +414,11 @@ class Store:
             archived.append(fid)
         return {"ok": True, "archived": archived, "missing": missing, "count": len(archived)}
 
+    def delete_fact(self, fact_id: int) -> bool:
+        cur = self.execute("DELETE FROM facts WHERE id=?", (fact_id,))
+        self.bump_revision()
+        return cur.rowcount > 0
+
     def search_facts(
         self,
         keyword: str,

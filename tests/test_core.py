@@ -69,11 +69,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(r2["action"], "supersede")
         live = self.store.live_by_slot("u1", "self", "likes")
         self.assertEqual(live.value, "咖啡")
-        old = self.store.get_fact(r1["fact_id"])
-        self.assertEqual(old.status, "superseded")
+        self.assertIsNone(self.store.get_fact(r1["fact_id"]))
         rb = self.engine.rollback(live.id)
-        self.assertTrue(rb["ok"])
-        self.assertEqual(self.store.live_by_slot("u1", "self", "likes").value, "茶")
+        self.assertFalse(rb["ok"])
 
     def test_joke_does_not_overwrite(self):
         self.engine.ingest(_payload(value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
@@ -117,9 +115,8 @@ class CoreTest(unittest.TestCase):
         live = self.store.live_by_slot("u1", "self", "likes")
         self.assertIsNotNone(live)
         self.assertTrue(live.value.startswith("不") or "不喜欢" in live.content)
-        old = self.store.get_fact(r1["fact_id"])
         if r2["action"] == "supersede":
-            self.assertEqual(old.status, "superseded")
+            self.assertIsNone(self.store.get_fact(r1["fact_id"]))
 
     def test_llm_dislike_alias_collides_likes(self):
         r1 = self.engine.ingest(_payload(attribute="likes", value="hiphop", content="我喜欢hiphop"), "我喜欢hiphop")
@@ -130,7 +127,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(r2["action"], "supersede")
         live = self.store.live_by_slot("u1", "self", "likes")
         self.assertTrue(live.value.startswith("不") or "不喜欢" in live.content)
-        self.assertEqual(self.store.get_fact(r1["fact_id"]).status, "superseded")
+        self.assertIsNone(self.store.get_fact(r1["fact_id"]))
         self.assertIsNone(self.store.live_by_slot("u1", "self", "dislikes"))
 
     def test_sleep_folds_old_dislike_note(self):
@@ -296,7 +293,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(r2["action"], "supersede")
         live = self.store.live_by_slot("u1", "self", "likes")
         self.assertEqual(live.value, "咖啡")
-        self.assertEqual(self.store.get_fact(r1["fact_id"]).status, "superseded")
+        self.assertIsNone(self.store.get_fact(r1["fact_id"]))
 
     def test_persona_isolation(self):
         self.engine.ingest(_payload(value="茶", content="我喜欢喝茶", persona_id="p1"), "我喜欢喝茶")

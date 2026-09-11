@@ -6,25 +6,29 @@
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
+    <div id="toast" hidden></div>
     <div class="wrap">
       <header>
-        <div>
-          <h1>Savage Type</h1>
-          <p class="lede">人格读 AstrBot。这里管事实、改口、审查后的黑话和表达样本。</p>
+        <div class="brand">
+          <img class="cover" src="../../_logo.webp" alt="" />
+          <div>
+            <h1>Savage Type</h1>
+            <p class="lede">人格读 AstrBot。这里管事实、改口、审查后的学习草稿。</p>
+          </div>
         </div>
-        <nav class="tabs" id="tabs">
-          <button data-tab="ops" class="on">工作台</button>
-          <button data-tab="settings">设置</button>
+        <nav class="tabs">
+          <button type="button" data-act="tab" data-tab="ops" class="on">工作台</button>
+          <button type="button" data-act="tab" data-tab="settings">设置</button>
         </nav>
       </header>
 
       <section id="page-ops">
         <div class="row toolbar">
-          <button id="refresh">刷新</button>
-          <button class="ghost" id="extract">抽取事实</button>
-          <button class="ghost" id="sleep">维护</button>
-          <button class="ghost" id="learn">跑一轮学习</button>
-          <button class="ghost" id="export">导出 JSONL</button>
+          <button type="button" data-act="refresh">刷新</button>
+          <button type="button" class="ghost" data-act="extract">抽取事实</button>
+          <button type="button" class="ghost" data-act="sleep">维护</button>
+          <button type="button" class="ghost" data-act="learn">跑一轮学习</button>
+          <button type="button" class="ghost" data-act="export">导出 JSONL</button>
         </div>
         <div class="kpis" id="kpis"></div>
         <p id="coexist" class="lede"></p>
@@ -32,72 +36,67 @@
         <div class="grid">
           <section class="card full">
             <h2>记忆显微镜</h2>
-            <p class="lede">每条显示昵称和 QQ / 平台 id。删除会归档，不硬抹，可用回滚恢复。</p>
+            <p class="lede">每条显示昵称和 QQ。删除会归档。手动记住的条目说话人固定为 admin。</p>
             <div class="row">
               <input id="q" placeholder="关键词" />
               <input id="speaker" placeholder="QQ / speaker_id（可空）" />
-              <button id="search">检索</button>
-              <button class="ghost" id="batch-archive">删除所选</button>
+              <button type="button" data-act="search">检索</button>
+              <button type="button" class="ghost" data-act="batch-archive">删除所选</button>
             </div>
-            <div id="hits"></div>
+            <div class="scroll" id="hits"></div>
           </section>
 
           <section class="card">
             <h2>学习审查</h2>
-            <p class="lede">黑话释义、few-shot、人格草稿。批准后才注入，不写回人格文件。</p>
-            <div id="reviews"></div>
+            <p class="lede">黑话、few-shot、人格草稿。批准后才注入。</p>
+            <div class="scroll" id="reviews"></div>
           </section>
 
           <section class="card">
             <h2>待确认覆盖</h2>
-            <div id="pending"></div>
+            <div class="scroll" id="pending"></div>
           </section>
 
           <section class="card">
             <h2>说话人归并</h2>
             <p class="lede">同名不同 QQ 不会自动合并。</p>
-            <div id="alias-suggestions"></div>
+            <div class="scroll" id="alias-suggestions"></div>
           </section>
 
           <section class="card">
-            <h2>手动记住 / 回滚</h2>
-            <textarea id="remember-text" placeholder="用户明确说过、值得长期留下的事实"></textarea>
+            <h2>手动记住</h2>
+            <p class="lede">写入后说话人固定为 admin，不和用户 QQ 抢同一槽。</p>
+            <textarea id="remember-text" placeholder="值得长期留下的事实"></textarea>
             <div class="row">
-              <input id="remember-speaker" placeholder="QQ / speaker_id" />
-              <button id="remember">写入</button>
+              <button type="button" data-act="remember">写入 admin</button>
             </div>
-            <div class="row">
-              <input id="rollback-id" placeholder="当前 live 事实 id" />
-              <button class="ghost" id="rollback">回滚</button>
-            </div>
-            <div id="archived"></div>
+            <div class="scroll short" id="archived"></div>
           </section>
 
           <section class="card full">
             <h2>注入显微镜</h2>
-            <p class="lede">最近一次主链注入。带当前说话人 QQ。</p>
-            <div id="microscope"></div>
+            <div class="scroll" id="microscope"></div>
           </section>
 
           <section class="card full">
             <h2>备份 / 聊天导入</h2>
             <div class="row">
-              <input id="archive-path" placeholder="JSONL 绝对路径" />
-              <button class="ghost" id="archive-preview">预览档案</button>
-              <button id="archive-import">确认导入档案</button>
+              <input id="archive-path" placeholder="JSONL 绝对路径（导入用）" />
+              <button type="button" class="ghost" data-act="archive-preview">预览档案</button>
+              <button type="button" data-act="archive-import">确认导入档案</button>
             </div>
             <textarea id="chat-text" placeholder="用户: 2026-09-01 12:00:00&#10;我喜欢喝茶"></textarea>
             <div class="row">
               <input id="chat-users" placeholder="用户名，逗号分隔" />
               <input id="chat-bots" placeholder="Bot 名，逗号分隔" />
-              <button class="ghost" id="chat-preview">预览聊天</button>
-              <button id="chat-import">导入聊天</button>
+              <button type="button" class="ghost" data-act="chat-preview">预览聊天</button>
+              <button type="button" data-act="chat-import">导入聊天</button>
             </div>
           </section>
 
           <section class="card full">
             <h2>诊断</h2>
-            <pre id="diag"></pre>
+            <div class="scroll diag" id="diag"></div>
           </section>
         </div>
       </section>
@@ -105,10 +104,10 @@
       <section id="page-settings" hidden>
         <section class="card full">
           <h2>插件设置</h2>
-          <p class="lede">字段与 AstrBot 插件配置页相同，保存后立即写回配置文件。</p>
+          <p class="lede">字段与 AstrBot 插件配置页相同。</p>
           <form id="settings-form" class="settings"></form>
           <div class="row">
-            <button id="settings-save" type="button">保存设置</button>
+            <button type="button" data-act="settings-save">保存设置</button>
           </div>
         </section>
       </section>
