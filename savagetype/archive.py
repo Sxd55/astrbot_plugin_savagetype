@@ -280,6 +280,59 @@ def archive_low_value(store: Store, min_age_days: int = 30, max_confidence: floa
     return n
 
 
+def _topic_key(text: str) -> str:
+    from .util import normalize_slot
+
+    t = normalize_slot(text)
+    for prefix in ("不", "没", "别", "非"):
+        if t.startswith(prefix):
+            t = t[len(prefix):]
+            break
+    t = t.replace("听", "").replace("喝", "").replace("吃", "")
+    return t[:24]
+
+
+def _topics(fact) -> set[str]:
+    keys = set()
+    for raw in (fact.value, fact.content):
+        key = _topic_key(raw or "")
+        if key:
+            keys.add(key)
+            if len(key) >= 4:
+                keys.add(key[:6])
+                keys.add(key[-6:])
+    return {k for k in keys if len(k) >= 3}
+
+
+def fold_preference_slots(store: Store) -> int:
+    """Merge leftover dislike/note copies of the same topic into likes."""
+    live = store.facts_by_status("live", limit=400)
+    groups: dict[tuple[str, str], list] = {}
+    for fact in live:
+        groups.setdefault((fact.speaker_id, fact.persona_id or ""), []).append(fact)
+    folded = 0
+    for _key, items in groups.items():
+        like_items = [f for f in items if f.attribute == "likes"]
+        extras = [f for f in items if f.attribute in {"dislikes", "note"}]
+        for extra in extras:
+            extra_topics = _topics(extra)
+            keeper = None
+            for like in like_items:
+                if extra_topics & _topics(like):
+                    keeper = like
+                    break
+            if keeper is None:
+                continue
+            store.update_fact(
+                extra.id,
+                status="superseded",
+                superseded_by=keeper.id,
+                reason="sleep_fold_preference",
+            )
+            folded += 1
+    return folded
+
+
 def expire_persona_drafts(store: Store, ttl_seconds: int = 14 * 86400) -> int:
     cutoff = now_ts() - max(1, ttl_seconds)
     rows = store.query(

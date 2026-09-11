@@ -17,6 +17,7 @@ from savagetype.archive import (  # noqa: E402
     archive_low_value,
     compact_summarized_timeline,
     expire_persona_drafts,
+    fold_preference_slots,
     import_jsonl,
     import_transcript_events,
     parse_transcript,
@@ -131,6 +132,71 @@ class CoreTest(unittest.TestCase):
         self.assertTrue(live.value.startswith("不") or "不喜欢" in live.content)
         self.assertEqual(self.store.get_fact(r1["fact_id"]).status, "superseded")
         self.assertIsNone(self.store.live_by_slot("u1", "self", "dislikes"))
+
+    def test_sleep_folds_old_dislike_note(self):
+        self.engine.ingest(_payload(attribute="likes", value="不hiphop", content="我改口了我不喜欢hiphop"), "我改口了我不喜欢hiphop")
+        now = 1
+        self.store.execute(
+            """INSERT INTO facts(subject, attribute, value, content, speaker_id, speaker_name, bot_id, window_tag,
+                status, confidence, evidence, mention_policy, first_person, explicit_correction, source,
+                created_at, updated_at, fingerprint, persona_id, slot_key)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "self",
+                "dislikes",
+                "hiphop",
+                "你不喜欢 hiphop。",
+                "u1",
+                "阿U",
+                "b",
+                "w",
+                "live",
+                0.9,
+                "[]",
+                "mention",
+                0,
+                0,
+                "legacy",
+                now,
+                now,
+                "legacy-dislike",
+                "",
+                "legacy-dislike",
+            ),
+        )
+        self.store.execute(
+            """INSERT INTO facts(subject, attribute, value, content, speaker_id, speaker_name, bot_id, window_tag,
+                status, confidence, evidence, mention_policy, first_person, explicit_correction, source,
+                created_at, updated_at, fingerprint, persona_id, slot_key)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "self",
+                "note",
+                "不喜欢 hiphop",
+                "用户明确表示不喜欢 hiphop（此前曾说过喜欢，已改口）。",
+                "u1",
+                "阿U",
+                "b",
+                "w",
+                "live",
+                0.8,
+                "[]",
+                "mention",
+                0,
+                0,
+                "legacy",
+                now,
+                now,
+                "legacy-note",
+                "",
+                "legacy-note",
+            ),
+        )
+        n = fold_preference_slots(self.store)
+        self.assertEqual(n, 2)
+        self.assertIsNotNone(self.store.live_by_slot("u1", "self", "likes"))
+        leftover = [f for f in self.store.facts_by_status("live", limit=20) if f.attribute in {"dislikes", "note"}]
+        self.assertFalse(leftover)
 
     def test_hearsay_uncertain(self):
         r = self.engine.ingest(

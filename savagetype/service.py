@@ -12,6 +12,7 @@ from .archive import (
     backup_db,
     compact_summarized_timeline,
     expire_persona_drafts,
+    fold_preference_slots,
     import_jsonl,
     import_transcript_events,
     parse_transcript,
@@ -390,6 +391,7 @@ class SavageTypeService:
                 reason="sleep_near_duplicate",
             )
             merged += 1
+        folded = fold_preference_slots(self.store)
         retain_days = int(self.config.get("sleep_timeline_retain_days") or 30)
         compacted = compact_summarized_timeline(self.store, retain_days=retain_days)
         archived = archive_low_value(
@@ -404,6 +406,7 @@ class SavageTypeService:
         counts = self.store.counts()
         result = {
             "merged_duplicates": merged,
+            "folded_preferences": folded,
             "compacted_timeline": compacted,
             "archived_low_value": archived,
             "expired_persona_drafts": expired,
