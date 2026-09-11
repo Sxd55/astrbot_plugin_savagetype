@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -18,6 +19,8 @@ except ImportError:
     from savagetype.store import Store
     from savagetype.util import PLUGIN_NAME, clip
 
+SCHEMA_PATH = Path(__file__).resolve().parent / "_conf_schema.json"
+
 PLUGIN_NAME_CONST = PLUGIN_NAME
 
 
@@ -35,7 +38,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "2.3.6",
+    "2.4.0",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -88,6 +91,9 @@ class SavageTypePlugin(Star):
             ("chat/preview", self.page_chat_preview, ["POST"], "Preview chat transcript"),
             ("chat/import", self.page_chat_import, ["POST"], "Import chat transcript"),
             ("microscope", self.page_microscope, ["GET"], "Recent injection snapshots"),
+            ("facts/archive", self.page_facts_archive, ["POST"], "Archive facts"),
+            ("config", self.page_config_get, ["GET"], "Plugin config and schema"),
+            ("config/save", self.page_config_save, ["POST"], "Save plugin config"),
         ]
         for route, handler, methods, desc in apis:
             self.context.register_web_api(
@@ -720,6 +726,76 @@ class SavageTypePlugin(Star):
         users = [s.strip() for s in str(payload.get("user_names") or "").split(",") if s.strip()]
         bots = [s.strip() for s in str(payload.get("bot_names") or "").split(",") if s.strip()]
         return json_response(self.service.import_chat(text, user_names=users, bot_names=bots))
+
+    def _schema(self) -> dict:
+        if SCHEMA_PATH.is_file():
+            return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        return {}
+
+    def _config_values(self) -> dict:
+        schema = self._schema()
+        out = {}
+        for key, spec in schema.items():
+            if isinstance(self.config, dict):
+                out[key] = self.config.get(key, spec.get("default"))
+            else:
+                try:
+                    out[key] = self.config.get(key, spec.get("default"))
+                except Exception:
+                    out[key] = spec.get("default")
+        return out
+
+    def _coerce_config_value(self, spec: dict, raw):
+        typ = spec.get("type")
+        if typ == "bool":
+            if isinstance(raw, bool):
+                return raw
+            if isinstance(raw, str):
+                return raw.strip().lower() in {"1", "true", "yes", "on"}
+            return bool(raw)
+        if typ == "int":
+            return int(raw)
+        if typ == "float":
+            return float(raw)
+        if raw is None:
+            return spec.get("default", "")
+        return str(raw)
+
+    async def page_config_get(self):
+        schema = self._schema()
+        return json_response({"schema": schema, "values": self._config_values()})
+
+    async def page_config_save(self):
+        payload = await request.json(default={})
+        incoming = payload.get("values") if isinstance(payload.get("values"), dict) else payload
+        schema = self._schema()
+        saved = {}
+        for key, spec in schema.items():
+            if key not in incoming:
+                continue
+            try:
+                value = self._coerce_config_value(spec, incoming[key])
+            except (TypeError, ValueError):
+                return error_response(f"bad value for {key}", status_code=400)
+            options = spec.get("options")
+            if options and value not in options:
+                return error_response(f"{key} must be one of {options}", status_code=400)
+            self.config[key] = value
+            saved[key] = value
+        if hasattr(self.config, "save_config"):
+            self.config.save_config()
+        self.service.config = self.config
+        self.service._sync_embed_fn()
+        return json_response({"ok": True, "saved": saved, "values": self._config_values()})
+
+    async def page_facts_archive(self):
+        payload = await request.json(default={})
+        ids = payload.get("ids") or payload.get("id")
+        if ids is None:
+            return error_response("missing ids", status_code=400)
+        if not isinstance(ids, list):
+            ids = [ids]
+        return json_response(self.store.archive_facts(ids, reason="ui_delete"))
 
     def _fact_view(self, f) -> dict:
         return {

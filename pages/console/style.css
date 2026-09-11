@@ -117,7 +117,15 @@ pre, .log, .item {
 .warn { color: var(--warn); }
 .ok { color: var(--ok); }
 .full { grid-column: 1 / -1; }
+.tabs { display: flex; gap: 8px; }
+.tabs button.on { background: var(--accent); color: var(--accent-ink); }
+.toolbar { margin-bottom: 12px; }
+.settings { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 18px; }
+.setting { display: flex; flex-direction: column; gap: 6px; }
+.setting label { font-weight: 600; }
+.toggle { font-weight: 400; }
+.item-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 @media (max-width: 860px) {
-  .grid, .kpis { grid-template-columns: 1fr; }
+  .grid, .kpis, .settings { grid-template-columns: 1fr; }
   header { display: block; }
 }

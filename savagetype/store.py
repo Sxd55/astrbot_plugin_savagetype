@@ -277,6 +277,7 @@ class Store:
             "unsummarized": n("SELECT COUNT(*) FROM timeline WHERE summarized=0"),
             "facts_live": n("SELECT COUNT(*) FROM facts WHERE status='live'"),
             "facts_superseded": n("SELECT COUNT(*) FROM facts WHERE status='superseded'"),
+            "facts_archived": n("SELECT COUNT(*) FROM facts WHERE status='archived'"),
             "pending": n("SELECT COUNT(*) FROM pending_overrides WHERE status='open'"),
             "reviews_pending": n("SELECT COUNT(*) FROM reviews WHERE status='pending'"),
             "jargon_approved": n("SELECT COUNT(*) FROM reviews WHERE kind='jargon' AND status='approved'"),
@@ -393,6 +394,25 @@ class Store:
             (status, limit),
         )
         return [self._fact(r) for r in rows]
+
+    def archive_facts(self, ids: list[int], reason: str = "ui_delete") -> dict[str, Any]:
+        archived: list[int] = []
+        missing: list[int] = []
+        for raw in ids:
+            try:
+                fid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            fact = self.get_fact(fid)
+            if not fact:
+                missing.append(fid)
+                continue
+            if fact.status in {"archived", "superseded"}:
+                archived.append(fid)
+                continue
+            self.update_fact(fid, status="archived", reason=reason)
+            archived.append(fid)
+        return {"ok": True, "archived": archived, "missing": missing, "count": len(archived)}
 
     def search_facts(
         self,

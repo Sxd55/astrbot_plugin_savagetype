@@ -613,6 +613,15 @@ class CoreTest(unittest.TestCase):
         self.assertTrue(service.embedding_status()["active"])
         self.assertIsNotNone(service.retriever.embed)
 
+    def test_archive_facts_batch(self):
+        a = self.engine.ingest(_payload(attribute="likes", value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        b = self.engine.ingest(_payload(attribute="habit", value="早起", content="我习惯早起"), "我习惯早起")
+        result = self.store.archive_facts([a["fact_id"], b["fact_id"]], reason="ui_delete")
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(self.store.get_fact(a["fact_id"]).status, "archived")
+        self.assertEqual(self.store.get_fact(b["fact_id"]).status, "archived")
+        self.assertEqual(self.store.counts()["facts_archived"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

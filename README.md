@@ -2,7 +2,7 @@
 
 Savage Type 是面向 AstrBot 的**全局人格记忆中枢**。Savage 只是插件名。身份和语气永远读 AstrBot 当前人格；本插件只负责记住事实、处理改口、在需要时把少量相关记忆注入本轮对话。
 
-当前版本 `v2.3.6`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
+当前版本 `v2.4.0`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
 
 要求 AstrBot `>= 4.22.0`。
 

@@ -7,13 +7,43 @@ function esc(s) {
   ));
 }
 
-function factItem(f, extra = "") {
+function speakerLabel(name, id) {
+  const n = (name || "").trim();
+  const q = (id || "").trim();
+  if (n && q && n !== q) return `${n} (${q})`;
+  return n || q || "未知";
+}
+
+function factItem(f, extra = "", withCheck = false) {
+  const who = speakerLabel(f.speaker_name, f.speaker_id);
+  const check = withCheck
+    ? `<input type="checkbox" class="pick" data-id="${esc(f.id)}" />`
+    : "";
   return `<div class="item">
-    <span class="chip">${esc(f.status)}</span>
-    <span class="chip">${esc(f.speaker_name || f.speaker_id)}</span>
-    <b>#${esc(f.id)}</b> ${esc(f.attribute)} · ${esc(f.content)}
+    <div class="item-head">
+      ${check}
+      <span class="chip">${esc(f.status)}</span>
+      <span class="chip">${esc(who)}</span>
+      <b>#${esc(f.id)}</b> ${esc(f.attribute)}
+    </div>
+    <div>${esc(f.content)}</div>
+    <div class="lede">QQ/id ${esc(f.speaker_id || "")} · 槽 ${esc(f.slot_key || f.attribute)}</div>
     ${extra}
+    <div class="row">
+      <button class="ghost" data-del="${esc(f.id)}">删除此条</button>
+    </div>
   </div>`;
+}
+
+function bindDeletes(root) {
+  root.querySelectorAll("[data-del]").forEach((btn) => {
+    btn.onclick = async () => {
+      if (!confirm(`归档 #${btn.dataset.del}？不硬删除，可回滚。`)) return;
+      const r = await bridge.apiPost("facts/archive", { ids: [Number(btn.dataset.del)] });
+      $("diag").textContent = JSON.stringify(r, null, 2);
+      await reload();
+    };
+  });
 }
 
 async function loadOverview() {
@@ -48,18 +78,19 @@ async function loadOverview() {
       };
     });
   }
-  $("diag").textContent = JSON.stringify({overview: ov, usage}, null, 2);
+  $("diag").textContent = JSON.stringify({ overview: ov, usage }, null, 2);
 }
 
 async function loadFacts() {
   const live = await bridge.apiGet("facts", { status: "live" });
   const archived = await bridge.apiGet("facts", { status: "superseded" });
   $("archived").innerHTML = (archived.items || []).slice(0, 12).map((f) =>
-    factItem(f, f.superseded_by ? `<div class="lede">被 #${esc(f.superseded_by)} 覆盖</div>` : "")
+    factItem(f, f.superseded_by ? `<div class="lede">被 #${esc(f.superseded_by)} 覆盖</div>` : "", false)
   ).join("") || `<p class="lede">没有 superseded 记录。</p>`;
   if (!$("hits").dataset.locked) {
-    $("hits").innerHTML = (live.items || []).slice(0, 16).map((f) => factItem(f)).join("")
+    $("hits").innerHTML = (live.items || []).slice(0, 30).map((f) => factItem(f, "", true)).join("")
       || `<p class="lede">还没有 live 事实。</p>`;
+    bindDeletes($("hits"));
   }
 }
 
@@ -104,8 +135,10 @@ async function loadReviews() {
   box.innerHTML = items.map((r) => `<div class="item">
     <span class="chip">${esc(r.kind)}</span>
     <span class="chip">Q${esc(r.quality ?? (r.payload && r.payload.quality) ?? 0)}</span>
+    <span class="chip">${esc(speakerLabel("", r.speaker_id))}</span>
     <b>#${esc(r.id)}</b> ${esc(r.title)}
-    <div class="lede">${esc(r.reason)} · ${esc(JSON.stringify(r.payload))}</div>
+    <div class="lede">QQ/id ${esc(r.speaker_id || "")} · ${esc(r.reason)}</div>
+    <div class="lede">${esc(JSON.stringify(r.payload))}</div>
     <div class="row">
       <button data-approve="${esc(r.id)}">批准</button>
       <button class="ghost" data-reject-review="${esc(r.id)}">驳回</button>
@@ -137,15 +170,63 @@ async function loadMicroscope() {
   box.innerHTML = items.map((it) => {
     const p = it.payload || {};
     const blocked = (p.blocked || []).map((b) => `${b.id}:${b.reason}`).join("；") || "无";
+    const who = speakerLabel("", p.speaker_id);
     return `<div class="item">
       <span class="chip">${esc(p.route)}</span>
       <span class="chip">${esc(p.path)}</span>
-      <span class="chip">${esc(p.cache)}</span>
+      <span class="chip">${esc(who)}</span>
       <div>${esc(p.query || "")}</div>
-      <div class="lede">core=${esc(p.core)} related=${esc(p.related)} jargon=${esc(p.jargon)} chars=${esc(p.pack_chars)}</div>
+      <div class="lede">QQ/id ${esc(p.speaker_id || "")} · core=${esc(p.core)} related=${esc(p.related)} chars=${esc(p.pack_chars)}</div>
       <div class="lede">blocked ${esc(blocked)}</div>
     </div>`;
   }).join("");
+}
+
+function fieldControl(key, spec, value) {
+  const hint = spec.hint ? `<div class="lede">${esc(spec.hint)}</div>` : "";
+  const label = `<label for="cfg-${esc(key)}">${esc(spec.description || key)}</label>`;
+  if (spec.type === "bool") {
+    const on = value ? "checked" : "";
+    return `<div class="setting">${label}
+      <label class="toggle"><input id="cfg-${esc(key)}" name="${esc(key)}" type="checkbox" ${on} /> 开启</label>
+      ${hint}</div>`;
+  }
+  if (Array.isArray(spec.options) && spec.options.length) {
+    const opts = spec.options.map((o) =>
+      `<option value="${esc(o)}" ${String(o) === String(value) ? "selected" : ""}>${esc(o)}</option>`
+    ).join("");
+    return `<div class="setting">${label}
+      <select id="cfg-${esc(key)}" name="${esc(key)}">${opts}</select>
+      ${hint}</div>`;
+  }
+  const typ = spec.type === "int" || spec.type === "float" ? "number" : "text";
+  const step = spec.type === "float" ? "0.01" : spec.type === "int" ? "1" : undefined;
+  const stepAttr = step ? `step="${step}"` : "";
+  return `<div class="setting">${label}
+    <input id="cfg-${esc(key)}" name="${esc(key)}" type="${typ}" ${stepAttr} value="${esc(value ?? "")}" />
+    ${hint}</div>`;
+}
+
+async function loadSettings() {
+  const form = $("settings-form");
+  if (!form) return;
+  const data = await bridge.apiGet("config");
+  const schema = data.schema || {};
+  const values = data.values || {};
+  form.innerHTML = Object.entries(schema).map(([key, spec]) =>
+    fieldControl(key, spec, values[key])
+  ).join("");
+}
+
+function readSettings() {
+  const form = $("settings-form");
+  const values = {};
+  form.querySelectorAll("[name]").forEach((el) => {
+    if (el.type === "checkbox") values[el.name] = el.checked;
+    else if (el.type === "number") values[el.name] = el.value === "" ? 0 : Number(el.value);
+    else values[el.name] = el.value;
+  });
+  return values;
 }
 
 async function reload() {
@@ -156,8 +237,21 @@ async function reload() {
   await loadMicroscope();
 }
 
+function showTab(name) {
+  $("page-ops").hidden = name !== "ops";
+  $("page-settings").hidden = name !== "settings";
+  document.querySelectorAll(".tabs button").forEach((b) => {
+    b.classList.toggle("on", b.dataset.tab === name);
+  });
+  if (name === "settings") loadSettings();
+}
+
 await bridge.ready();
 await reload();
+
+document.querySelectorAll(".tabs button").forEach((b) => {
+  b.onclick = () => showTab(b.dataset.tab);
+});
 
 $("refresh").onclick = reload;
 $("extract").onclick = async () => {
@@ -168,6 +262,7 @@ $("extract").onclick = async () => {
 $("sleep").onclick = async () => {
   const r = await bridge.apiPost("sleep", {});
   $("diag").textContent = JSON.stringify(r, null, 2);
+  await reload();
 };
 $("learn").onclick = async () => {
   const r = await bridge.apiPost("learn", {});
@@ -179,10 +274,20 @@ $("search").onclick = async () => {
   const data = await bridge.apiGet("search", {
     q: $("q").value,
     speaker_id: $("speaker").value,
-    k: 16,
+    k: 30,
   });
-  $("hits").innerHTML = (data.items || []).map((f) => factItem(f)).join("")
+  $("hits").innerHTML = (data.items || []).map((f) => factItem(f, "", true)).join("")
     || `<p class="lede">没有命中。</p>`;
+  bindDeletes($("hits"));
+};
+$("batch-archive").onclick = async () => {
+  const ids = [...$("hits").querySelectorAll(".pick:checked")].map((el) => Number(el.dataset.id));
+  if (!ids.length) return;
+  if (!confirm(`归档 ${ids.length} 条？不硬删除。`)) return;
+  const r = await bridge.apiPost("facts/archive", { ids });
+  $("diag").textContent = JSON.stringify(r, null, 2);
+  $("hits").dataset.locked = "";
+  await reload();
 };
 $("remember").onclick = async () => {
   const content = $("remember-text").value.trim();
@@ -237,5 +342,11 @@ $("chat-import").onclick = async () => {
     bot_names: $("chat-bots").value,
   });
   $("diag").textContent = JSON.stringify(r, null, 2);
+  await reload();
+};
+$("settings-save").onclick = async () => {
+  const r = await bridge.apiPost("config/save", { values: readSettings() });
+  $("diag").textContent = JSON.stringify(r, null, 2);
+  await loadSettings();
   await reload();
 };
