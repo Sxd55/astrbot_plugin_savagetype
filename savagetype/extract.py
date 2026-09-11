@@ -9,7 +9,7 @@ from .contradiction import ContradictionEngine, looks_correction, looks_first_pe
 from .models import TimelineEvent
 from .slots import apply_slot
 from .store import Store
-from .util import PREF_PATTERNS, clip, fingerprint, now_ts, safe_json_extract
+from .util import DIRECTIVE_RE, FIRST_PERSON_RE, PREF_PATTERNS, REMEMBER_RE, clip, fingerprint, now_ts, safe_json_extract
 
 EXTRACT_PROMPT = """你是记忆整理器。只从对话里抽取稳定事实，不要文风、不要黑话、不要新人格。
 输出 JSON 数组，每项字段：
@@ -19,7 +19,8 @@ subject, attribute, value, content, confidence(0-1), first_person(bool), explici
 - 「不喜欢/不再喜欢 X」必须写成 attribute=likes、value 以「不」开头（例如 不hiphop）。不要用 dislikes，也不要另写 note。
 - dislikes 只用于讨厌、受不了、生理反感，不是「不喜欢」。
 - subject：当前说话人自己的事实用 self；Bot 自己用 bot；其他人用稳定名字。
-- 只记偏好、称呼、约定、身份、习惯、明确纠正。
+- 只记当前说话人用第一人称明确说出的关于自己的偏好、称呼、约定、身份、习惯、纠正。
+- 必须带「我/俺/咱」这类自述，或「记住/记下来」这类指示。闲聊、别人的事、转述不要记。
 - 玩笑、反话、转述、一次性情绪不要写成稳定事实。
 - 没有稳定事实就输出 []。
 对话：
@@ -76,6 +77,10 @@ class Extractor:
                 continue
             text = (ev.content or "").strip()
             if len(text) < 2:
+                continue
+            if not FIRST_PERSON_RE.search(text):
+                continue
+            if not (DIRECTIVE_RE.search(text) or REMEMBER_RE.search(text) or looks_correction(text)):
                 continue
             for regex, attr in PREF_PATTERNS:
                 match = regex.search(text)

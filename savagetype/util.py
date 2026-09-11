@@ -46,6 +46,9 @@ HEARSAY_RE = re.compile(
 )
 FIRST_PERSON_RE = re.compile(r"(我|俺|咱|本人)")
 REMEMBER_RE = re.compile(r"(记住|记一下|记下来|别忘了|帮我记)")
+DIRECTIVE_RE = re.compile(
+    r"(记住|记一下|记下来|别忘了|帮我记|我喜欢|我不喜欢|我讨厌|叫我|称呼我|我是|我住|改口|以后请|以后叫)"
+)
 
 PREF_PATTERNS = [
     (re.compile(r"(?:我|俺|咱)(?:其实)?(?:现在)?(?:不|没|不再)喜欢(?:听|喝|吃)?(.+?)(?:[，。！!？?\s]|$)"), "likes"),

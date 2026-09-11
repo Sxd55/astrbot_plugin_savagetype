@@ -619,6 +619,27 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(self.store.get_fact(b["fact_id"]).status, "archived")
         self.assertEqual(self.store.counts()["facts_archived"], 2)
 
+    def test_store_reopens_after_close(self):
+        self.engine.ingest(_payload(value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        self.store.close()
+        live = self.store.live_by_slot("u1", "self", "likes")
+        self.assertIsNotNone(live)
+        self.assertEqual(live.value, "茶")
+
+    def test_capture_skips_non_directive(self):
+        from savagetype.service import SavageTypeService
+
+        service = SavageTypeService(
+            store=self.store,
+            config={},
+            llm_generate=lambda *_a, **_k: "",
+            get_provider=lambda *_a, **_k: None,
+            logger=None,
+        )
+        self.assertTrue(service.is_self_directive("我喜欢喝茶"))
+        self.assertTrue(service.is_self_directive("记住我叫小明"))
+        self.assertFalse(service.is_self_directive("今天天气真好"))
+
 
 if __name__ == "__main__":
     unittest.main()

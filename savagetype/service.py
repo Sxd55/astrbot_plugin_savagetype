@@ -207,11 +207,45 @@ class SavageTypeService:
             "persona_id": persona_id or "",
         }
 
+    def is_admin_event(self, event: Any) -> bool:
+        if event is None:
+            return False
+        try:
+            if str(getattr(event, "role", "") or "").lower() == "admin":
+                return True
+        except Exception:
+            pass
+        try:
+            if hasattr(event, "is_admin") and event.is_admin():
+                return True
+        except Exception:
+            pass
+        try:
+            if bool(event.get_extra("_stype_admin")):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def is_self_directive(self, text: str) -> bool:
+        from .util import DIRECTIVE_RE, FIRST_PERSON_RE, REMEMBER_RE
+
+        t = (text or "").strip()
+        if not t:
+            return False
+        if REMEMBER_RE.search(t) and FIRST_PERSON_RE.search(t):
+            return True
+        return bool(DIRECTIVE_RE.search(t) and FIRST_PERSON_RE.search(t))
+
     def capture_user(self, event: Any, text: str) -> int | None:
         if not self.capture_ok(event):
             return None
         text = (text or "").strip()
         if not text:
+            return None
+        if not self.is_admin_event(event):
+            return None
+        if not self.is_self_directive(text):
             return None
         ident = self._ident_from_event(event)
         ts = now_ts()

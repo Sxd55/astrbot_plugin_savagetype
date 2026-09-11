@@ -93,13 +93,28 @@ class Store:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(SCHEMA)
-        self._conn.commit()
+        self._closed = False
+        self._connect()
         self._migrate()
         if self.get_meta("revision") is None:
             self.set_meta("revision", "1")
+
+    def _connect(self) -> None:
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.executescript(SCHEMA)
+        self._conn.commit()
+        self._closed = False
+
+    def _ensure_conn(self) -> None:
+        if self._closed:
+            self._connect()
+            return
+        try:
+            self._conn.execute("SELECT 1")
+        except (sqlite3.ProgrammingError, sqlite3.OperationalError, AttributeError):
+            self._connect()
 
     def _table_cols(self, table: str) -> set[str]:
         rows = self.query(f"PRAGMA table_info({table})")
@@ -185,16 +200,22 @@ class Store:
 
     def close(self) -> None:
         with self._lock:
-            self._conn.close()
+            self._closed = True
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
     def execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
         with self._lock:
+            self._ensure_conn()
             cur = self._conn.execute(sql, tuple(params))
             self._conn.commit()
             return cur
 
     def query(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
         with self._lock:
+            self._ensure_conn()
             return list(self._conn.execute(sql, tuple(params)))
 
     def get_meta(self, key: str) -> str | None:

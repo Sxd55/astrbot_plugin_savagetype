@@ -38,7 +38,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "2.5.2",
+    "2.5.3",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -62,6 +62,9 @@ class SavageTypePlugin(Star):
         logger.info("Savage Type coexistence: %s", self.service.coexistence.snapshot())
 
     async def terminate(self):
+        task = getattr(self.service, "_learn_task", None)
+        if task and not task.done():
+            task.cancel()
         try:
             self.store.close()
         except Exception:
@@ -437,6 +440,8 @@ class SavageTypePlugin(Star):
             content(string): 要记住的稳定事实
         """
         ident = await self._ident(event)
+        if not self.service.is_admin_event(event):
+            return "ok=false action=denied reason=admin_only"
         result = self.service.remember(ident, content)
         if result.get("action") in {"insert", "refresh", "supersede", "wrote_uncertain"}:
             return f"ok=true action={result.get('action')} fact_id={result.get('fact_id')}"
