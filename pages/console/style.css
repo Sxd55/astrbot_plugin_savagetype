@@ -101,7 +101,8 @@ textarea { width: 100%; min-height: 84px; resize: vertical; }
 }
 .scroll.short { max-height: 160px; }
 .scroll.diag {
-  max-height: 220px;
+  max-height: 480px;
+  min-height: 240px;
   font-family: var(--mono);
   font-size: 12px;
   white-space: pre-wrap;

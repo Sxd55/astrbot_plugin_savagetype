@@ -1,28 +1,27 @@
 const $ = (id) => document.getElementById(id);
 
-function pluginBase() {
-  const path = window.location.pathname.replace(/\/+$/, "");
-  if (path.endsWith("/console") || path.endsWith("/console/index.html")) {
-    return path.replace(/\/console(?:\/index\.html)?$/, "");
+function unwrap(result) {
+  if (result && typeof result === "object" && "status" in result && "data" in result) {
+    if (result.status === "error") {
+      const err = new Error(result.message || "request failed");
+      err.payload = result;
+      throw err;
+    }
+    return result.data;
   }
-  return path;
+  return result;
 }
 
 async function apiGet(route, query = {}) {
-  if (window.AstrBotPluginPage?.apiGet) return window.AstrBotPluginPage.apiGet(route, query);
-  const params = new URLSearchParams(query).toString();
-  const res = await fetch(`${pluginBase()}/${route}${params ? `?${params}` : ""}`);
-  return res.json();
+  const bridge = window.AstrBotPluginPage;
+  if (!bridge?.apiGet) throw new Error("AstrBotPluginPage 未就绪，请在 AstrBot 拓展页打开");
+  return unwrap(await bridge.apiGet(route, query));
 }
 
 async function apiPost(route, body = {}) {
-  if (window.AstrBotPluginPage?.apiPost) return window.AstrBotPluginPage.apiPost(route, body);
-  const res = await fetch(`${pluginBase()}/${route}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return res.json();
+  const bridge = window.AstrBotPluginPage;
+  if (!bridge?.apiPost) throw new Error("AstrBotPluginPage 未就绪，请在 AstrBot 拓展页打开");
+  return unwrap(await bridge.apiPost(route, body));
 }
 
 function toast(msg) {
@@ -250,9 +249,14 @@ async function onAct(act, el) {
   if (act === "sleep") return run("已维护", async () => { const r = await apiPost("sleep", {}); await reload(); return r; });
   if (act === "learn") return run("已学习", async () => { const r = await apiPost("learn", {}); await reload(); return r; });
   if (act === "export") return run("已导出", async () => {
+    const bridge = window.AstrBotPluginPage;
+    if (bridge?.download) {
+      await bridge.download("export", {}, "savagetype.jsonl");
+      return { ok: true };
+    }
     const r = await apiGet("export");
     if (r && r.content) downloadText(r.filename || "savagetype.jsonl", r.content);
-    return { ok: true, filename: r && r.filename, chars: r && r.chars };
+    return { ok: true, filename: r && r.filename };
   });
   if (act === "search") return run("已检索", async () => {
     $("hits").dataset.locked = "1";

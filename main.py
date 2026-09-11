@@ -5,7 +5,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
-from astrbot.api.web import error_response, json_response, request
+from astrbot.api.web import error_response, file_response, json_response, request
 from astrbot.core.agent.message import TextPart
 from astrbot.core.provider.provider import EmbeddingProvider, RerankProvider
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path, get_astrbot_plugin_data_path
@@ -38,7 +38,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "2.5.0",
+    "2.5.2",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -688,13 +688,7 @@ class SavageTypePlugin(Star):
     async def page_export(self):
         dest = self.data_dir / "exports" / f"savagetype-{self.store.revision()}.jsonl"
         path = self.service.export_jsonl(dest)
-        text = path.read_text(encoding="utf-8")
-        return json_response({
-            "ok": True,
-            "filename": path.name,
-            "content": text,
-            "chars": len(text),
-        })
+        return file_response(path, filename=path.name, content_type="application/json")
 
     async def page_archive_preview(self):
         payload = await request.json(default={})
