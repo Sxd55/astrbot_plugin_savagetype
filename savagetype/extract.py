@@ -16,6 +16,8 @@ EXTRACT_PROMPT = """你是记忆整理器。只从对话里抽取稳定事实，
 subject, attribute, value, content, confidence(0-1), first_person(bool), explicit_correction(bool), mention_policy(mention|tone|uncertain)
 规则：
 - attribute 只能是：likes, dislikes, name, identity, habit, promise, note
+- 「不喜欢/不再喜欢 X」必须写成 attribute=likes、value 以「不」开头（例如 不hiphop）。不要用 dislikes，也不要另写 note。
+- dislikes 只用于讨厌、受不了、生理反感，不是「不喜欢」。
 - subject：当前说话人自己的事实用 self；Bot 自己用 bot；其他人用稳定名字。
 - 只记偏好、称呼、约定、身份、习惯、明确纠正。
 - 玩笑、反话、转述、一次性情绪不要写成稳定事实。

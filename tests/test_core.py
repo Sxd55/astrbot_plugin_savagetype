@@ -120,6 +120,18 @@ class CoreTest(unittest.TestCase):
         if r2["action"] == "supersede":
             self.assertEqual(old.status, "superseded")
 
+    def test_llm_dislike_alias_collides_likes(self):
+        r1 = self.engine.ingest(_payload(attribute="likes", value="hiphop", content="我喜欢hiphop"), "我喜欢hiphop")
+        r2 = self.engine.ingest(
+            _payload(attribute="dislikes", value="hiphop", content="你不喜欢 hiphop。", explicit_correction=1),
+            "我改口了我不喜欢hiphop",
+        )
+        self.assertEqual(r2["action"], "supersede")
+        live = self.store.live_by_slot("u1", "self", "likes")
+        self.assertTrue(live.value.startswith("不") or "不喜欢" in live.content)
+        self.assertEqual(self.store.get_fact(r1["fact_id"]).status, "superseded")
+        self.assertIsNone(self.store.live_by_slot("u1", "self", "dislikes"))
+
     def test_hearsay_uncertain(self):
         r = self.engine.ingest(
             _payload(value="猫", content="听说他喜欢猫", first_person=0),

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from .util import normalize_slot
 
 ATTR_ALIASES = {
@@ -17,7 +19,6 @@ ATTR_ALIASES = {
     "爱吃": "likes",
     "dislikes": "dislikes",
     "dislike": "dislikes",
-    "不喜欢": "dislikes",
     "讨厌": "dislikes",
     "受不了": "dislikes",
     "name": "name",
@@ -103,7 +104,16 @@ def apply_slot(payload: dict) -> dict:
     payload = dict(payload)
     speaker_id = str(payload.get("speaker_id") or "")
     speaker_name = str(payload.get("speaker_name") or "")
-    payload["attribute"] = canonical_attribute(str(payload.get("attribute") or "note"))
+    attribute = str(payload.get("attribute") or "note")
+    value = str(payload.get("value") or "")
+    content = str(payload.get("content") or "")
+    blob = f"{attribute} {value} {content}"
+    if re.search(r"(不喜欢|没喜欢|不再喜欢)", blob) and canonical_attribute(attribute) in {"likes", "dislikes", "note"}:
+        payload["attribute"] = "likes"
+        if value and not value.startswith("不"):
+            payload["value"] = "不" + value
+    else:
+        payload["attribute"] = canonical_attribute(attribute)
     payload["subject"] = canonical_subject(
         str(payload.get("subject") or ""),
         speaker_id=speaker_id,
