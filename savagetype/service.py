@@ -513,6 +513,8 @@ class SavageTypeService:
             if fact.speaker_id and fact.speaker_id not in seen:
                 seen[fact.speaker_id] = fact.speaker_name or fact.speaker_id
         return [{"id": k, "name": v} for k, v in seen.items()]
+
+    def overview(self) -> dict[str, Any]:
         counts = self.store.counts()
         return {
             "counts": counts,
