@@ -1,0 +1,208 @@
+{
+  "enabled": {
+    "description": "总开关",
+    "type": "bool",
+    "hint": "关闭后不再采集、抽取、注入。",
+    "default": true
+  },
+  "capture_enabled": {
+    "description": "采集时间线",
+    "type": "bool",
+    "hint": "把用户消息和 Bot 回复写入时间线。检测到同类记忆插件采集时会自动降级。",
+    "default": true
+  },
+  "inject_enabled": {
+    "description": "主链注入",
+    "type": "bool",
+    "hint": "在 LLM 请求前注入本轮相关事实。检测到 memory_companion / LivingMemory 注入时会自动降级。",
+    "default": true
+  },
+  "extract_enabled": {
+    "description": "自动抽取事实",
+    "type": "bool",
+    "hint": "时间线达到阈值后抽取稳定事实。启发式始终可用；配置了总结模型时额外走 LLM。",
+    "default": true
+  },
+  "summary_provider_id": {
+    "description": "事实抽取模型",
+    "type": "string",
+    "hint": "留空则使用当前会话聊天模型。抽取失败会保留未总结时间线。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "extract_min_messages": {
+    "description": "抽取阈值（未总结条数）",
+    "type": "int",
+    "hint": "未总结时间线达到该条数后触发一次抽取。",
+    "default": 8
+  },
+  "extract_cooldown_seconds": {
+    "description": "抽取防抖（秒）",
+    "type": "int",
+    "hint": "两次自动抽取的最小间隔，避免每条消息都打模型。",
+    "default": 45
+  },
+  "extract_fail_cooldown_seconds": {
+    "description": "抽取失败冷却（秒）",
+    "type": "int",
+    "hint": "LLM 抽取失败后暂停自动抽取的时间。未总结时间线会保留。",
+    "default": 180
+  },
+  "inject_budget_chars": {
+    "description": "注入字数预算",
+    "type": "int",
+    "hint": "记忆包最大汉字/字符数。不含包装说明时也会被截断到此预算。",
+    "default": 800
+  },
+  "core_fact_limit": {
+    "description": "常驻核心事实条数",
+    "type": "int",
+    "hint": "当前说话人的高置信稳定事实，即使本轮问题不直接相关也会带一小部分。",
+    "default": 4
+  },
+  "related_fact_limit": {
+    "description": "相关事实条数",
+    "type": "int",
+    "default": 6
+  },
+  "retrieval_mode": {
+    "description": "检索执行模式",
+    "type": "string",
+    "options": ["basic", "auto", "rerank"],
+    "hint": "basic=本地；auto=有 Rerank 就用，失败回退；rerank=强制尝试 Rerank。",
+    "default": "auto"
+  },
+  "embedding_enabled": {
+    "description": "启用 Embedding",
+    "type": "bool",
+    "hint": "默认关闭。打开后立即用向量补充召回。关闭时若 live 事实达到下方阈值，仍会自动启用（不改这个开关）。没有 Embedding Provider 时只提示、不强开。",
+    "default": false
+  },
+  "embedding_auto_threshold": {
+    "description": "自动启用 Embedding 的 live 事实数",
+    "type": "int",
+    "hint": "live 事实达到该数量时自动建向量并参与检索。默认 2500。设为 0 表示从不自动启用。不会改写「启用 Embedding」开关。",
+    "default": 2500
+  },
+  "embedding_provider_id": {
+    "description": "Embedding 提供商",
+    "type": "string",
+    "hint": "留空则使用 AstrBot 当前可用的第一个 Embedding Provider。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "rerank_provider_id": {
+    "description": "Rerank 提供商",
+    "type": "string",
+    "hint": "留空则使用当前可用的第一个 Rerank Provider。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "top_k": {
+    "description": "召回候选数",
+    "type": "int",
+    "default": 16
+  },
+  "cache_ttl_seconds": {
+    "description": "检索缓存 TTL（秒）",
+    "type": "int",
+    "hint": "同一说话人、同一 query、同一库 revision 下短时复用检索结果。权限与 speaker 过滤仍每次重算。",
+    "default": 20
+  },
+  "high_evidence_confidence": {
+    "description": "高证据置信度阈值",
+    "type": "float",
+    "hint": "旧事实达到该置信度，且仅被单次新说法挑战时，进入待确认覆盖而不是立刻替换。",
+    "default": 0.8
+  },
+  "debug_log_injection": {
+    "description": "注入调试日志",
+    "type": "bool",
+    "hint": "排障时打开。会记录检索路径、选中/过滤原因和实际注入包，不含密码类原文。",
+    "default": false
+  },
+  "coexistence_degrade": {
+    "description": "检测同类插件并降级",
+    "type": "bool",
+    "hint": "发现 memory_companion / LivingMemory 等重叠能力时跳过对应采集或注入，并在面板显示原因。",
+    "default": true
+  },
+  "learning_enabled": {
+    "description": "启用自主学习",
+    "type": "bool",
+    "hint": "关闭后不再排队黑话、few-shot、人格草稿。事实抽取不受影响。检测到 self_learning 时会自动跳过风格/黑话。",
+    "default": true
+  },
+  "jargon_enabled": {
+    "description": "黑话释义学习",
+    "type": "bool",
+    "hint": "统计预筛高频词，LLM 只写含义。批准后注入「这个词是什么意思」，不强迫复读。",
+    "default": true
+  },
+  "jargon_min_count": {
+    "description": "黑话进入候选的最低出现次数",
+    "type": "int",
+    "default": 4
+  },
+  "jargon_cooldown_seconds": {
+    "description": "黑话挖掘冷却（秒）",
+    "type": "int",
+    "default": 120
+  },
+  "fewshot_enabled": {
+    "description": "真实对话 few-shot",
+    "type": "bool",
+    "hint": "从时间线里的 user→bot 邻接对生成表达样本，默认待审。",
+    "default": true
+  },
+  "persona_draft_enabled": {
+    "description": "人格增量草稿",
+    "type": "bool",
+    "hint": "根据已批准 few-shot 生成不超过 80 字的补丁草稿。批准后只注入，不写回 AstrBot 人格文件。",
+    "default": true
+  },
+  "persona_draft_min_fewshots": {
+    "description": "生成人格草稿所需已批准 few-shot 数",
+    "type": "int",
+    "default": 4
+  },
+  "persona_draft_cooldown_seconds": {
+    "description": "人格草稿冷却（秒）",
+    "type": "int",
+    "hint": "写入数据库，重载插件后仍生效。默认一天最多生成一次草稿。",
+    "default": 86400
+  },
+  "persona_draft_ttl_seconds": {
+    "description": "已批准人格草稿有效期（秒）",
+    "type": "int",
+    "hint": "超过后不再注入，避免旧补丁永远占位。默认 14 天。",
+    "default": 1209600
+  },
+  "inject_jargon_limit": {
+    "description": "每轮注入黑话条数上限",
+    "type": "int",
+    "default": 3
+  },
+  "inject_fewshot_limit": {
+    "description": "每轮注入 few-shot 条数上限",
+    "type": "int",
+    "default": 2
+  },
+  "sleep_timeline_retain_days": {
+    "description": "已总结时间线保留天数",
+    "type": "int",
+    "hint": "睡眠维护会删除超过该天数且已抽取的时间线。未总结的记录不会删。",
+    "default": 30
+  },
+  "sleep_low_value_days": {
+    "description": "低价值事实归档最短天数",
+    "type": "int",
+    "hint": "低置信、少访问、非纠正的 live 事实超过该天数后归档，不硬删除。",
+    "default": 30
+  },
+  "sleep_low_value_confidence": {
+    "description": "低价值归档置信度上限",
+    "type": "float",
+    "default": 0.45
+  }
+}

@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>Savage Type</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <div>
+          <h1>Savage Type</h1>
+          <p class="lede">全局记忆中枢。人格仍读 AstrBot；事实、改口、已批准的黑话释义和表达样本从这里注入。</p>
+        </div>
+        <div class="row">
+          <button id="refresh">刷新</button>
+          <button class="ghost" id="extract">抽取事实</button>
+          <button class="ghost" id="sleep">维护</button>
+        </div>
+      </header>
+
+      <div class="kpis" id="kpis"></div>
+      <p id="coexist" class="lede"></p>
+      <section class="card" id="alias-card">
+        <h2>说话人归并建议</h2>
+        <p class="lede">同名不同 id 不会自动合并，点映射才写入。</p>
+        <div id="alias-suggestions"></div>
+      </section>
+
+      <div class="grid">
+        <section class="card">
+          <h2>记忆显微镜</h2>
+          <div class="row">
+            <input id="q" placeholder="关键词 / 当前问题" />
+            <input id="speaker" placeholder="说话人 id（可空）" />
+            <button id="search">检索</button>
+          </div>
+          <div id="hits"></div>
+        </section>
+
+        <section class="card">
+          <h2>待确认覆盖</h2>
+          <div id="pending"></div>
+        </section>
+
+        <section class="card">
+          <h2>学习审查</h2>
+          <p class="lede">黑话释义 / few-shot / 人格草稿。批准后才注入，不写回人格文件。</p>
+          <div class="row">
+            <button class="ghost" id="learn">跑一轮学习</button>
+          </div>
+          <div id="reviews"></div>
+        </section>
+
+        <section class="card">
+          <h2>手动记住</h2>
+          <textarea id="remember-text" placeholder="用户明确说过、值得长期留下的事实"></textarea>
+          <div class="row">
+            <input id="remember-speaker" placeholder="speaker_id" />
+            <button id="remember">写入</button>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>superseded / 回滚</h2>
+          <div class="row">
+            <input id="rollback-id" placeholder="当前 live 事实 id" />
+            <button class="ghost" id="rollback">回滚</button>
+          </div>
+          <div id="archived"></div>
+        </section>
+
+        <section class="card full">
+          <h2>备份 / 导入</h2>
+          <p class="lede">JSONL 换机导入会先自动备份当前库。聊天导入只支持粘贴文本，不走 QQ 接口。</p>
+          <div class="row">
+            <button class="ghost" id="export">导出 JSONL</button>
+          </div>
+          <div class="row">
+            <input id="archive-path" placeholder="JSONL 绝对路径" />
+            <button class="ghost" id="archive-preview">预览档案</button>
+            <button id="archive-import">确认导入档案</button>
+          </div>
+          <textarea id="chat-text" placeholder="用户: 2026-09-01 12:00:00&#10;我喜欢喝茶&#10;&#10;Bot: 2026-09-01 12:00:03&#10;记下了"></textarea>
+          <div class="row">
+            <input id="chat-users" placeholder="用户名，逗号分隔" />
+            <input id="chat-bots" placeholder="Bot 名，逗号分隔" />
+            <button class="ghost" id="chat-preview">预览聊天</button>
+            <button id="chat-import">导入聊天</button>
+          </div>
+        </section>
+
+        <section class="card full">
+          <h2>注入显微镜</h2>
+          <p class="lede">默认记录最近注入。debug_log_injection 只控制是否写日志。</p>
+          <div id="microscope"></div>
+        </section>
+
+        <section class="card full">
+          <h2>诊断</h2>
+          <pre id="diag"></pre>
+        </section>
+      </div>
+    </div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
