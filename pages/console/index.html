@@ -10,7 +10,7 @@
     <div class="wrap">
       <header>
         <div class="brand">
-          <img class="cover" src="../../_logo.webp" alt="" />
+          <img class="cover" src="./_logo.webp" alt="" />
           <div>
             <h1>Savage Type</h1>
             <p class="lede">人格读 AstrBot。这里管事实、改口、审查后的学习草稿。</p>
@@ -36,12 +36,18 @@
         <div class="grid">
           <section class="card full">
             <h2>记忆显微镜</h2>
-            <p class="lede">每条显示昵称和 QQ。删除会归档。手动记住的条目说话人固定为 admin。</p>
+            <p class="lede">检索、删除、手动写入都在这里。说话人可选已有 QQ，或手填。</p>
             <div class="row">
               <input id="q" placeholder="关键词" />
-              <input id="speaker" placeholder="QQ / speaker_id（可空）" />
+              <input id="speaker" placeholder="筛选 QQ（可空）" />
               <button type="button" data-act="search">检索</button>
               <button type="button" class="ghost" data-act="batch-archive">删除所选</button>
+            </div>
+            <textarea id="remember-text" placeholder="手动记住一条事实"></textarea>
+            <div class="row">
+              <select id="remember-speaker"></select>
+              <input id="remember-speaker-custom" placeholder="或手填 QQ / id" />
+              <button type="button" data-act="remember">写入</button>
             </div>
             <div class="scroll" id="hits"></div>
           </section>
@@ -63,25 +69,16 @@
             <div class="scroll" id="alias-suggestions"></div>
           </section>
 
-          <section class="card">
-            <h2>手动记住</h2>
-            <p class="lede">写入后说话人固定为 admin，不和用户 QQ 抢同一槽。</p>
-            <textarea id="remember-text" placeholder="值得长期留下的事实"></textarea>
-            <div class="row">
-              <button type="button" data-act="remember">写入 admin</button>
-            </div>
-            <div class="scroll short" id="archived"></div>
-          </section>
-
           <section class="card full">
             <h2>注入显微镜</h2>
             <div class="scroll" id="microscope"></div>
           </section>
 
           <section class="card full">
-            <h2>备份 / 聊天导入</h2>
+            <h2>聊天导入</h2>
+            <p class="lede">默认读取插件数据目录。可改成其它 JSONL 路径。</p>
             <div class="row">
-              <input id="archive-path" placeholder="JSONL 绝对路径（导入用）" />
+              <input id="archive-path" placeholder="JSONL 路径" />
               <button type="button" class="ghost" data-act="archive-preview">预览档案</button>
               <button type="button" data-act="archive-import">确认导入档案</button>
             </div>

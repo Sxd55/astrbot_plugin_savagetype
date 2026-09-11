@@ -123,11 +123,41 @@ class SavageTypeService:
     def enabled(self) -> bool:
         return bool(self.config.get("enabled", True))
 
-    def capture_ok(self) -> bool:
-        return self.enabled() and bool(self.config.get("capture_enabled", True)) and not self.coexistence.skip_capture
+    def whitelist_ids(self) -> list[str]:
+        raw = str(self.config.get("memory_whitelist") or "")
+        return [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
 
-    def inject_ok(self) -> bool:
-        return self.enabled() and bool(self.config.get("inject_enabled", True)) and not self.coexistence.skip_inject
+    def window_allowed(self, event: Any = None, ident: dict[str, str] | None = None) -> bool:
+        allow = self.whitelist_ids()
+        if not allow:
+            return True
+        ident = ident or (self._ident_from_event(event) if event is not None else {})
+        window = str((ident or {}).get("window_tag") or "")
+        speaker = str((ident or {}).get("speaker_id") or "")
+        group = ""
+        if event is not None:
+            try:
+                group = str(event.get_group_id() or "")
+            except Exception:
+                group = str(getattr(getattr(event, "message_obj", None), "group_id", "") or "")
+        hay = " ".join([window, speaker, group])
+        return any(item and item in hay for item in allow)
+
+    def capture_ok(self, event: Any = None) -> bool:
+        return (
+            self.enabled()
+            and bool(self.config.get("capture_enabled", True))
+            and not self.coexistence.skip_capture
+            and self.window_allowed(event)
+        )
+
+    def inject_ok(self, event: Any = None) -> bool:
+        return (
+            self.enabled()
+            and bool(self.config.get("inject_enabled", True))
+            and not self.coexistence.skip_inject
+            and self.window_allowed(event)
+        )
 
     def refresh_coexistence(self, stars: list[Any]) -> None:
         self.coexistence.refresh(stars)
@@ -178,7 +208,7 @@ class SavageTypeService:
         }
 
     def capture_user(self, event: Any, text: str) -> int | None:
-        if not self.capture_ok():
+        if not self.capture_ok(event):
             return None
         text = (text or "").strip()
         if not text:
@@ -199,7 +229,7 @@ class SavageTypeService:
         return event_id
 
     def capture_bot(self, event: Any, text: str) -> int | None:
-        if not self.capture_ok():
+        if not self.capture_ok(event):
             return None
         text = (text or "").strip()
         if not text:
@@ -473,7 +503,16 @@ class SavageTypeService:
                 )
         return suggestions[:20]
 
-    def overview(self) -> dict[str, Any]:
+    def speaker_options(self) -> list[dict[str, str]]:
+        seen: dict[str, str] = {"admin": "admin"}
+        for row in self.store.speaker_name_map():
+            sid = str(row.get("speaker_id") or "")
+            if sid and sid not in seen:
+                seen[sid] = str(row.get("speaker_name") or sid)
+        for fact in self.store.facts_by_status("live", limit=200):
+            if fact.speaker_id and fact.speaker_id not in seen:
+                seen[fact.speaker_id] = fact.speaker_name or fact.speaker_id
+        return [{"id": k, "name": v} for k, v in seen.items()]
         counts = self.store.counts()
         return {
             "counts": counts,
@@ -482,6 +521,8 @@ class SavageTypeService:
             "usage": self.store.usage_summary(),
             "aliases": self.store.list_aliases(),
             "alias_suggestions": self.alias_suggestions(),
+            "speakers": self.speaker_options(),
+            "data_dir": str(self.store.db_path.parent),
             "embedding": self.embedding_status(),
             "config": {
                 "enabled": self.enabled(),

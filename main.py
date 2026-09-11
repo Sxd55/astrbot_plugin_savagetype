@@ -122,7 +122,7 @@ class SavageTypePlugin(Star):
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         try:
             self.service.refresh_coexistence(self.context.get_all_stars())
-            if not self.service.inject_ok():
+            if not self.service.inject_ok(event):
                 return
             query = (event.message_str or req.prompt or "").strip()
             if not query:
@@ -571,7 +571,7 @@ class SavageTypePlugin(Star):
 
     async def page_facts(self):
         status = request.query.get("status", "live")
-        facts = self.store.facts_by_status(status, limit=80)
+        facts = self.store.facts_by_status(status, limit=200)
         return json_response({"items": [self._fact_view(f) for f in facts]})
 
     async def page_pending(self):
@@ -617,9 +617,10 @@ class SavageTypePlugin(Star):
         content = str(payload.get("content") or "").strip()
         if not content:
             return error_response("missing content", status_code=400)
+        speaker_id = str(payload.get("speaker_id") or "admin").strip() or "admin"
         speaker = {
-            "speaker_id": "admin",
-            "speaker_name": "admin",
+            "speaker_id": speaker_id,
+            "speaker_name": str(payload.get("speaker_name") or speaker_id),
             "bot_id": "",
             "window_tag": "console",
             "persona_id": str(payload.get("persona_id") or ""),

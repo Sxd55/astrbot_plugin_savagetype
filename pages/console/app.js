@@ -42,7 +42,7 @@ function showDiag(data) {
 async function run(label, fn) {
   try {
     const r = await fn();
-    if (r && r.error) toast(`${label}失败`);
+    if (r && r.ok === false) toast(`${label}失败`);
     else toast(label);
     if (r !== undefined) showDiag(r);
     return r;
@@ -118,15 +118,24 @@ async function loadOverview() {
         <button type="button" data-act="alias" data-alias="${esc(s.alias)}" data-canonical="${esc(s.canonical_id)}">映射</button></div>`).join("")
     : `<p class="lede">没有同名不同 id 的建议。</p>`;
   showDiag({ overview: ov });
+  const sel = $("remember-speaker");
+  if (sel) {
+    const speakers = ov.speakers || [{ id: "admin", name: "admin" }];
+    sel.innerHTML = speakers.map((s) =>
+      `<option value="${esc(s.id)}">${esc(s.name)} (${esc(s.id)})</option>`
+    ).join("");
+  }
+  const pathBox = $("archive-path");
+  if (pathBox && !pathBox.value && ov.data_dir) {
+    pathBox.placeholder = ov.data_dir;
+    pathBox.value = ov.data_dir || "";
+  }
 }
 
 async function loadFacts() {
   const live = await apiGet("facts", { status: "live" });
-  const archived = await apiGet("facts", { status: "superseded" });
-  $("archived").innerHTML = (archived.items || []).slice(0, 12).map((f) => factItem(f)).join("")
-    || `<p class="lede">没有 superseded 记录。</p>`;
   if (!$("hits").dataset.locked) {
-    $("hits").innerHTML = (live.items || []).slice(0, 40).map((f) => factItem(f, "", true)).join("")
+    $("hits").innerHTML = (live.items || []).slice(0, 80).map((f) => factItem(f, "", true)).join("")
       || `<p class="lede">还没有 live 事实。</p>`;
   }
 }
@@ -263,14 +272,18 @@ async function onAct(act, el) {
   if (act === "del") return run("已删除", async () => {
     if (!confirm(`归档 #${el.dataset.id}？`)) return { ok: false, error: "cancelled" };
     const r = await apiPost("facts/archive", { ids: [Number(el.dataset.id)] });
+    $("hits").dataset.locked = "";
     await reload();
     return r;
   });
   if (act === "remember") return run("已记住", async () => {
     const content = $("remember-text").value.trim();
     if (!content) return { ok: false, error: "empty" };
-    const r = await apiPost("remember", { content, speaker_id: "admin" });
+    const custom = ($("remember-speaker-custom").value || "").trim();
+    const speaker_id = custom || $("remember-speaker").value || "admin";
+    const r = await apiPost("remember", { content, speaker_id });
     $("remember-text").value = "";
+    $("hits").dataset.locked = "";
     await reload();
     return r;
   });

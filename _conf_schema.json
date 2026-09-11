@@ -204,5 +204,11 @@
     "description": "低价值归档置信度上限",
     "type": "float",
     "default": 0.45
+  },
+  "memory_whitelist": {
+    "description": "记忆白名单",
+    "type": "string",
+    "hint": "留空=不限制。填写群号或 QQ，逗号分隔。填了之后只有名单内的群聊/私聊会采集和注入。",
+    "default": ""
   }
 }
