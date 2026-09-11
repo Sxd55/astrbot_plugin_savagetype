@@ -38,7 +38,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "2.5.3",
+    "2.6.0",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -97,6 +97,8 @@ class SavageTypePlugin(Star):
             ("facts/archive", self.page_facts_archive, ["POST"], "Archive facts"),
             ("config", self.page_config_get, ["GET"], "Plugin config and schema"),
             ("config/save", self.page_config_save, ["POST"], "Save plugin config"),
+            ("dossiers", self.page_dossiers, ["GET"], "List QQ dossiers"),
+            ("dossier", self.page_dossier, ["GET"], "One QQ dossier"),
         ]
         for route, handler, methods, desc in apis:
             self.context.register_web_api(
@@ -228,6 +230,17 @@ class SavageTypePlugin(Star):
             return
         lines = [f"{f.id} [{f.speaker_name or f.speaker_id}/{f.attribute}] {clip(f.content, 80)}" for f in facts]
         yield event.plain_result("\n".join(lines))
+
+    @stype.command("dossier")
+    async def cmd_dossier(self, event: AstrMessageEvent, speaker_id: str = ""):
+        """查看某人按 QQ 汇总的短档案"""
+        ident = await self._ident(event)
+        sid = (speaker_id or ident["speaker_id"]).strip()
+        card = self.service.dossier_for(sid, persona_id=ident.get("persona_id") or "")
+        if not card.get("card"):
+            yield event.plain_result(f"{sid} 还没有短档案（需要至少一条 live 事实）。")
+            return
+        yield event.plain_result(card["card"])
 
     @stype.command("explain")
     async def cmd_explain(self, event: AstrMessageEvent):
@@ -802,6 +815,17 @@ class SavageTypePlugin(Star):
         if not isinstance(ids, list):
             ids = [ids]
         return json_response(self.store.archive_facts(ids, reason="ui_delete"))
+
+    async def page_dossiers(self):
+        persona_id = request.query.get("persona_id", "") or ""
+        return json_response({"items": self.service.list_dossiers(persona_id=persona_id)})
+
+    async def page_dossier(self):
+        speaker_id = request.query.get("speaker_id", "") or ""
+        if not speaker_id:
+            return error_response("missing speaker_id", status_code=400)
+        persona_id = request.query.get("persona_id", "") or ""
+        return json_response(self.service.dossier_for(speaker_id, persona_id=persona_id))
 
     def _fact_view(self, f) -> dict:
         return {

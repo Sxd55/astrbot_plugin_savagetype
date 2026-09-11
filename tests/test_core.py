@@ -640,6 +640,18 @@ class CoreTest(unittest.TestCase):
         self.assertTrue(service.is_self_directive("记住我叫小明"))
         self.assertFalse(service.is_self_directive("今天天气真好"))
 
+    def test_dossier_card_from_live_facts(self):
+        from savagetype.profiles import build_profile
+
+        self.engine.ingest(_payload(attribute="likes", value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        self.engine.ingest(_payload(attribute="name", value="阿U", content="叫我阿U"), "叫我阿U")
+        facts = self.store.live_by_speaker("u1")
+        card = build_profile("u1", facts, speaker_name="阿U")
+        self.assertIn("u1", card["card"])
+        self.assertTrue(any("茶" in line for line in card["lines"]))
+        other = build_profile("u2", facts)
+        self.assertFalse(other["lines"])
+
 
 if __name__ == "__main__":
     unittest.main()

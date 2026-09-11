@@ -2,7 +2,7 @@
 
 Savage Type 是面向 AstrBot 的全局人格记忆中枢。Savage 只是插件名。身份和语气永远读 AstrBot 当前人格；本插件只负责记住事实、处理改口、在需要时把少量相关记忆注入本轮对话。不改写人格文件，不做日程和主动陪伴。
 
-当前版本 `v2.5.3`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
+当前版本 `v2.6.0`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
 
 要求 AstrBot `>= 4.22.0`。
 
@@ -36,7 +36,7 @@ AstrBot WebUI → 插件 → Savage Type → 拓展页。常用能力都做成�
 
 工作台分区：
 
-- 记忆显微镜：看、搜、删、手动写入都在这里。每条显示昵称和 QQ。可单条删除或勾选批量删除（归档，不硬抹）。写入时可从已有 QQ 下拉，或手填 id。
+- 人物档案：每人一张短卡，键是 QQ。有 live 事实才出现。主链只注入当前说话人的压缩卡（称呼、偏好、习惯、约定），不是整份传记。
 - 学习审查：黑话释义、few-shot、人格草稿的待办。批准后才进主链；驳回后同一指纹默认不再入队。和「待确认覆盖」不是一回事。
 - 待确认覆盖：高证据旧事实被新说法挑战时，在这里确认换还是驳回。
 - 说话人归并：同名不同 QQ 的建议。不会自动合并，要点「映射」。
@@ -88,7 +88,7 @@ AstrBot WebUI → 插件 → Savage Type → 拓展页。常用能力都做成�
 | `/stype reviews [kind]` | 待审学习项 |
 | `/stype approve <id>` | 批准学习草稿 |
 | `/stype reject <id>` | 驳回学习草稿 |
-| `/stype microscope [n]` | 最近注入快照 |
+| `/stype dossier [QQ]` | 当前说话人或指定 QQ 的短档案 |
 | `/stype export` | 导出 JSONL 到数据目录 |
 | `/stype import 预览\|确认 <路径>` | 预览或导入 JSONL（确认前会备份当前库） |
 | `/stype alias <旧id> <主id>` | 说话人归并 |

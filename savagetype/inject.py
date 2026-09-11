@@ -64,6 +64,7 @@ def build_pack(
     budget: int = 1000,
     companion_present: bool = False,
     learning: LearningPack | None = None,
+    dossier: str = "",
 ) -> str:
     learning = learning or LearningPack()
     if result.route == "low_info":
@@ -74,7 +75,7 @@ def build_pack(
                 if term_in_query(str(j.get("term") or ""), result.query or "")
             ]
         )
-        if not result.core and not learning.jargon:
+        if not result.core and not learning.jargon and not dossier:
             return ""
 
     related = result.related
@@ -82,6 +83,8 @@ def build_pack(
         related = [f for f in related if f.attribute not in {"status", "schedule", "mood"}]
 
     kept = [INJECT_PREFIX.strip()]
+    if dossier:
+        _append_if_fits(kept, dossier, budget)
     _append_core_lines(kept, result.core, budget)
     _append_if_fits(kept, _fact_block("【本轮相关】", related), budget)
     _append_if_fits(

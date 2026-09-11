@@ -23,6 +23,7 @@ from .contradiction import ContradictionEngine
 from .extract import Extractor
 from .inject import build_pack
 from .learn import LearningEngine
+from .profiles import build_profile
 from .retrieve import Retriever, detect_other_speaker
 from .store import Store
 from .slots import apply_slot
@@ -360,14 +361,33 @@ class SavageTypeService:
             speaker_ids=ids,
         )
 
+    def dossier_for(self, speaker_id: str, persona_id: str = "") -> dict[str, Any]:
+        canonical = self.store.resolve_speaker(speaker_id)
+        ids = self.store.speaker_ids_for(canonical)
+        facts = self.store.live_by_speaker(canonical, persona_id=persona_id, speaker_ids=ids, limit=40)
+        name = ""
+        if facts:
+            name = facts[0].speaker_name or ""
+        return build_profile(canonical, facts, speaker_name=name)
+
+    def list_dossiers(self, persona_id: str = "") -> list[dict[str, Any]]:
+        out = []
+        for row in self.store.distinct_live_speakers(persona_id=persona_id, limit=80):
+            card = self.dossier_for(row["speaker_id"], persona_id=persona_id)
+            if card.get("lines"):
+                out.append(card)
+        return out
+
     async def build_injection(self, query: str, speaker_id: str, persona_id: str = "") -> tuple[str, Any, dict[str, Any]]:
         result = await self.retrieve_for(query, speaker_id, persona_id=persona_id)
         learning = self.learning.pack_for(query, persona_id=persona_id, route=result.route)
+        dossier = self.dossier_for(speaker_id, persona_id=persona_id)
         pack = build_pack(
             result,
             budget=int(self.config.get("inject_budget_chars") or 800),
             companion_present=any("companion" in d for d in self.coexistence.detected),
             learning=learning,
+            dossier=dossier.get("card") or "",
         )
         snapshot = {
             "query": clip(query, 80),
@@ -388,6 +408,7 @@ class SavageTypeService:
             "jargon": [j.get("term") for j in (learning.jargon or [])],
             "fewshots": len(learning.fewshots or []),
             "persona_draft": bool(learning.persona_draft),
+            "dossier": bool(dossier.get("card")),
             "injected": bool(pack),
         }
         self.store.add_diag("inject", snapshot)

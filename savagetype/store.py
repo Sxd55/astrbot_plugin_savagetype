@@ -416,6 +416,49 @@ class Store:
         )
         return [self._fact(r) for r in rows]
 
+    def live_by_speaker(
+        self,
+        speaker_id: str,
+        persona_id: str = "",
+        speaker_ids: list[str] | None = None,
+        limit: int = 40,
+    ) -> list[Fact]:
+        ids = list(speaker_ids or [])
+        if speaker_id and speaker_id not in ids:
+            ids.append(speaker_id)
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        params: list[Any] = list(ids)
+        clauses = [f"status='live'", f"speaker_id IN ({placeholders})"]
+        if persona_id:
+            clauses.append("(persona_id=? OR persona_id='')")
+            params.append(persona_id)
+        params.append(limit)
+        sql = f"SELECT * FROM facts WHERE {' AND '.join(clauses)} ORDER BY confidence DESC, updated_at DESC LIMIT ?"
+        return [self._fact(r) for r in self.query(sql, params)]
+
+    def distinct_live_speakers(self, persona_id: str = "", limit: int = 80) -> list[dict[str, Any]]:
+        if persona_id:
+            rows = self.query(
+                """SELECT speaker_id, MAX(speaker_name) AS speaker_name, COUNT(*) AS n
+                   FROM facts WHERE status='live' AND (persona_id=? OR persona_id='')
+                   GROUP BY speaker_id ORDER BY n DESC LIMIT ?""",
+                (persona_id, limit),
+            )
+        else:
+            rows = self.query(
+                """SELECT speaker_id, MAX(speaker_name) AS speaker_name, COUNT(*) AS n
+                   FROM facts WHERE status='live'
+                   GROUP BY speaker_id ORDER BY n DESC LIMIT ?""",
+                (limit,),
+            )
+        return [
+            {"speaker_id": r["speaker_id"], "speaker_name": r["speaker_name"] or r["speaker_id"], "count": int(r["n"] or 0)}
+            for r in rows
+            if r["speaker_id"]
+        ]
+
     def archive_facts(self, ids: list[int], reason: str = "ui_delete") -> dict[str, Any]:
         archived: list[int] = []
         missing: list[int] = []

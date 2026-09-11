@@ -227,9 +227,24 @@ function readSettings() {
   return values;
 }
 
+async function loadDossiers() {
+  const box = $("dossiers");
+  if (!box) return;
+  const data = await apiGet("dossiers");
+  const items = data.items || [];
+  box.innerHTML = items.length
+    ? items.map((d) => `<div class="item">
+        <span class="chip">${esc(d.speaker_name || "")}</span>
+        <span class="chip">${esc(d.speaker_id)}</span>
+        <div>${esc((d.lines || []).join("；"))}</div>
+      </div>`).join("")
+    : `<p class="lede">还没有人物档案。管理员明确自述并抽取后才会出现。</p>`;
+}
+
 async function reload() {
   await loadOverview();
   await loadFacts();
+  await loadDossiers();
   await loadPending();
   await loadReviews();
   await loadMicroscope();
