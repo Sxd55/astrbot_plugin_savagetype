@@ -80,6 +80,45 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(r["action"], "ignored_joke")
         self.assertEqual(self.store.live_by_slot("u1", "self", "likes").value, "茶")
 
+    def test_dislike_flip_stays_on_likes_slot(self):
+        self.store.add_timeline(
+            {
+                "ts": 1,
+                "speaker_id": "u1",
+                "speaker_name": "阿U",
+                "bot_id": "b",
+                "window_tag": "w",
+                "role": "user",
+                "content": "我喜欢hiphop音乐",
+                "fingerprint": "t-hiphop-1",
+            }
+        )
+        self.store.add_timeline(
+            {
+                "ts": 2,
+                "speaker_id": "u1",
+                "speaker_name": "阿U",
+                "bot_id": "b",
+                "window_tag": "w",
+                "role": "user",
+                "content": "我改口了我现在不喜欢听hiphop音乐",
+                "fingerprint": "t-hiphop-2",
+            }
+        )
+        facts = self.extractor.extract_heuristic(self.store.unsummarized(limit=10))
+        likes = [f for f in facts if f["attribute"] == "likes"]
+        self.assertGreaterEqual(len(likes), 2)
+        self.assertFalse(any(f["attribute"] == "dislikes" for f in facts if "hiphop" in f.get("value", "").lower() or "hiphop" in f.get("content", "").lower()))
+        r1 = self.engine.ingest(likes[0], likes[0]["content"])
+        r2 = self.engine.ingest(likes[-1], likes[-1]["content"])
+        self.assertIn(r2["action"], {"supersede", "refresh"})
+        live = self.store.live_by_slot("u1", "self", "likes")
+        self.assertIsNotNone(live)
+        self.assertTrue(live.value.startswith("不") or "不喜欢" in live.content)
+        old = self.store.get_fact(r1["fact_id"])
+        if r2["action"] == "supersede":
+            self.assertEqual(old.status, "superseded")
+
     def test_hearsay_uncertain(self):
         r = self.engine.ingest(
             _payload(value="猫", content="听说他喜欢猫", first_person=0),

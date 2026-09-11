@@ -41,11 +41,13 @@ def values_conflict(old: str, new: str) -> bool:
     a, b = normalize_slot(old), normalize_slot(new)
     if not a or not b or a == b:
         return False
+    neg = ("不", "没", "别", "非")
+    a_neg = any(a.startswith(n) for n in neg)
+    b_neg = any(b.startswith(n) for n in neg)
+    if a_neg != b_neg:
+        return True
     if a in b or b in a:
         return False
-    neg = ("不", "没", "别", "非")
-    if any(a.startswith(n) for n in neg) != any(b.startswith(n) for n in neg):
-        return True
     return True
 
 

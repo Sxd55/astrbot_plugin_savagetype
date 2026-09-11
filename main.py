@@ -35,7 +35,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "2.3.2",
+    "2.3.3",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -398,7 +398,6 @@ class SavageTypePlugin(Star):
             )
         yield event.plain_result("\n".join(lines))
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @stype.command("extract")
     async def cmd_extract(self, event: AstrMessageEvent):
         """立刻抽取未总结时间线"""

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Awaitable
 
 from .contradiction import ContradictionEngine, looks_correction, looks_first_person
@@ -79,18 +80,20 @@ class Extractor:
                 value = clip(match.group(1), 40)
                 if not value:
                     continue
-                if attr == "likes" and ("不喜欢" in match.group(0) or "没喜欢" in match.group(0)):
-                    attr = "dislikes"
-                out.append(
-                    self._payload(
-                        ev,
-                        subject="self",
-                        attribute=attr,
-                        value=value,
-                        content=clip(text, 120),
-                        confidence=0.72 if looks_first_person(text) else 0.45,
-                    )
+                if attr == "likes" and re.search(r"(不喜欢|没喜欢|现在不喜欢|不再喜欢)", match.group(0)):
+                    value = "不" + value if not value.startswith("不") else value
+                payload = self._payload(
+                    ev,
+                    subject="self",
+                    attribute=attr,
+                    value=value,
+                    content=clip(text, 120),
+                    confidence=0.72 if looks_first_person(text) else 0.45,
                 )
+                if looks_correction(text):
+                    payload["explicit_correction"] = 1
+                out.append(payload)
+                break
             if looks_correction(text) and len(text) <= 80:
                 out.append(
                     self._payload(
