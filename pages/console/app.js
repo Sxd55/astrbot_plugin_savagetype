@@ -267,14 +267,12 @@ async function onAct(act, el) {
   if (act === "batch-archive") return run("已删除所选", async () => {
     const ids = [...$("hits").querySelectorAll(".pick:checked")].map((n) => Number(n.dataset.id));
     if (!ids.length) return { ok: false, error: "未选择" };
-    if (!confirm(`归档 ${ids.length} 条？`)) return { ok: false, error: "cancelled" };
     const r = await apiPost("facts/archive", { ids });
     $("hits").dataset.locked = "";
     await reload();
     return r;
   });
   if (act === "del") return run("已删除", async () => {
-    if (!confirm(`归档 #${el.dataset.id}？`)) return { ok: false, error: "cancelled" };
     const r = await apiPost("facts/archive", { ids: [Number(el.dataset.id)] });
     $("hits").dataset.locked = "";
     await reload();
