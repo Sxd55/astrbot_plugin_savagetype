@@ -85,18 +85,16 @@
     "default": 2500
   },
   "embedding_provider_id": {
-    "description": "Embedding 提供商",
+    "description": "Embedding 提供商 ID",
     "type": "string",
-    "hint": "留空则使用 AstrBot 当前可用的第一个 Embedding Provider。",
-    "default": "",
-    "_special": "select_provider"
+    "hint": "AstrBot 目前只给对话模型提供下拉选择器，嵌入/重排序模型请在插件面板「设置」里下拉选择（按类型过滤），或在这里手填提供商 ID。留空则用第一个可用的 Embedding Provider。",
+    "default": ""
   },
   "rerank_provider_id": {
-    "description": "Rerank 提供商",
+    "description": "Rerank 提供商 ID",
     "type": "string",
-    "hint": "留空则使用当前可用的第一个 Rerank Provider。有预算时优先配这一项，通常比 Embedding 更能提升召回。",
-    "default": "",
-    "_special": "select_provider"
+    "hint": "同上：在插件面板「设置」里选择，或手填提供商 ID。留空则用第一个可用的 Rerank Provider。有预算时优先配这一项。",
+    "default": ""
   },
   "top_k": {
     "description": "召回候选数",
@@ -142,8 +140,8 @@
   "memory_source_platforms": {
     "description": "记忆来源平台",
     "type": "string",
-    "hint": "逗号分隔。默认只记录 QQ（aiocqhttp / qq_official）。webchat（ChatUI）不在名单内，不会被记录。",
-    "default": "aiocqhttp,qq_official"
+    "hint": "逗号分隔的适配器类型。默认只记录 QQ（aiocqhttp / qq_official / qq_official_webhook）。webchat（ChatUI）不在名单内，不会被记录。",
+    "default": "aiocqhttp,qq_official,qq_official_webhook"
   },
   "pipeline_enabled": {
     "description": "AI 记忆整理与审核",
@@ -190,10 +188,16 @@
     "default": 7
   },
   "ui_theme_color": {
-    "description": "面板主题色",
+    "description": "面板主题色（主色 / UI 强调）",
     "type": "string",
-    "hint": "十六进制颜色，例如 #7c5cff。",
+    "hint": "十六进制颜色。面板里也能用预设按钮切换。默认 #7c5cff 是着色器渐变风格签名色。",
     "default": "#7c5cff"
+  },
+  "ui_theme_color2": {
+    "description": "面板主题色（撞色 / 着色器副色）",
+    "type": "string",
+    "hint": "与主色一起驱动背景的实时着色器渐变场。",
+    "default": "#22d3ee"
   },
   "learning_enabled": {
     "description": "启用自主学习",

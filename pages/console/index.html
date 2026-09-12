@@ -7,6 +7,8 @@
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
+    <canvas id="sg-canvas" aria-hidden="true"></canvas>
+    <div id="sg-fallback" class="sg-fallback" aria-hidden="true" hidden></div>
     <div id="toast" hidden></div>
     <div class="wrap">
       <header class="topbar glass">
@@ -144,8 +146,18 @@
       <!-- 设置 -->
       <section id="page-settings" hidden>
         <section class="card glass">
+          <h2>外观</h2>
+          <p class="lede">撞色主题：主色 + 撞色两种颜色。点预设直接切换，或用取色器完全自定义。</p>
+          <div class="row" id="theme-presets"></div>
+          <div class="row">
+            <label class="color-field">主色 <input type="color" id="theme-color" value="#6366f1" /></label>
+            <label class="color-field">撞色 <input type="color" id="theme-color2" value="#22d3ee" /></label>
+            <button type="button" data-act="theme-apply">应用主题</button>
+          </div>
+        </section>
+        <section class="card glass">
           <h2>插件设置</h2>
-          <p class="lede">字段与 AstrBot 插件配置页相同，保存后立刻生效。</p>
+          <p class="lede">保存后立刻生效。模型下拉按类型分开：抽取/整理/审核只列对话模型，Embedding 与 Rerank 各自只列对应类型（AstrBot 原生配置页目前不支持这两类的选择器，需要手填 ID）。</p>
           <form id="settings-form" class="settings"></form>
           <div class="row">
             <button type="button" data-act="settings-save">保存设置</button>

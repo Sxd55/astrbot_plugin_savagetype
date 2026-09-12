@@ -95,8 +95,19 @@ def now_ts() -> int:
     return int(time.time())
 
 
+PLATFORM_ALIASES = {
+    "qq_official_webhook": "qq_official",
+    "qq_official_websocket": "qq_official",
+}
+
+
+def norm_platform(value: str) -> str:
+    key = (value or "").strip().lower()
+    return PLATFORM_ALIASES.get(key, key)
+
+
 def platform_of(window_tag: str) -> str:
-    return (window_tag or "").split(":", 1)[0].strip().lower()
+    return norm_platform((window_tag or "").split(":", 1)[0])
 
 
 def is_private_window(window_tag: str) -> bool:

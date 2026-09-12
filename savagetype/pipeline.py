@@ -57,6 +57,9 @@ def candidate_reason(ev: TimelineEvent, is_owner: bool) -> str:
     text = (ev.content or "").strip()
     if not text or COMMAND_SPLIT_RE.match(text) or LOW_INFO_RE.match(text):
         return ""
+    low = text.lower()
+    if low.startswith("stype") or low.startswith("savagetype_"):
+        return ""
     self_directive = bool(
         FIRST_PERSON_RE.search(text)
         and (DIRECTIVE_RE.search(text) or REMEMBER_RE.search(text) or CORRECTION_RE.search(text))

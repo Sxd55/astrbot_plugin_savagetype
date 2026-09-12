@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import re
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -11,10 +12,12 @@ from astrbot.core.provider.provider import EmbeddingProvider, RerankProvider
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path, get_astrbot_plugin_data_path
 
 try:
+    from .savagetype import __version__ as PLUGIN_VERSION
     from .savagetype.service import SavageTypeService
     from .savagetype.store import Store
     from .savagetype.util import PLUGIN_NAME, clip, now_ts
 except ImportError:
+    from savagetype import __version__ as PLUGIN_VERSION
     from savagetype.service import SavageTypeService
     from savagetype.store import Store
     from savagetype.util import PLUGIN_NAME, clip, now_ts
@@ -38,7 +41,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "2.8.0",
+    "3.0.0",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -120,6 +123,8 @@ class SavageTypePlugin(Star):
             ("profile/update", self.page_profile_update, ["POST"], "Update profile"),
             ("facts/update", self.page_fact_update, ["POST"], "Edit one fact"),
             ("reset", self.page_reset, ["POST"], "Clean rebuild with backup"),
+            ("providers", self.page_providers, ["GET"], "List providers by type"),
+            ("ui/theme", self.page_theme_set, ["POST"], "Save panel theme colors"),
         ]
         for route, handler, methods, desc in apis:
             self.context.register_web_api(
@@ -132,23 +137,32 @@ class SavageTypePlugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         try:
-            self.service.refresh_coexistence(self.context.get_all_stars())
             text = (event.message_str or "").strip()
             if not text:
                 return
-            self.service.remember_owner_window(event)
-            if self.service.is_owner_event(event):
-                reply = await self.service.handle_owner_reply(text)
-                if reply:
-                    await self.service.send_text(event.unified_msg_origin, reply)
-                    try:
-                        event.stop_event()
-                    except Exception:
-                        pass
-                    return
-            if text.startswith("/"):
+            try:
+                self.service.refresh_coexistence(self.context.get_all_stars())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Savage Type coexistence refresh failed: %s", exc)
+            try:
+                self.service.remember_owner_window(event)
+                if self.service.is_owner_event(event):
+                    reply = await self.service.handle_owner_reply(text)
+                    if reply:
+                        await self.service.send_text(event.unified_msg_origin, reply)
+                        try:
+                            event.stop_event()
+                        except Exception:
+                            pass
+                        return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Savage Type owner reply failed: %s", exc)
+            if self.service.is_command_text(text, event):
                 return
-            persona_id = await self._persona_id(event)
+            try:
+                persona_id = await self._persona_id(event)
+            except Exception:
+                persona_id = ""
             ident = self.service.identity_from_event(event, persona_id=persona_id)
             event.set_extra("_stype_ident", ident)
             self.service.capture_user(event, text)
@@ -228,12 +242,18 @@ class SavageTypePlugin(Star):
         ov = self.service.overview()
         c = ov["counts"]
         co = ov["coexistence"]
+        skip = ov["config"].get("capture_skip") or {}
+        skip_line = f"{skip.get('reason')}（{skip.get('platform') or '?'}）" if skip else "无"
         yield event.plain_result(
-            "Savage Type 状态\n"
+            f"Savage Type 状态 v{PLUGIN_VERSION}\n"
             f"时间线 {c['timeline']} / 未总结 {c['unsummarized']}\n"
             f"live {c['facts_live']} / superseded {c['facts_superseded']} / 覆盖待确认 {c['pending']}\n"
+            f"主人记忆 {c.get('owner_facts', 0)} / 档案 {c.get('profiles', 0)} / 待审记忆 {c.get('memory_pending', 0)}\n"
             f"学习待审 {c.get('reviews_pending', 0)} / 黑话 {c.get('jargon_approved', 0)} / few-shot {c.get('fewshot_approved', 0)}\n"
             f"采集 {'开' if ov['config']['capture'] else '关'} 注入 {'开' if ov['config']['inject'] else '关'}\n"
+            f"本会话平台 {self.service.event_platform(event) or '未知'}\n"
+            f"允许平台 {', '.join(ov['config'].get('platforms') or []) or '不限'}\n"
+            f"上次采集跳过 {skip_line}\n"
             f"检索 {ov['config']['retrieval_mode']} embedding {ov['config']['embedding_enabled']}\n"
             f"降级 {', '.join(co['reasons']) or '无'}"
         )
@@ -795,6 +815,83 @@ class SavageTypePlugin(Star):
         counts = self.store.clear_dirty_v280()
         self.store.add_diag("clean_rebuild", {"backup": str(backup), "cleared": counts})
         return json_response({"ok": True, "backup": str(backup), "cleared": counts})
+
+    def _provider_entry(self, provider) -> dict:
+        pid = ""
+        model = ""
+        try:
+            meta = provider.meta()
+            pid = str(getattr(meta, "id", "") or "")
+            model = str(getattr(meta, "model", "") or "")
+        except Exception:
+            pid = ""
+        return {"id": pid, "model": model, "name": f"{pid} · {model}".strip(" ·") if (pid or model) else "未命名"}
+
+    def page_providers_sync(self) -> dict:
+        def collect(providers) -> list[dict]:
+            out: list[dict] = []
+            seen: set[str] = set()
+            for provider in providers or []:
+                entry = self._provider_entry(provider)
+                key = entry.get("id") or entry.get("name") or ""
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                out.append(entry)
+            return out
+
+        chat: list[dict] = []
+        embedding: list[dict] = []
+        rerank: list[dict] = []
+        try:
+            chat = collect(self.context.get_all_providers())
+        except Exception:
+            pass
+        try:
+            manager = self.context.provider_manager
+            insts = getattr(manager, "embedding_provider_insts", None)
+            if insts is None:
+                insts = self.context.get_all_embedding_providers()
+            embedding = collect(insts)
+        except Exception:
+            pass
+        try:
+            manager = self.context.provider_manager
+            insts = getattr(manager, "rerank_provider_insts", None)
+            if insts:
+                rerank = collect(insts)
+            else:
+                inst_map = getattr(manager, "inst_map", {}) or {}
+                rerank = collect([p for p in inst_map.values() if isinstance(p, RerankProvider)])
+        except Exception:
+            pass
+        return {"chat": chat, "embedding": embedding, "rerank": rerank}
+
+    async def page_providers(self):
+        return json_response(self.page_providers_sync())
+
+    async def page_theme_set(self):
+        payload = await request.json(default={})
+        color = str(payload.get("color") or "").strip()
+        color2 = str(payload.get("color2") or "").strip()
+        hex_re = re.compile(r"^#[0-9a-fA-F]{6}$")
+        if not hex_re.match(color):
+            return error_response("bad color", status_code=400)
+        self.config["ui_theme_color"] = color.lower()
+        if color2:
+            if not hex_re.match(color2):
+                return error_response("bad color2", status_code=400)
+            self.config["ui_theme_color2"] = color2.lower()
+        if hasattr(self.config, "save_config"):
+            self.config.save_config()
+        self.service.apply_config()
+        return json_response(
+            {
+                "ok": True,
+                "color": self.config["ui_theme_color"],
+                "color2": self.config.get("ui_theme_color2", ""),
+            }
+        )
 
     async def page_pending(self):
         items = self.store.pending_open(80)

@@ -690,6 +690,7 @@ class FakeEvent:
         window: str = "aiocqhttp:GroupMessage:100",
         bot_id: str = "bot",
         role: str = "member",
+        message_text: str = "",
     ):
         self._sender = sender
         self._name = name
@@ -699,6 +700,7 @@ class FakeEvent:
         self.message_obj = SimpleNamespace(
             self_id=bot_id,
             sender=SimpleNamespace(user_id=sender),
+            message=[SimpleNamespace(text=message_text)],
         )
 
     def get_sender_id(self) -> str:
@@ -775,6 +777,40 @@ class V280Test(unittest.TestCase):
         self.assertEqual(self.store.delete_empty_profiles(ttl_days=7), 1)
         self.assertIsNone(self.store.get_profile("newbie"))
 
+    def test_platform_type_and_alias(self):
+        service = self._service(memory_source_platforms="aiocqhttp,qq_official")
+        ev = FakeEvent(window="mybot:GroupMessage:100")
+        ev.get_platform_name = lambda: "qq_official_webhook"
+        ident = service.identity_from_event(ev)
+        self.assertEqual(ident["platform"], "qq_official")
+        self.assertTrue(service.platform_allowed(ident))
+
+        web = FakeEvent(window="webchat:FriendMessage:web", sender="admin-web", name="主人")
+        web.get_platform_name = lambda: "webchat"
+        web_ident = service.identity_from_event(web)
+        self.assertTrue(web_ident["is_owner"])
+        self.assertEqual(service.capture_skip_reason(web, web_ident), "")
+        self.assertIsNotNone(service.capture_user(web, "我喜欢喝茶"))
+        self.assertEqual(self.store.counts()["timeline"], 1)
+        self.assertIsNone(self.store.get_profile("admin-web"))
+
+        qq = FakeEvent(sender="u9", name="路人")
+        qq.get_platform_name = lambda: "aiocqhttp"
+        self.assertIsNotNone(service.capture_user(qq, "我喜欢喝茶"))
+        self.assertIsNotNone(self.store.get_profile("u9"))
+
+    def test_command_text_is_skipped(self):
+        service = self._service()
+        ev = FakeEvent(sender="u1", name="阿U", message_text="/stype status")
+        self.assertTrue(service.is_command_text("stype status", ev))
+        self.assertIsNone(service.capture_user(ev, "stype status"))
+        self.assertEqual(self.store.counts()["timeline"], 0)
+
+        plain = FakeEvent(sender="u1", name="阿U", message_text="我喜欢喝茶")
+        self.assertFalse(service.is_command_text("我喜欢喝茶", plain))
+        self.assertIsNotNone(service.capture_user(plain, "我喜欢喝茶"))
+        self.assertEqual(self.store.counts()["timeline"], 1)
+
     def test_manual_remember_keeps_speaker(self):
         service = self._service()
         speaker = {"speaker_id": "u2", "speaker_name": "老二", "window_tag": "aiocqhttp:FriendMessage:2"}
@@ -795,6 +831,21 @@ class V280Test(unittest.TestCase):
             window_tag="w", role="user", content="我喜欢喝茶",
         )
         self.assertEqual(candidate_reason(like_ev, False), "self")
+
+    def test_inject_returns_blank_when_empty(self):
+        result = RetrievalResult(
+            query="q",
+            route="long_term",
+            path="basic",
+            cache="miss",
+            hits=[],
+            blocked=[],
+            core=[],
+            related=[],
+            uncertain=[],
+            superseded=[],
+        )
+        self.assertEqual(build_pack(result, budget=400), "")
 
     def test_owner_scope_visible_to_others(self):
         self.engine.ingest(

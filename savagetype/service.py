@@ -41,10 +41,35 @@ from .util import (
     SCOPE_PERSON,
     clip,
     fingerprint,
+    norm_platform,
     now_ts,
     parse_csv,
     platform_of,
 )
+
+DEFAULT_SOURCE_PLATFORMS = "aiocqhttp,qq_official,qq_official_webhook"
+
+KNOWN_ADAPTER_TYPES = {
+    "aiocqhttp",
+    "qq_official",
+    "telegram",
+    "wecom",
+    "wecom_ai_bot",
+    "lark",
+    "dingtalk",
+    "discord",
+    "slack",
+    "kook",
+    "vocechat",
+    "weixin_official_account",
+    "weixin_oc",
+    "satori",
+    "misskey",
+    "line",
+    "matrix",
+    "mattermost",
+    "webchat",
+}
 
 
 def _unpack_llm_result(result: Any) -> tuple[str, int, int]:
@@ -186,18 +211,120 @@ class SavageTypeService:
         self._rebuild_owner_ids()
         self._sync_embed_fn()
 
+    def allowed_platforms(self) -> list[str]:
+        raw = self.config.get("memory_source_platforms")
+        if raw is None:
+            raw = DEFAULT_SOURCE_PLATFORMS
+        return sorted({norm_platform(p) for p in parse_csv(str(raw))})
+
+    def event_platform_candidates(self, event: Any) -> set[str]:
+        """Best-effort adapter type candidates (never trust a single source)."""
+        out: set[str] = set()
+        try:
+            getter = getattr(event, "get_platform_name", None)
+            if callable(getter):
+                name = norm_platform(str(getter() or ""))
+                if name:
+                    out.add(name)
+        except Exception:
+            pass
+        try:
+            meta = getattr(event, "platform_meta", None)
+            for attr in ("adapter_type", "id", "name"):
+                value = norm_platform(str(getattr(meta, attr, "") or ""))
+                if value:
+                    out.add(value)
+        except Exception:
+            pass
+        try:
+            prefix = platform_of(str(event.unified_msg_origin or ""))
+            if prefix:
+                out.add(prefix)
+        except Exception:
+            pass
+        return out
+
+    def event_platform(self, event: Any) -> str:
+        """Preferred display value for the current event's adapter type."""
+        candidates = self.event_platform_candidates(event)
+        for name in sorted(candidates):
+            if name in self.allowed_platforms():
+                return name
+        for name in sorted(candidates):
+            if name in KNOWN_ADAPTER_TYPES:
+                return name
+        return sorted(candidates)[0] if candidates else ""
+
     def platform_allowed(self, ident: dict[str, str] | None = None) -> bool:
         ident = ident or {}
         if not ident:
             return True
-        raw = self.config.get("memory_source_platforms")
-        if raw is None:
-            raw = "aiocqhttp,qq_official"
-        allow = parse_csv(str(raw))
+        allow = set(self.allowed_platforms())
         if not allow:
             return True
-        platform = str(ident.get("platform") or "") or platform_of(str(ident.get("window_tag") or ""))
-        return platform in allow
+        candidates: set[str] = set()
+        platform = norm_platform(str(ident.get("platform") or ""))
+        if platform:
+            candidates.add(platform)
+        prefix = platform_of(str(ident.get("window_tag") or ""))
+        if prefix:
+            candidates.add(prefix)
+        if not candidates:
+            return True
+        if candidates & allow:
+            return True
+        if candidates & KNOWN_ADAPTER_TYPES:
+            return False
+        # Custom/unknown instance id: don't silently drop memory.
+        return True
+
+    def capture_skip_reason(
+        self,
+        event: Any = None,
+        ident: dict[str, str] | None = None,
+        owner_bypass: bool = False,
+    ) -> str:
+        if not self.enabled():
+            return "disabled"
+        if not bool(self.config.get("capture_enabled", True)):
+            return "capture_off"
+        if self.coexistence.skip_capture:
+            return "coexistence"
+        ident = ident or (self._ident_from_event(event) if event is not None else {})
+        is_owner = owner_bypass or bool(ident.get("is_owner"))
+        if not is_owner and not self.platform_allowed(ident):
+            platform = norm_platform(str(ident.get("platform") or "")) or "unknown"
+            return f"platform:{platform}"
+        if not self.window_allowed(event, ident):
+            return "whitelist"
+        return ""
+
+    def _note_capture_skip(self, reason: str, event: Any = None, ident: dict[str, str] | None = None) -> None:
+        now = now_ts()
+        last = int(self.store.get_meta("capture_skip_at") or "0")
+        if now - last < 60:
+            return
+        self.store.set_meta("capture_skip_at", str(now))
+        ident = ident or {}
+        payload = {
+            "reason": reason,
+            "platform": norm_platform(str(ident.get("platform") or "")),
+            "window": str(ident.get("window_tag") or ""),
+            "allowed": self.allowed_platforms(),
+        }
+        self.store.set_meta("capture_skip", json.dumps(payload, ensure_ascii=False))
+        self.store.add_diag("capture_skip", payload)
+        if self.logger:
+            self.logger.info("Savage Type capture skipped: %s", payload)
+
+    def last_capture_skip(self) -> dict[str, Any] | None:
+        raw = self.store.get_meta("capture_skip")
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
 
     def whitelist_ids(self) -> list[str]:
         raw = str(self.config.get("memory_whitelist") or "")
@@ -220,14 +347,7 @@ class SavageTypeService:
         return any(item and item in hay for item in allow)
 
     def capture_ok(self, event: Any = None, ident: dict[str, str] | None = None) -> bool:
-        if not (
-            self.enabled()
-            and bool(self.config.get("capture_enabled", True))
-            and not self.coexistence.skip_capture
-        ):
-            return False
-        ident = ident or (self._ident_from_event(event) if event is not None else {})
-        return self.platform_allowed(ident) and self.window_allowed(event, ident)
+        return not self.capture_skip_reason(event, ident)
 
     def inject_ok(self, event: Any = None) -> bool:
         return (
@@ -281,8 +401,9 @@ class SavageTypeService:
             "speaker_name": speaker_name or canonical,
             "bot_id": bot_id,
             "window_tag": window_tag,
-            "platform": platform_of(window_tag),
+            "platform": self.event_platform(event) or platform_of(window_tag),
             "persona_id": persona_id or "",
+            "is_owner": self.is_owner_event(event),
         }
 
     def is_admin_event(self, event: Any) -> bool:
@@ -318,6 +439,12 @@ class SavageTypeService:
     def is_owner_event(self, event: Any) -> bool:
         if event is None:
             return False
+        try:
+            if self.event_platform(event) == "webchat":
+                # ChatUI 只有管理员能进，视为主人本人。
+                return True
+        except Exception:
+            pass
         owner = self.owner_qq()
         if owner:
             try:
@@ -339,28 +466,65 @@ class SavageTypeService:
         if not umo:
             return
         try:
+            if self.event_platform(event) == "webchat":
+                return
+        except Exception:
+            pass
+        try:
             if event.get_group_id():
                 return
         except Exception:
             pass
         self.store.set_meta("owner_umo", umo)
 
+    def raw_message_text(self, event: Any) -> str:
+        """Original text from the message chain (keeps the leading command slash)."""
+        try:
+            chain = getattr(getattr(event, "message_obj", None), "message", None) or []
+            parts = []
+            for comp in chain:
+                raw = getattr(comp, "text", None)
+                if raw:
+                    parts.append(str(raw))
+            return "".join(parts)
+        except Exception:
+            return ""
+
+    def is_command_text(self, text: str, event: Any = None) -> bool:
+        candidates = [(text or "").strip()]
+        raw = self.raw_message_text(event).strip() if event is not None else ""
+        if raw:
+            candidates.append(raw)
+        for item in candidates:
+            if not item:
+                continue
+            if COMMAND_SPLIT_RE.match(item):
+                return True
+            low = item.lower()
+            if low.startswith("stype") or low.startswith("savagetype_"):
+                return True
+        return False
+
     def capture_user(self, event: Any, text: str) -> int | None:
         ident = self._ident_from_event(event)
-        if not self.capture_ok(event, ident):
+        skip = self.capture_skip_reason(event, ident)
+        if skip:
+            self._note_capture_skip(skip, event, ident)
             return None
         text = (text or "").strip()
-        if not text or COMMAND_SPLIT_RE.match(text):
+        if not text or self.is_command_text(text, event):
             return None
         is_owner = self.is_owner_event(event)
         if is_owner:
             self.mark_owner_speaker(ident["speaker_id"])
-        self.store.upsert_profile(
-            ident["speaker_id"],
-            ident.get("speaker_name", ""),
-            ident.get("platform", ""),
-            is_owner=is_owner,
-        )
+        if self.platform_allowed(ident):
+            # 档案只建在 QQ 侧；ChatUI（webchat）只进主人记忆，不建人物档案。
+            self.store.upsert_profile(
+                ident["speaker_id"],
+                ident.get("speaker_name", ""),
+                ident.get("platform", ""),
+                is_owner=is_owner,
+            )
         if is_owner:
             self.learning.observe_message(text, persona_id=ident.get("persona_id") or "")
         ts = now_ts()
@@ -375,12 +539,14 @@ class SavageTypeService:
         )
 
     def capture_bot(self, event: Any, text: str) -> int | None:
-        if not self.capture_ok(event):
+        ident = self._ident_from_event(event)
+        skip = self.capture_skip_reason(event, ident)
+        if skip:
+            self._note_capture_skip(skip, event, ident)
             return None
         text = (text or "").strip()
         if not text:
             return None
-        ident = self._ident_from_event(event)
         ts = now_ts()
         return self.store.add_timeline(
             {
@@ -852,8 +1018,10 @@ class SavageTypeService:
                 "retrieval_mode": self.config.get("retrieval_mode"),
                 "embedding_enabled": bool(self.config.get("embedding_enabled")),
                 "pipeline_enabled": bool(self.config.get("pipeline_enabled", True)),
-                "platforms": parse_csv(str(self.config.get("memory_source_platforms") or "")),
+                "platforms": self.allowed_platforms(),
                 "theme_color": str(self.config.get("ui_theme_color") or "#7c5cff"),
+                "theme_color2": str(self.config.get("ui_theme_color2") or "#22d3ee"),
+                "capture_skip": self.last_capture_skip(),
             },
         }
 

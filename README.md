@@ -2,7 +2,7 @@
 
 Savage Type 是面向 AstrBot 的全局人格记忆中枢。Savage 只是插件名。身份和语气永远读 AstrBot 当前人格；本插件只负责记住事实、处理改口、在需要时把少量相关记忆注入本轮对话。不改写人格文件，不做日程和主动陪伴。
 
-当前版本 `v2.8.0`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
+当前版本 `v3.0.0`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
 
 要求 AstrBot `>= 4.22.0`。
 
@@ -17,7 +17,7 @@ Savage Type 是面向 AstrBot 的全局人格记忆中枢。Savage 只是插件�
 
 ## 数据怎么流动
 
-1. QQ 消息进入时间线（ChatUI/webchat 不记录）。任何新面孔自动建空档案。
+1. QQ 消息进入时间线，任何新面孔自动建空档案。ChatUI（webchat）只记录主人自己的对话（进主人记忆），不建人物档案、不记录其他人。
 2. 有长期价值的候选消息（自述、指令、状态）进入后台 AI 管线：缩写原文 → 对照原文审核是否脱离原意 → 最多改 2 轮 → 通过才写入；不通过进「待审记忆」并 QQ 通知主人，主人回复「是/否 + 编号」决定。
 3. 每条记忆带证据消息 id、直白文本、关键词、审核状态；时间线里被引用的原文不会被维护清理。
 4. 同一人格、同一说话人、同一规范化槽发生冲突时：新的生效，旧的删除；高证据旧事实被单次非纠正说法挑战时先进「待确认覆盖」。玩笑、转述、不确定不会覆盖。
@@ -43,7 +43,7 @@ AstrBot WebUI → 插件 → Savage Type → 拓展页。三个主区 + 设置�
 - **诊断**：注入显微镜、聊天导入、原始 JSON 诊断、清空并重建（先自动备份）。
 - **设置**：字段与 AstrBot 插件配置页相同，保存后立刻生效。
 
-界面为玻璃拟态，主色由 `ui_theme_color` 配置，适配明暗主题。
+界面为 Shader Gradient 风格：近黑底上跑真实的 WebGL 片元着色器流动渐变（fbm 域扭曲），内容坐在冻毛玻璃面板上，只用主色一支 UI 强调色；devicePixelRatio 封顶 2、离屏暂停、`prefers-reduced-motion` 单帧、WebGL 不可用时回退静态渐变。主色与撞色共同驱动背景着色器场，设置页内置 8 组预设按钮并支持取色器自定义。
 
 ## 审核与通知
 
@@ -89,11 +89,11 @@ LLM 工具：`savagetype_recall` 检索，`savagetype_remember` 写入（只有�
 ## 主要配置项
 
 - `owner_qq`：主人 QQ，只允许一个。留空回退管理员。
-- `memory_source_platforms`：记忆来源平台，默认 `aiocqhttp,qq_official`；不填 webchat 就不记录 ChatUI。
-- `pipeline_enabled` / `normalize_provider_id` / `verify_provider_id` / `pipeline_max_revisions`：AI 整理与审核。
+- `memory_source_platforms`：记忆来源适配器类型，默认 `aiocqhttp,qq_official,qq_official_webhook`；不填 webchat 就不记录 ChatUI。`/stype status` 会显示本会话平台和上次采集跳过原因。
+- `pipeline_enabled` / `normalize_provider_id` / `verify_provider_id` / `pipeline_max_revisions`：AI 整理与审核。插件面板设置里抽取/整理/审核只列对话模型，Embedding / Rerank 各列对应类型；AstrBot 原生配置页还不支持嵌入/重排序选择器，那两项需要手填 ID。
 - `pipeline_batch_size` / `pipeline_notify_cooldown_seconds`：后台批量与通知冷却。
 - `empty_profile_ttl_days`：空档案清理天数，默认 7，0=不清理。
-- `ui_theme_color`：面板主色。
+- `ui_theme_color` / `ui_theme_color2`：面板主色 + 撞色。设置页有 5 组预设按钮，也可以取色器自定义。
 - 其余：抽取、注入预算、检索、睡眠维护、共存降级等，见插件设置页。
 
 ## 共存

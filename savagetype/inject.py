@@ -119,5 +119,8 @@ def build_pack(
             "【人格补丁草稿】" + clip(learning.persona_draft, 80) + "（不覆盖 AstrBot 人格）",
             budget,
         )
+    if len(kept) <= 1:
+        # 没有任何可注入内容时不要塞一个空的记忆包。
+        return ""
     kept.append(INJECT_SUFFIX)
     return "\n".join(kept)

@@ -1,5 +1,8 @@
+import { initShaderGradient } from "./shader.js";
+
 const $ = (id) => document.getElementById(id);
 
+let shaderControls = null;
 let editingFactId = 0;
 let editingFactWhere = "memory";
 let editingReviewId = 0;
@@ -79,14 +82,80 @@ function speakerLabel(name, id) {
   return n || q || "未知";
 }
 
-function applyTheme(color) {
-  const raw = (color || "").trim();
-  if (!/^#[0-9a-fA-F]{6}$/.test(raw)) return;
-  document.documentElement.style.setProperty("--accent", raw);
-  const r = parseInt(raw.slice(1, 3), 16);
-  const g = parseInt(raw.slice(3, 5), 16);
-  const b = parseInt(raw.slice(5, 7), 16);
-  document.documentElement.style.setProperty("--accent-soft", `rgba(${r}, ${g}, ${b}, 0.16)`);
+const THEME_PRESETS = [
+  { name: "黑玫", a: "#1a1a1d", b: "#e6397c" },
+  { name: "酒红米", a: "#990033", b: "#ddcdb7" },
+  { name: "青蜜", a: "#01847f", b: "#ffaa93" },
+  { name: "蓝黄", a: "#0081ff", b: "#fef99d" },
+  { name: "粉紫", a: "#ffdbdd", b: "#652c97" },
+  { name: "藏蓝米白", a: "#122e8a", b: "#f5efea" },
+  { name: "炭黑青", a: "#2c2c34", b: "#00d4ff" },
+  { name: "淡紫银", a: "#b19cd9", b: "#d3d3d3" },
+];
+
+const PROVIDER_KEYS = {
+  summary_provider_id: "chat",
+  normalize_provider_id: "chat",
+  verify_provider_id: "chat",
+  embedding_provider_id: "embedding",
+  rerank_provider_id: "rerank",
+};
+
+function normalizeHex(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  return /^#[0-9a-f]{6}$/.test(raw) ? raw : "";
+}
+
+function rgbaOf(hex, alpha) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function relLuminance(hex) {
+  const channels = [1, 3, 5].map((i) => {
+    const c = parseInt(hex.slice(i, i + 2), 16) / 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  });
+  return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+}
+
+function onColor(hex) {
+  return relLuminance(hex) > 0.22 ? "#1c1b1f" : "#ffffff";
+}
+
+const themeState = { color: "#7c5cff", color2: "#22d3ee" };
+
+function applyTheme(color, color2) {
+  const raw = normalizeHex(color) || "#7c5cff";
+  const raw2 = normalizeHex(color2) || "#22d3ee";
+  themeState.color = raw;
+  themeState.color2 = raw2;
+
+  const root = document.documentElement.style;
+  root.setProperty("--accent", raw);
+  root.setProperty("--accent2", raw2);
+  root.setProperty("--accent-soft", rgbaOf(raw, 0.16));
+  root.setProperty("--accent2-soft", rgbaOf(raw2, 0.16));
+  root.setProperty("--on-accent", onColor(raw));
+
+  if (shaderControls) shaderControls.setColors(raw, raw2);
+}
+
+function renderThemeControls(color, color2) {
+  const box = $("theme-presets");
+  const ca = normalizeHex(color) || "#7c5cff";
+  const cb = normalizeHex(color2) || "#22d3ee";
+  if (box) {
+    box.innerHTML = THEME_PRESETS.map((p) => `
+      <button type="button" class="theme-dot ${p.a === ca && p.b === cb ? "on" : ""}"
+        data-act="theme-preset" data-a="${p.a}" data-b="${p.b}">
+        <span class="dot" style="background:${p.a}"></span><span class="dot" style="background:${p.b}"></span>${esc(p.name)}
+      </button>`).join("");
+  }
+  if ($("theme-color")) $("theme-color").value = ca;
+  if ($("theme-color2")) $("theme-color2").value = cb;
 }
 
 function reviewBadge(status) {
@@ -159,12 +228,17 @@ async function loadOverview() {
   if ($("coexist-diag")) $("coexist-diag").textContent = coexLine;
 
   const owner = ov.owner || {};
+  const cfg = ov.config || {};
   if ($("owner-line")) {
-    $("owner-line").textContent = owner.qq
+    const ownerText = owner.qq
       ? `主人 QQ：${owner.qq}${owner.ids && owner.ids.length > 1 ? `（含归并 id：${owner.ids.join(", ")}）` : ""}。`
       : "主人 QQ 未配置：当前回退 AstrBot 管理员判定，建议在设置里填写，避免把别人的主人当成你的主人。";
+    const platforms = (cfg.platforms || []).join(", ") || "不限";
+    const skip = cfg.capture_skip;
+    const skipText = skip ? `上次采集跳过：${skip.reason}（${skip.platform || "?"}）。` : "";
+    $("owner-line").textContent = `${ownerText} 允许平台：${platforms}。${skipText}`;
   }
-  applyTheme((ov.config || {}).theme_color);
+  applyTheme(cfg.theme_color, cfg.theme_color2);
 
   const box = $("alias-suggestions");
   if (box) {
@@ -363,9 +437,21 @@ async function loadProfile(speakerId) {
   `;
 }
 
-function fieldControl(key, spec, value) {
+function fieldControl(key, spec, value, providers) {
   const hint = spec.hint ? `<div class="lede">${esc(spec.hint)}</div>` : "";
   const label = `<label for="cfg-${esc(key)}">${esc(spec.description || key)}</label>`;
+  const providerType = PROVIDER_KEYS[key];
+  if (providerType) {
+    const list = (providers && providers[providerType]) || [];
+    const known = list.some((p) => String(p.id) === String(value));
+    const opts = [`<option value="">（跟随默认）</option>`]
+      .concat(list.map((p) =>
+        `<option value="${esc(p.id)}" ${String(p.id) === String(value) ? "selected" : ""}>${esc(p.name || p.id)}</option>`
+      ))
+      .concat(value && !known ? [`<option value="${esc(value)}" selected>（当前）${esc(value)}</option>`] : [])
+      .join("");
+    return `<div class="setting">${label}<select id="cfg-${esc(key)}" name="${esc(key)}">${opts}</select>${hint}</div>`;
+  }
   if (spec.type === "bool") {
     return `<div class="setting">${label}
       <label class="toggle"><input id="cfg-${esc(key)}" name="${esc(key)}" type="checkbox" ${value ? "checked" : ""} /> 开启</label>
@@ -385,12 +471,20 @@ function fieldControl(key, spec, value) {
 }
 
 async function loadSettings() {
-  const data = await apiGet("config");
+  const [data, providers] = await Promise.all([apiGet("config"), apiGet("providers")]);
   const schema = data.schema || {};
   const values = data.values || {};
+  renderThemeControls(values.ui_theme_color, values.ui_theme_color2);
   $("settings-form").innerHTML = Object.entries(schema).map(([key, spec]) =>
-    fieldControl(key, spec, values[key])
+    fieldControl(key, spec, values[key], providers)
   ).join("");
+}
+
+async function saveTheme(color, color2) {
+  const r = await apiPost("ui/theme", { color, color2 });
+  applyTheme(r.color, r.color2);
+  renderThemeControls(r.color, r.color2);
+  return r;
 }
 
 function readSettings() {
@@ -416,11 +510,32 @@ async function reload() {
 function showTab(name) {
   ["memory", "profiles", "diag", "settings"].forEach((key) => {
     const page = $(`page-${key}`);
-    if (page) page.hidden = key !== name;
+    if (!page) return;
+    page.hidden = key !== name;
+    if (key === name) {
+      page.classList.remove("page-enter");
+      void page.offsetWidth;
+      page.classList.add("page-enter");
+    }
   });
   document.querySelectorAll(".tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === name));
   if (name === "settings") run("加载设置", loadSettings);
   if (name === "profiles") run("已刷新档案", loadProfiles);
+}
+
+function attachRipple(ev) {
+  const el = ev.target.closest("button, .tabs button, .theme-dot, .item.selectable");
+  if (!el || el.disabled) return;
+  const rect = el.getBoundingClientRect();
+  const size = Math.max(rect.width, rect.height) * 2;
+  const ripple = document.createElement("span");
+  ripple.className = "ripple";
+  ripple.style.width = `${size}px`;
+  ripple.style.height = `${size}px`;
+  ripple.style.left = `${ev.clientX - rect.left - size / 2}px`;
+  ripple.style.top = `${ev.clientY - rect.top - size / 2}px`;
+  el.appendChild(ripple);
+  setTimeout(() => ripple.remove(), 520);
 }
 
 async function saveFactEdit(el) {
@@ -539,8 +654,15 @@ async function onAct(act, el) {
     await reload();
     return r;
   });
+  if (act === "theme-preset") return run("主题已切换", () => saveTheme(el.dataset.a, el.dataset.b));
+  if (act === "theme-apply") return run("主题已切换", () => saveTheme($("theme-color").value, $("theme-color2").value));
   if (act === "settings-save") return run("已保存设置", async () => { const r = await apiPost("config/save", { values: readSettings() }); await loadSettings(); await loadOverview(); return r; });
 }
+
+document.addEventListener("pointerdown", (ev) => {
+  if (ev.button !== 0) return;
+  attachRipple(ev);
+});
 
 document.addEventListener("click", (ev) => {
   const el = ev.target.closest("[data-act]");
@@ -550,6 +672,10 @@ document.addEventListener("click", (ev) => {
 });
 
 async function boot() {
+  shaderControls = initShaderGradient({
+    color1: themeState.color,
+    color2: themeState.color2,
+  });
   if (window.AstrBotPluginPage?.ready) {
     try { await window.AstrBotPluginPage.ready(); } catch (err) { showDiag(err); }
   }
