@@ -59,6 +59,9 @@ class Fact:
     origin: str = ""
     edited_at: int = 0
     edited_by: str = ""
+    importance: float = 0.0
+    kind: str = ""
+    pinned: int = 0
 
     def slot_key(self) -> str:
         from .slots import canonical_attribute, canonical_subject

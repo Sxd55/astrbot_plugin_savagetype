@@ -177,10 +177,12 @@ function keywordsHtml(list) {
   return items ? ` ${items}` : "";
 }
 
-function factActions(id, where) {
+function factActions(f, where) {
+  const pinLabel = f.pinned ? "取消置顶" : "置顶";
   return `<div class="actions">
-    <button type="button" class="ghost tiny" data-act="fact-edit" data-id="${esc(id)}" data-where="${esc(where)}">编辑</button>
-    <button type="button" class="ghost tiny" data-act="fact-del" data-id="${esc(id)}" data-where="${esc(where)}">删除</button>
+    <button type="button" class="ghost tiny" data-act="fact-pin" data-id="${esc(f.id)}" data-pinned="${f.pinned ? 1 : 0}" data-where="${esc(where)}">${pinLabel}</button>
+    <button type="button" class="ghost tiny" data-act="fact-edit" data-id="${esc(f.id)}" data-where="${esc(where)}">编辑</button>
+    <button type="button" class="ghost tiny" data-act="fact-del" data-id="${esc(f.id)}" data-where="${esc(where)}">删除</button>
   </div>`;
 }
 
@@ -188,6 +190,13 @@ function factEditor(f, where, quitAct) {
   return `<div class="item on">
     <div class="item-head"><span class="chip">#${esc(f.id)} ${esc(f.attribute)}</span><span class="chip gray">${esc(speakerLabel(f.speaker_name, f.speaker_id))}</span></div>
     <textarea data-edit-fact="${esc(f.id)}">${esc(f.plain || f.content || f.value)}</textarea>
+    <div class="row">
+      <label class="lede">重要度
+        <input type="number" min="0" max="1" step="0.05" style="width:110px"
+          data-edit-importance="${esc(f.id)}" value="${esc(f.importance ?? 0)}" />
+      </label>
+      <span class="lede">当前权重 ${esc(f.weight ?? "-")}（随时间衰减，被召回会回升）</span>
+    </div>
     <div class="actions">
       <button type="button" data-act="fact-edit-save" data-id="${esc(f.id)}" data-where="${esc(where)}">保存</button>
       <button type="button" class="ghost tiny" data-act="${esc(quitAct)}">取消</button>
@@ -202,14 +211,17 @@ function factCard(f, where) {
   return `<div class="item" id="${esc(detailId)}">
     <div class="item-head">
       <span class="chip">${esc(f.attribute)}</span>
+      ${f.kind ? `<span class="chip gray">${esc(f.kind)}</span>` : ""}
       <span class="chip gray">${esc(who)}</span>
       ${reviewBadge(f.review_status)}
+      ${f.pinned ? `<span class="chip">置顶</span>` : ""}
+      ${typeof f.weight === "number" ? `<span class="chip gray">权重 ${esc(f.weight)}</span>` : ""}
       ${f.edited_at ? `<span class="chip gray">已编辑</span>` : ""}
     </div>
     <div class="plain">${esc(text)}</div>
     <div class="meta">QQ/id ${esc(f.speaker_id || "")} · #${esc(f.id)} · 更新 ${esc(fmtTime(f.updated_at))}${keywordsHtml(f.keywords)}</div>
     ${f.content && f.content !== text ? `<details><summary>原文</summary><div class="raw">${esc(f.content)}</div></details>` : ""}
-    ${factActions(f.id, where)}
+    ${factActions(f, where)}
   </div>`;
 }
 
@@ -323,6 +335,27 @@ async function loadMemoryPending() {
       </div>
     </div>`;
   }).join("");
+}
+
+async function loadArchived() {
+  const box = $("archive-list");
+  if (!box) return;
+  const data = await apiGet("facts", { status: "archived" });
+  const items = data.items || [];
+  box.innerHTML = items.length
+    ? items.slice(0, 80).map((f) => `<div class="item">
+        <div class="item-head">
+          <span class="chip gray">#${esc(f.id)}</span>
+          <span class="chip gray">${esc(f.kind || f.attribute)}</span>
+          <span class="chip gray">${esc(speakerLabel(f.speaker_name, f.speaker_id))}</span>
+        </div>
+        <div class="plain">${esc(f.plain || f.content || f.value)}</div>
+        <div class="meta">${esc(f.reason || "")} · ${esc(fmtTime(f.updated_at))}</div>
+        <div class="actions">
+          <button type="button" class="ghost tiny" data-act="fact-restore" data-id="${esc(f.id)}">恢复</button>
+        </div>
+      </div>`).join("")
+    : `<p class="lede">回收站是空的。</p>`;
 }
 
 async function loadReviews() {
@@ -508,6 +541,7 @@ async function reload() {
   await loadReviews();
   await loadPending();
   await loadMicroscope();
+  await loadArchived();
 }
 
 function showTab(name) {
@@ -547,7 +581,10 @@ async function saveFactEdit(el) {
   const area = document.querySelector(`textarea[data-edit-fact="${id}"]`);
   const plain = area ? area.value.trim() : "";
   if (!plain) return { ok: false, error: "empty" };
-  const r = await apiPost("facts/update", { id, plain });
+  const body = { id, plain };
+  const imp = document.querySelector(`input[data-edit-importance="${id}"]`);
+  if (imp && imp.value !== "") body.importance = Number(imp.value);
+  const r = await apiPost("facts/update", body);
   editingFactId = 0;
   if (where === "profile") await loadProfile(currentProfileId);
   else await loadMemory();
@@ -590,6 +627,20 @@ async function onAct(act, el) {
     const r = await apiPost("memory/review", { id, status: "approved", plain });
     editingReviewId = 0;
     await loadMemoryPending(); await loadMemory(); await loadOverview();
+    return r;
+  });
+  if (act === "fact-pin") return run("已更新", async () => {
+    const r = await apiPost("facts/pin", {
+      id: Number(el.dataset.id),
+      pinned: el.dataset.pinned !== "1",
+    });
+    if (el.dataset.where === "profile") await loadProfile(currentProfileId);
+    else await loadMemory();
+    return r;
+  });
+  if (act === "fact-restore") return run("已恢复", async () => {
+    const r = await apiPost("facts/restore", { ids: [Number(el.dataset.id)] });
+    await reload();
     return r;
   });
   if (act === "fact-edit") {

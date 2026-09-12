@@ -978,5 +978,207 @@ class V280Test(unittest.TestCase):
         return event.id
 
 
+class V320Test(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "v32.db")
+        self.engine = ContradictionEngine(self.store, high_evidence=0.8)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_default_importance_by_origin(self):
+        from savagetype.util import default_importance
+
+        self.assertAlmostEqual(default_importance({"origin": "manual"}), 1.0)
+        self.assertAlmostEqual(default_importance({"review_status": "ai_passed"}), 0.8)
+        self.assertAlmostEqual(default_importance({}), 0.5)
+        boosted = default_importance({"review_status": "ai_passed", "explicit_correction": 1, "first_person": 1})
+        self.assertGreater(boosted, 0.8)
+
+    def test_fact_weight_decay_and_reinforce(self):
+        from savagetype.util import fact_weight, now_ts
+
+        ts = now_ts()
+        fact = Fact(
+            id=1, subject="self", attribute="likes", value="茶", content="c",
+            speaker_id="u1", speaker_name="u", bot_id="", window_tag="",
+            status="live", confidence=0.9, importance=0.8, created_at=ts, updated_at=ts,
+        )
+        self.assertAlmostEqual(fact_weight(fact, now=ts), 0.8, places=2)
+        decayed = fact_weight(fact, now=ts + 30 * 86400)
+        self.assertLess(decayed, 0.45)
+        fact.access_count = 4
+        reinforced = fact_weight(fact, now=ts + 30 * 86400)
+        self.assertGreater(reinforced, decayed)
+        fact.pinned = 1
+        self.assertGreaterEqual(fact_weight(fact, now=ts + 365 * 86400), 0.8)
+
+    def test_fact_kind_classification(self):
+        from savagetype.slots import apply_slot
+
+        likes = apply_slot({"subject": "self", "attribute": "likes", "value": "茶", "content": "我喜欢茶", "speaker_id": "u1"})
+        self.assertEqual(likes["kind"], "preference")
+        promise = apply_slot({"subject": "self", "attribute": "promise", "value": "寄快递", "content": "记住我要寄快递", "speaker_id": "u1"})
+        self.assertEqual(promise["kind"], "promise")
+        identity = apply_slot({"subject": "self", "attribute": "身份", "value": "学生", "content": "我是学生", "speaker_id": "u1"})
+        self.assertEqual(identity["kind"], "identity")
+        status = apply_slot({"subject": "self", "attribute": "status", "value": "加班", "content": "我这周加班", "speaker_id": "u1"})
+        self.assertEqual(status["kind"], "status")
+
+    def test_retrieve_dedup_and_pin_bypass(self):
+        self.engine.ingest(_payload(speaker="u1", value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        fact = self.store.live_by_slot("u1", "self", "likes")
+        retriever = Retriever(self.store)
+
+        r1 = asyncio.run(retriever.retrieve("喜欢什么", "u1", skip_ids={fact.id}))
+        ids = {f.id for f in r1.core + r1.related}
+        self.assertNotIn(fact.id, ids)
+        self.assertIn("recently_injected", {h.filter_reason for h in r1.blocked})
+
+        r2 = asyncio.run(retriever.retrieve("你还记得我喜欢什么吗", "u1", skip_ids={fact.id}))
+        self.assertIn(fact.id, {f.id for f in r2.core + r2.related})
+
+        self.store.set_pinned(fact.id, True)
+        r3 = asyncio.run(retriever.retrieve("喜欢什么", "u1", skip_ids={fact.id}))
+        self.assertIn(fact.id, {f.id for f in r3.core + r3.related})
+
+    def test_inject_promise_and_status_sections(self):
+        promise = Fact(
+            id=1, subject="self", attribute="promise", value="寄快递", content="要寄快递",
+            speaker_id="u1", speaker_name="u", bot_id="", window_tag="", status="live",
+            confidence=0.9, kind="promise", plain="要寄快递",
+        )
+        status = Fact(
+            id=2, subject="self", attribute="status", value="加班", content="最近加班",
+            speaker_id="u1", speaker_name="u", bot_id="", window_tag="", status="live",
+            confidence=0.9, kind="status", plain="最近加班",
+        )
+        result = RetrievalResult(
+            query="q", route="long_term", path="basic", cache="miss",
+            hits=[], blocked=[], core=[], related=[promise, status],
+            uncertain=[], superseded=[],
+        )
+        pack = build_pack(result, budget=800)
+        self.assertIn("【约定】", pack)
+        self.assertIn("【近况】", pack)
+        self.assertIn("不可信数据", pack)
+
+    def test_restore_blocks_conflict(self):
+        a = self.engine.ingest(_payload(speaker="u1", value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        self.store.archive_facts([a["fact_id"]])
+        b = self.engine.ingest(_payload(speaker="u1", value="咖啡", content="我喜欢咖啡"), "我喜欢咖啡")
+        out = self.store.restore_facts([a["fact_id"]])
+        self.assertEqual(out["restored"], [])
+        self.assertEqual(len(out["blocked"]), 1)
+        self.store.archive_facts([b["fact_id"]])
+        out2 = self.store.restore_facts([a["fact_id"]])
+        self.assertIn(a["fact_id"], out2["restored"])
+
+    def test_archive_decayed_and_pin_protection(self):
+        from savagetype.archive import archive_decayed
+        from savagetype.util import now_ts
+
+        old_ts = now_ts() - 90 * 86400
+        first = self.engine.ingest(_payload(speaker="u1", value="旧", content="我喜欢旧东西"), "我喜欢旧东西")
+        self.store.update_fact(first["fact_id"], importance=0.05, updated_at=old_ts)
+        self.assertEqual(
+            archive_decayed(self.store, min_age_days=30, threshold=0.12, half_life_days=30),
+            1,
+        )
+        self.assertEqual(self.store.get_fact(first["fact_id"]).status, "archived")
+
+        second = self.engine.ingest(_payload(speaker="u2", value="旧2", content="我喜欢旧东西2"), "我喜欢旧东西2")
+        self.store.update_fact(second["fact_id"], importance=0.05, updated_at=old_ts)
+        self.store.set_pinned(second["fact_id"], True)
+        self.assertEqual(
+            archive_decayed(self.store, min_age_days=30, threshold=0.12, half_life_days=30),
+            0,
+        )
+        self.assertEqual(self.store.get_fact(second["fact_id"]).status, "live")
+
+    def test_keyword_score_uses_keywords(self):
+        from savagetype.retrieve import keyword_score
+
+        fact = Fact(
+            id=1, subject="self", attribute="note", value="咨询", content="问了一下午",
+            speaker_id="u1", speaker_name="u", bot_id="", window_tag="", status="live",
+            confidence=0.8, keywords=["OpenAI", "万事达卡"],
+        )
+        self.assertGreater(keyword_score("OpenAI 能用吗", fact), 0)
+        self.assertEqual(keyword_score("完全不相干", fact), 0.0)
+
+    def test_search_facts_matches_keywords(self):
+        self.engine.ingest(
+            _payload(speaker="u1", value="境外支付", content="咨询境外支付", keywords=["万事达卡", "OpenAI"]),
+            "咨询境外支付",
+        )
+        self.assertEqual(len(self.store.search_facts("万事达")), 1)
+
+    def test_migration_adds_new_columns(self):
+        import sqlite3
+
+        path = Path(self.tmp.name) / "old.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """
+            CREATE TABLE facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT NOT NULL, attribute TEXT NOT NULL,
+                value TEXT NOT NULL, content TEXT NOT NULL, speaker_id TEXT NOT NULL,
+                speaker_name TEXT NOT NULL DEFAULT '', bot_id TEXT NOT NULL DEFAULT '',
+                window_tag TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.5, evidence TEXT NOT NULL DEFAULT '[]',
+                mention_policy TEXT NOT NULL DEFAULT 'mention', first_person INTEGER NOT NULL DEFAULT 0,
+                explicit_correction INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT 'extract',
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, superseded_by INTEGER,
+                supersedes INTEGER, fingerprint TEXT NOT NULL, embedding TEXT,
+                access_count INTEGER NOT NULL DEFAULT 0, last_accessed INTEGER NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL DEFAULT '', persona_id TEXT NOT NULL DEFAULT '',
+                slot_key TEXT NOT NULL DEFAULT ''
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+        store = Store(path)
+        try:
+            cols = {r["name"] for r in store.query("PRAGMA table_info(facts)")}
+            self.assertIn("importance", cols)
+            self.assertIn("kind", cols)
+            self.assertIn("pinned", cols)
+        finally:
+            store.close()
+
+    def test_idle_pending(self):
+        from savagetype.service import SavageTypeService
+        from savagetype.util import now_ts
+
+        service = SavageTypeService(
+            store=self.store,
+            config={"extract_idle_seconds": 60},
+            llm_generate=lambda *_a, **_k: "",
+            get_provider=lambda *_a, **_k: None,
+            logger=None,
+        )
+        self.assertFalse(service.idle_pending())
+        self.store.add_timeline(
+            {
+                "ts": now_ts() - 3600, "speaker_id": "u1", "speaker_name": "u",
+                "bot_id": "b", "window_tag": "aiocqhttp:GroupMessage:1", "role": "user",
+                "content": "我喜欢喝茶", "fingerprint": "idle-1",
+            }
+        )
+        self.assertTrue(service.idle_pending())
+        self.store.add_timeline(
+            {
+                "ts": now_ts(), "speaker_id": "u1", "speaker_name": "u",
+                "bot_id": "b", "window_tag": "aiocqhttp:GroupMessage:1", "role": "user",
+                "content": "在吗", "fingerprint": "idle-2",
+            }
+        )
+        self.assertFalse(service.idle_pending())
+
+
 if __name__ == "__main__":
     unittest.main()

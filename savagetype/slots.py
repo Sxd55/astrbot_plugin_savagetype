@@ -4,7 +4,15 @@ from __future__ import annotations
 
 import re
 
-from .util import normalize_slot
+from .util import (
+    KIND_HABIT,
+    KIND_IDENTITY,
+    KIND_NOTE,
+    KIND_PREFERENCE,
+    KIND_PROMISE,
+    KIND_STATUS,
+    normalize_slot,
+)
 
 ATTR_ALIASES = {
     "likes": "likes",
@@ -100,6 +108,22 @@ def canonical_subject(raw: str, speaker_id: str = "", speaker_name: str = "") ->
     return text[:40]
 
 
+KIND_BY_ATTRIBUTE = {
+    "likes": KIND_PREFERENCE,
+    "dislikes": KIND_PREFERENCE,
+    "name": KIND_IDENTITY,
+    "identity": KIND_IDENTITY,
+    "habit": KIND_HABIT,
+    "promise": KIND_PROMISE,
+    "status": KIND_STATUS,
+    "note": KIND_NOTE,
+}
+
+
+def fact_kind(attribute: str) -> str:
+    return KIND_BY_ATTRIBUTE.get(canonical_attribute(attribute), KIND_NOTE)
+
+
 def apply_slot(payload: dict) -> dict:
     payload = dict(payload)
     speaker_id = str(payload.get("speaker_id") or "")
@@ -119,4 +143,5 @@ def apply_slot(payload: dict) -> dict:
         speaker_id=speaker_id,
         speaker_name=speaker_name,
     )
+    payload["kind"] = str(payload.get("kind") or fact_kind(payload["attribute"]))
     return payload

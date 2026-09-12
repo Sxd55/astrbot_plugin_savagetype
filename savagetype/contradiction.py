@@ -193,6 +193,9 @@ class ContradictionEngine:
     def supersede(self, old: Fact, payload: dict[str, Any]) -> dict[str, Any]:
         payload = dict(payload)
         payload["status"] = "live"
+        if float(payload.get("importance") or 0) <= 0 and float(old.importance or 0) > 0:
+            # 覆盖不降级：新事实至少继承旧事实的重要性。
+            payload["importance"] = float(old.importance)
         new_id = self.store.add_fact(payload, bump=False)
         self.store.delete_fact(old.id)
         return {
@@ -233,12 +236,17 @@ class ContradictionEngine:
             if eid not in evidence:
                 evidence.append(eid)
         confidence = max(existing.confidence, float(payload.get("confidence", existing.confidence)))
+        importance = max(
+            float(existing.importance or 0),
+            float(payload.get("importance") or 0),
+        )
         self.store.update_fact(
             existing.id,
             value=payload.get("value", existing.value),
             content=payload.get("content", existing.content),
             evidence=evidence,
             confidence=confidence,
+            importance=importance,
             last_accessed=now_ts(),
             access_count=existing.access_count + 1,
         )

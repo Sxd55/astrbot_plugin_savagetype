@@ -271,7 +271,7 @@ def compact_summarized_timeline(store: Store, retain_days: int = 30, limit: int 
 def archive_low_value(store: Store, min_age_days: int = 30, max_confidence: float = 0.45, limit: int = 200) -> int:
     cutoff = now_ts() - max(1, min_age_days) * 86400
     rows = store.query(
-        """SELECT id FROM facts WHERE status='live' AND confidence<=? AND updated_at<?
+        """SELECT id FROM facts WHERE status='live' AND pinned=0 AND confidence<=? AND updated_at<?
            AND access_count<=1 AND explicit_correction=0
            ORDER BY confidence ASC, updated_at ASC LIMIT ?""",
         (max_confidence, cutoff, limit),
@@ -283,10 +283,41 @@ def archive_low_value(store: Store, min_age_days: int = 30, max_confidence: floa
     return n
 
 
+def archive_decayed(
+    store: Store,
+    min_age_days: int = 30,
+    threshold: float = 0.12,
+    half_life_days: float = 30.0,
+    reinforce_factor: float = 0.5,
+    max_multiplier: float = 3.0,
+    limit: int = 200,
+) -> int:
+    """Archive low-weight live facts (importance decayed past the threshold)."""
+    from .util import fact_weight
+
+    if threshold <= 0:
+        return 0
+    now = now_ts()
+    cutoff = now - max(1, min_age_days) * 86400
+    live = store.facts_by_status("live", limit=max(limit * 3, 300))
+    n = 0
+    for fact in live:
+        if int(getattr(fact, "pinned", 0)):
+            continue
+        if int(fact.updated_at or 0) >= cutoff:
+            continue
+        if fact_weight(fact, now, half_life_days, reinforce_factor, max_multiplier) < threshold:
+            store.update_fact(fact.id, status="archived", reason="importance_decayed")
+            n += 1
+            if n >= limit:
+                break
+    return n
+
+
 def expire_status_facts(store: Store, limit: int = 200) -> int:
     now = now_ts()
     rows = store.query(
-        "SELECT id FROM facts WHERE status='live' AND expires_at>0 AND expires_at<? ORDER BY expires_at ASC LIMIT ?",
+        "SELECT id FROM facts WHERE status='live' AND pinned=0 AND expires_at>0 AND expires_at<? ORDER BY expires_at ASC LIMIT ?",
         (now, limit),
     )
     n = 0
@@ -331,6 +362,8 @@ def fold_preference_slots(store: Store) -> int:
         like_items = [f for f in items if f.attribute == "likes"]
         extras = [f for f in items if f.attribute in {"dislikes", "note"}]
         for extra in extras:
+            if int(getattr(extra, "pinned", 0)):
+                continue
             extra_topics = _topics(extra)
             keeper = None
             for like in like_items:

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .archive import (
+    archive_decayed,
     archive_low_value,
     backup_db,
     compact_summarized_timeline,
@@ -100,6 +101,7 @@ class SavageTypeService:
         self.get_persona_text = get_persona_text
         self.send_message = send_message
         self._owner_ids: set[str] = set()
+        self._recent_injections: dict[str, dict[int, int]] = {}
         self.coexistence = Coexistence(enabled=bool(config.get("coexistence_degrade", True)))
         self.contradiction = ContradictionEngine(
             store,
@@ -568,6 +570,19 @@ class SavageTypeService:
             }
         )
 
+    def _cfg_value(self, key: str, default: Any) -> Any:
+        raw = self.config.get(key)
+        return default if raw is None else raw
+
+    def idle_pending(self) -> bool:
+        """True when the newest unsummarized message has been silent long enough."""
+        idle = int(self._cfg_value("extract_idle_seconds", 300))
+        if idle <= 0:
+            return False
+        rows = self.store.query("SELECT MAX(ts) AS ts FROM timeline WHERE summarized=0")
+        newest = int(rows[0]["ts"] or 0) if rows else 0
+        return bool(newest) and now_ts() - newest >= idle
+
     async def maybe_extract(self, force: bool = False) -> dict[str, Any]:
         if not self.enabled() or not self.config.get("extract_enabled", True):
             return {"ok": True, "skipped": True, "reason": "extract disabled"}
@@ -579,9 +594,12 @@ class SavageTypeService:
             return {"ok": True, "skipped": True, "reason": "debounce"}
         if self._extract_lock.locked():
             return {"ok": True, "skipped": True, "reason": "busy"}
+        idle = not force and self.idle_pending()
         async with self._extract_lock:
             try:
-                result = await self.pipeline.run(force=force)
+                result = await self.pipeline.run(force=force or idle)
+                if idle:
+                    result["idle"] = True
                 self._last_extract_at = now_ts()
                 if not result.get("skipped"):
                     self.store.add_usage("extract", ok=True, detail=str(result.get("events") or 0))
@@ -749,7 +767,44 @@ class SavageTypeService:
                 text = ""
         return await self.learning.maybe_learn(force=force, persona_text=text or "")
 
-    async def retrieve_for(self, query: str, speaker_id: str, persona_id: str = "") -> Any:
+    def importance_cfg(self) -> dict[str, float]:
+        return {
+            "weight": float(self._cfg_value("importance_weight", 0.25)),
+            "half_life_days": float(self._cfg_value("importance_half_life_days", 30)),
+            "reinforce_factor": float(self._cfg_value("importance_reinforce_factor", 0.5)),
+            "max_multiplier": float(self._cfg_value("importance_max_half_life_multiplier", 3)),
+        }
+
+    def _recent_ids(self, window_tag: str) -> set[int]:
+        if not window_tag:
+            return set()
+        window = max(0, int(self._cfg_value("inject_dedup_window_seconds", 600)))
+        if window <= 0:
+            return set()
+        seen = self._recent_injections.get(window_tag) or {}
+        now = now_ts()
+        fresh = {fid: ts for fid, ts in seen.items() if now - ts < window}
+        self._recent_injections[window_tag] = fresh
+        return set(fresh)
+
+    def _remember_injected(self, window_tag: str, facts: list[Any]) -> None:
+        if not window_tag or not facts:
+            return
+        seen = self._recent_injections.setdefault(window_tag, {})
+        now = now_ts()
+        for fact in facts:
+            seen[int(fact.id)] = now
+        if len(self._recent_injections) > 200:
+            for key in list(self._recent_injections)[:100]:
+                self._recent_injections.pop(key, None)
+
+    async def retrieve_for(
+        self,
+        query: str,
+        speaker_id: str,
+        persona_id: str = "",
+        skip_ids: set[int] | None = None,
+    ) -> Any:
         self._sync_embed_fn()
         canonical = self.store.resolve_speaker(speaker_id)
         ids = self.store.speaker_ids_for(canonical)
@@ -763,6 +818,8 @@ class SavageTypeService:
             ask_other_id=ask_other,
             persona_id=persona_id,
             speaker_ids=ids,
+            skip_ids=skip_ids,
+            importance_cfg=self.importance_cfg(),
         )
 
     def dossier_for(self, speaker_id: str, persona_id: str = "") -> dict[str, Any]:
@@ -782,8 +839,16 @@ class SavageTypeService:
                 out.append(card)
         return out
 
-    async def build_injection(self, query: str, speaker_id: str, persona_id: str = "") -> tuple[str, Any, dict[str, Any]]:
-        result = await self.retrieve_for(query, speaker_id, persona_id=persona_id)
+    async def build_injection(
+        self,
+        query: str,
+        speaker_id: str,
+        persona_id: str = "",
+        window_tag: str = "",
+    ) -> tuple[str, Any, dict[str, Any]]:
+        skip_ids = self._recent_ids(window_tag)
+        result = await self.retrieve_for(query, speaker_id, persona_id=persona_id, skip_ids=skip_ids)
+        self._remember_injected(window_tag, result.core + result.related)
         learning = self.learning.pack_for(query, persona_id=persona_id, route=result.route)
         dossier = self.dossier_for(speaker_id, persona_id=persona_id)
         pack = build_pack(
@@ -814,6 +879,7 @@ class SavageTypeService:
             "persona_draft": bool(learning.persona_draft),
             "dossier": bool(dossier.get("card")),
             "injected": bool(pack),
+            "dedup": len(skip_ids),
         }
         self.store.add_diag("inject", snapshot)
         return pack, result, snapshot
@@ -878,6 +944,8 @@ class SavageTypeService:
     def sleep_maintenance(self) -> dict[str, Any]:
         merged = 0
         for keeper, dup in self.store.live_near_duplicates():
+            if int(getattr(dup, "pinned", 0)):
+                continue
             evidence = list(keeper.evidence)
             for eid in dup.evidence:
                 if eid not in evidence:
@@ -903,6 +971,14 @@ class SavageTypeService:
             min_age_days=int(self.config.get("sleep_low_value_days") or 30),
             max_confidence=float(self.config.get("sleep_low_value_confidence") or 0.45),
         )
+        decayed = archive_decayed(
+            self.store,
+            min_age_days=int(self.config.get("sleep_low_value_days") or 30),
+            threshold=float(self._cfg_value("importance_prune_threshold", 0.12)),
+            half_life_days=float(self._cfg_value("importance_half_life_days", 30)),
+            reinforce_factor=float(self._cfg_value("importance_reinforce_factor", 0.5)),
+            max_multiplier=float(self._cfg_value("importance_max_half_life_multiplier", 3)),
+        )
         expired = expire_persona_drafts(
             self.store,
             ttl_seconds=int(self.config.get("persona_draft_ttl_seconds") or 14 * 86400),
@@ -917,6 +993,7 @@ class SavageTypeService:
             "expired_status": expired_status,
             "compacted_timeline": compacted,
             "archived_low_value": archived,
+            "archived_decayed": decayed,
             "expired_persona_drafts": expired,
             "deleted_empty_profiles": empty_profiles,
             **counts,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from .models import Fact, RetrievalHit, RetrievalResult
 from .store import Store
@@ -14,6 +14,7 @@ from .util import (
     SCOPE_OWNER,
     STATUS_RE,
     TIME_WINDOW_RE,
+    fact_weight,
     now_ts,
 )
 
@@ -34,7 +35,8 @@ def cosine(a: list[float] | None, b: list[float] | None) -> float:
 
 def keyword_score(query: str, fact: Fact) -> float:
     q = (query or "").lower()
-    blob = f"{fact.subject} {fact.attribute} {fact.value} {fact.content}".lower()
+    keywords = " ".join(str(k) for k in (getattr(fact, "keywords", None) or []))
+    blob = f"{fact.subject} {fact.attribute} {fact.value} {fact.content} {keywords}".lower()
     if not q or not blob:
         return 0.0
     hits = 0
@@ -150,6 +152,8 @@ class Retriever:
         ask_other_id: str | None = None,
         persona_id: str = "",
         speaker_ids: list[str] | None = None,
+        skip_ids: set[int] | None = None,
+        importance_cfg: dict[str, Any] | None = None,
     ) -> RetrievalResult:
         route = classify_route(query)
         key = self.cache_key(query, speaker_id, persona_id)
@@ -194,8 +198,12 @@ class Retriever:
 
         blocked: list[RetrievalHit] = []
         visible: list[Fact] = []
+        dedup_ids = skip_ids or set()
+        dedup_route = route in {"long_term", "current_status"}
         for fact in candidates:
             reason = self._visibility(fact, speaker_id, query, ask_other_id, route, ids, persona_id)
+            if not reason and dedup_route and fact.id in dedup_ids and not int(getattr(fact, "pinned", 0)):
+                reason = "recently_injected"
             if reason:
                 blocked.append(RetrievalHit(fact=fact, score=0, source="filter", filter_reason=reason))
             else:
@@ -203,7 +211,7 @@ class Retriever:
 
         local_ranked = sorted(
             visible,
-            key=lambda f: self._local_score(query, f, speaker_id, route, ids),
+            key=lambda f: self._local_score(query, f, speaker_id, route, ids, importance_cfg),
             reverse=True,
         )
         local_ids = [f.id for f in local_ranked[: max(top_k * 2, 12)]]
@@ -288,6 +296,7 @@ class Retriever:
         speaker_id: str,
         route: str,
         speaker_ids: list[str] | None = None,
+        importance_cfg: dict[str, Any] | None = None,
     ) -> float:
         score = keyword_score(query, fact)
         age_days = max(0, (now_ts() - (fact.updated_at or now_ts())) / 86400)
@@ -299,6 +308,18 @@ class Retriever:
             score += 0.15
         if getattr(fact, "scope", "") == SCOPE_OWNER:
             score += 0.12
+        if importance_cfg:
+            weight = float(importance_cfg.get("weight") or 0)
+            if weight:
+                score += weight * fact_weight(
+                    fact,
+                    now_ts(),
+                    half_life_days=float(importance_cfg.get("half_life_days") or 30),
+                    reinforce_factor=float(importance_cfg.get("reinforce_factor") or 0.5),
+                    max_multiplier=float(importance_cfg.get("max_multiplier") or 3),
+                )
+        if int(getattr(fact, "pinned", 0)):
+            score += 0.2
         if route == "current_status" and age_days > 2:
             score -= 0.5
         return score
@@ -357,7 +378,11 @@ class Retriever:
                     uncertain.append(fact)
                 continue
             if (
-                (fact.speaker_id in ids or getattr(fact, "scope", "") == SCOPE_OWNER)
+                (
+                    fact.speaker_id in ids
+                    or getattr(fact, "scope", "") == SCOPE_OWNER
+                    or int(getattr(fact, "pinned", 0))
+                )
                 and fact.confidence >= 0.7
                 and fact.attribute in {"likes", "dislikes", "name", "identity", "habit", "promise"}
                 and len(core) < core_limit

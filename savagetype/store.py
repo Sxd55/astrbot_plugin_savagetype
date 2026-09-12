@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .models import Fact, MemoryReview, PendingOverride, Profile, ReviewItem, TimelineEvent
-from .slots import apply_slot
+from .slots import apply_slot, fact_kind
 from .util import (
     MEMORY_STATUS_PENDING,
     SCOPE_OWNER,
+    default_importance,
     dumps,
     loads,
     make_slot_key,
@@ -71,7 +72,10 @@ CREATE TABLE IF NOT EXISTS facts (
     last_accessed INTEGER NOT NULL DEFAULT 0,
     reason TEXT NOT NULL DEFAULT '',
     persona_id TEXT NOT NULL DEFAULT '',
-    slot_key TEXT NOT NULL DEFAULT ''
+    slot_key TEXT NOT NULL DEFAULT '',
+    importance REAL NOT NULL DEFAULT 0,
+    kind TEXT NOT NULL DEFAULT '',
+    pinned INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_facts_slot ON facts(speaker_id, subject, attribute, status);
 CREATE INDEX IF NOT EXISTS idx_facts_status ON facts(status, updated_at);
@@ -189,6 +193,12 @@ class Store:
             self.execute("ALTER TABLE facts ADD COLUMN edited_at INTEGER NOT NULL DEFAULT 0")
         if "edited_by" not in fact_cols:
             self.execute("ALTER TABLE facts ADD COLUMN edited_by TEXT NOT NULL DEFAULT ''")
+        if "importance" not in fact_cols:
+            self.execute("ALTER TABLE facts ADD COLUMN importance REAL NOT NULL DEFAULT 0")
+        if "kind" not in fact_cols:
+            self.execute("ALTER TABLE facts ADD COLUMN kind TEXT NOT NULL DEFAULT ''")
+        if "pinned" not in fact_cols:
+            self.execute("ALTER TABLE facts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
         tl_cols = self._table_cols("timeline")
         if "persona_id" not in tl_cols:
             self.execute("ALTER TABLE timeline ADD COLUMN persona_id TEXT NOT NULL DEFAULT ''")
@@ -218,6 +228,10 @@ class Store:
         if "tokens_out" not in usage_cols:
             self.execute("ALTER TABLE usage_ledger ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0")
         self.execute("CREATE INDEX IF NOT EXISTS idx_facts_slotkey ON facts(slot_key, status)")
+        self.execute("UPDATE facts SET importance=confidence WHERE importance<=0 AND confidence>0")
+        rows = self.query("SELECT id, attribute FROM facts WHERE kind='' OR kind IS NULL")
+        for row in rows:
+            self.execute("UPDATE facts SET kind=? WHERE id=?", (fact_kind(row["attribute"]), int(row["id"])))
         self.execute("CREATE INDEX IF NOT EXISTS idx_facts_persona ON facts(persona_id, speaker_id, status)")
         self.execute("CREATE INDEX IF NOT EXISTS idx_timeline_persona ON timeline(persona_id, speaker_id, ts)")
         self.execute(
@@ -371,11 +385,14 @@ class Store:
             "person_facts": n("SELECT COUNT(*) FROM facts WHERE status='live' AND scope!='owner'"),
             "memory_pending": n("SELECT COUNT(*) FROM memory_reviews WHERE status='pending'"),
             "profiles": n("SELECT COUNT(*) FROM profiles"),
+            "facts_pinned": n("SELECT COUNT(*) FROM facts WHERE status='live' AND pinned=1"),
         }
 
     def add_fact(self, payload: dict[str, Any], bump: bool = True) -> int:
         now = now_ts()
         payload = apply_slot(payload)
+        if float(payload.get("importance") or 0) <= 0:
+            payload["importance"] = default_importance(payload)
         persona_id = str(payload.get("persona_id") or "")
         slot_key = payload.get("slot_key") or make_slot_key(
             persona_id,
@@ -389,8 +406,9 @@ class Store:
                 status, confidence, evidence, mention_policy, first_person, explicit_correction,
                 source, created_at, updated_at, superseded_by, supersedes, fingerprint, embedding,
                 access_count, last_accessed, reason, persona_id, slot_key, expires_at, write_op,
-                scope, plain, keywords, source_event_id, review_status, origin, edited_at, edited_by
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                scope, plain, keywords, source_event_id, review_status, origin, edited_at, edited_by,
+                importance, kind, pinned
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 payload["subject"],
                 payload["attribute"],
@@ -428,6 +446,9 @@ class Store:
                 str(payload.get("origin") or ""),
                 int(payload.get("edited_at", 0) or 0),
                 str(payload.get("edited_by") or ""),
+                float(payload.get("importance") or 0),
+                str(payload.get("kind") or ""),
+                int(payload.get("pinned", 0) or 0),
             ),
         )
         if bump:
@@ -563,6 +584,44 @@ class Store:
         self.bump_revision()
         return cur.rowcount > 0
 
+    def set_pinned(self, fact_id: int, pinned: bool) -> bool:
+        fact = self.get_fact(fact_id)
+        if fact is None:
+            return False
+        self.update_fact(fact_id, pinned=int(bool(pinned)))
+        return True
+
+    def restore_facts(self, ids: list[int]) -> dict[str, Any]:
+        """Bring archived/superseded facts back. Blocks when a live fact holds the slot."""
+        restored: list[int] = []
+        blocked: list[dict[str, Any]] = []
+        missing: list[int] = []
+        for raw in ids:
+            try:
+                fid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            fact = self.get_fact(fid)
+            if fact is None:
+                missing.append(fid)
+                continue
+            if fact.status == "live":
+                restored.append(fid)
+                continue
+            conflict = self.live_by_slot(
+                fact.speaker_id,
+                fact.subject,
+                fact.attribute,
+                persona_id=fact.persona_id,
+                speaker_ids=self.speaker_ids_for(fact.speaker_id),
+            )
+            if conflict is not None and conflict.id != fid:
+                blocked.append({"id": fid, "conflict": conflict.id})
+                continue
+            self.update_fact(fid, status="live", reason="restored", superseded_by=None)
+            restored.append(fid)
+        return {"ok": True, "restored": restored, "blocked": blocked, "missing": missing}
+
     def search_facts(
         self,
         keyword: str,
@@ -577,9 +636,9 @@ class Store:
             ids.append(speaker_id)
         clauses = [
             "status='live'",
-            "(content LIKE ? OR subject LIKE ? OR attribute LIKE ? OR value LIKE ?)",
+            "(content LIKE ? OR subject LIKE ? OR attribute LIKE ? OR value LIKE ? OR keywords LIKE ?)",
         ]
-        params: list[Any] = [like, like, like, like]
+        params: list[Any] = [like, like, like, like, like]
         if persona_id:
             clauses.append("(persona_id=? OR persona_id='')")
             params.append(persona_id)
@@ -963,6 +1022,9 @@ class Store:
             origin=row["origin"] if "origin" in keys else "",
             edited_at=int(row["edited_at"] or 0) if "edited_at" in keys else 0,
             edited_by=row["edited_by"] if "edited_by" in keys else "",
+            importance=float(row["importance"] or 0) if "importance" in keys else 0.0,
+            kind=row["kind"] if "kind" in keys else "",
+            pinned=int(row["pinned"] or 0) if "pinned" in keys else 0,
         )
 
     # ------------------------------------------------------------------

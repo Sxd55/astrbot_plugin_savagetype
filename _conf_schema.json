@@ -48,6 +48,18 @@
     "hint": "LLM 抽取失败后暂停自动抽取的时间。未总结时间线会保留。",
     "default": 180
   },
+  "extract_idle_seconds": {
+    "description": "空闲触发抽取（秒）",
+    "type": "int",
+    "hint": "会话静默这么久后，即使未到阈值也会整理一次未总结消息。0=关闭。",
+    "default": 300
+  },
+  "inject_dedup_window_seconds": {
+    "description": "跨轮注入去重窗口（秒）",
+    "type": "int",
+    "hint": "同一窗口内刚注入过的记忆，在长问答/状态路由里短时间内不重复注入；「还记得/上次」类问题豁免。0=关闭。",
+    "default": 600
+  },
   "inject_budget_chars": {
     "description": "注入字数预算",
     "type": "int",
@@ -282,6 +294,43 @@
     "description": "低价值归档置信度上限",
     "type": "float",
     "default": 0.45
+  },
+  "importance_weight": {
+    "description": "重要性在检索中的权重",
+    "type": "float",
+    "hint": "每条记忆按「基础重要性 × 半衰期衰减 × 访问强化」算分，越高越容易被召回。0=关闭重要性打分。",
+    "default": 0.25
+  },
+  "importance_half_life_days": {
+    "description": "重要性半衰期（天）",
+    "type": "float",
+    "hint": "多久没被更新/访问，权重衰减到一半。被引用会按下方系数拉长半衰期。",
+    "default": 30.0
+  },
+  "importance_reinforce_factor": {
+    "description": "访问强化系数",
+    "type": "float",
+    "hint": "每次被召回，半衰期乘 (1 + 系数 × 访问次数)，上限见下一项。",
+    "default": 0.5
+  },
+  "importance_max_half_life_multiplier": {
+    "description": "半衰期最大拉伸倍数",
+    "type": "float",
+    "hint": "访问强化最多把半衰期拉长到基础值的几倍。",
+    "default": 3.0
+  },
+  "importance_prune_threshold": {
+    "description": "重要性归档阈值",
+    "type": "float",
+    "hint": "维护时权重低于该值且超过「低价值事实归档最短天数」的记忆会归档。置顶记忆永不归档。",
+    "default": 0.12
+  },
+  "image_caption_provider_id": {
+    "description": "图片转述模型",
+    "type": "string",
+    "hint": "留空=不额外调用模型，只使用 AstrBot 已生成的图片转述（如果有）。填了之后，图片消息会用该对话模型转述并写入记忆。",
+    "default": "",
+    "_special": "select_provider"
   },
   "memory_whitelist": {
     "description": "记忆白名单",

@@ -26,6 +26,13 @@ ROLE_BOT_ID = "bot_self"
 SCOPE_OWNER = "owner"
 SCOPE_PERSON = "person"
 
+KIND_PREFERENCE = "preference"
+KIND_IDENTITY = "identity"
+KIND_HABIT = "habit"
+KIND_PROMISE = "promise"
+KIND_STATUS = "status"
+KIND_NOTE = "note"
+
 ORIGIN_QQ = "qq"
 ORIGIN_MANUAL = "manual"
 ORIGIN_IMPORT = "import"
@@ -93,6 +100,50 @@ COMMAND_SPLIT_RE = re.compile(r"^[/／]")
 
 def now_ts() -> int:
     return int(time.time())
+
+
+def default_importance(payload: dict[str, Any]) -> float:
+    origin = str(payload.get("origin") or "")
+    review = str(payload.get("review_status") or "")
+    if origin == ORIGIN_MANUAL or review == REVIEW_MANUAL:
+        base = 1.0
+    elif review == REVIEW_AI_PASSED:
+        base = 0.8
+    else:
+        base = 0.5
+    if int(payload.get("explicit_correction") or 0):
+        base += 0.1
+    if int(payload.get("first_person") or 0):
+        base += 0.05
+    return max(0.0, min(1.0, base))
+
+
+def fact_weight(
+    fact: Any,
+    now: int | None = None,
+    half_life_days: float = 30.0,
+    reinforce_factor: float = 0.5,
+    max_multiplier: float = 3.0,
+) -> float:
+    """Base importance decayed by age, with access-stretched half-life."""
+    base = float(getattr(fact, "importance", 0) or 0)
+    if base <= 0:
+        base = float(getattr(fact, "confidence", 0.5) or 0.5)
+    if int(getattr(fact, "pinned", 0) or 0):
+        return max(base, 1.0)
+    now = now or now_ts()
+    accesses = max(0, int(getattr(fact, "access_count", 0) or 0))
+    last = max(
+        int(getattr(fact, "last_accessed", 0) or 0),
+        int(getattr(fact, "updated_at", 0) or 0),
+        int(getattr(fact, "created_at", 0) or 0),
+    )
+    age_days = max(0.0, (now - last) / 86400.0) if last else 0.0
+    half_life = max(0.1, float(half_life_days)) * min(
+        1.0 + max(0.0, float(reinforce_factor)) * accesses,
+        max(1.0, float(max_multiplier)),
+    )
+    return base * (0.5 ** (age_days / half_life))
 
 
 PLATFORM_ALIASES = {
