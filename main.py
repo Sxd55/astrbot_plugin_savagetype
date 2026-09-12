@@ -2,7 +2,7 @@ from pathlib import Path
 import json
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.api.web import error_response, file_response, json_response, request
@@ -13,11 +13,11 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path, get_astrbot_p
 try:
     from .savagetype.service import SavageTypeService
     from .savagetype.store import Store
-    from .savagetype.util import PLUGIN_NAME, clip
+    from .savagetype.util import PLUGIN_NAME, clip, now_ts
 except ImportError:
     from savagetype.service import SavageTypeService
     from savagetype.store import Store
-    from savagetype.util import PLUGIN_NAME, clip
+    from savagetype.util import PLUGIN_NAME, clip, now_ts
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "_conf_schema.json"
 
@@ -38,7 +38,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "2.7.0",
+    "2.8.0",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -53,13 +53,26 @@ class SavageTypePlugin(Star):
             get_provider=self._get_special_provider,
             logger=logger,
             get_persona_text=self._persona_text,
+            send_message=self._send_message,
         )
         self._register_pages()
         logger.info("Savage Type loaded, db=%s", self.store.db_path)
 
     async def initialize(self):
         self.service.refresh_coexistence(self.context.get_all_stars())
+        if self.store.get_meta("cleaned_v280") != "1":
+            try:
+                backup = self.service.backup_now(self.data_dir / "backups")
+                counts = self.store.clear_dirty_v280()
+                self.store.set_meta("cleaned_v280", "1")
+                logger.info("Savage Type clean rebuild done: backup=%s cleared=%s", backup, counts)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Savage Type clean rebuild failed: %s", exc)
         logger.info("Savage Type coexistence: %s", self.service.coexistence.snapshot())
+
+    async def _send_message(self, umo: str, text: str) -> None:
+        chain = MessageChain().message(text)
+        await self.context.send_message(umo, chain)
 
     async def terminate(self):
         task = getattr(self.service, "_learn_task", None)
@@ -99,6 +112,14 @@ class SavageTypePlugin(Star):
             ("config/save", self.page_config_save, ["POST"], "Save plugin config"),
             ("dossiers", self.page_dossiers, ["GET"], "List QQ dossiers"),
             ("dossier", self.page_dossier, ["GET"], "One QQ dossier"),
+            ("memory", self.page_memory, ["GET"], "Owner memory library"),
+            ("memory/pending", self.page_memory_pending, ["GET"], "Pending memory reviews"),
+            ("memory/review", self.page_memory_review, ["POST"], "Approve or reject memory"),
+            ("profiles", self.page_profiles, ["GET"], "List profiles"),
+            ("profile", self.page_profile, ["GET"], "One profile with facts"),
+            ("profile/update", self.page_profile_update, ["POST"], "Update profile"),
+            ("facts/update", self.page_fact_update, ["POST"], "Edit one fact"),
+            ("reset", self.page_reset, ["POST"], "Clean rebuild with backup"),
         ]
         for route, handler, methods, desc in apis:
             self.context.register_web_api(
@@ -113,7 +134,19 @@ class SavageTypePlugin(Star):
         try:
             self.service.refresh_coexistence(self.context.get_all_stars())
             text = (event.message_str or "").strip()
-            if not text or text.startswith("/"):
+            if not text:
+                return
+            self.service.remember_owner_window(event)
+            if self.service.is_owner_event(event):
+                reply = await self.service.handle_owner_reply(text)
+                if reply:
+                    await self.service.send_text(event.unified_msg_origin, reply)
+                    try:
+                        event.stop_event()
+                    except Exception:
+                        pass
+                    return
+            if text.startswith("/"):
                 return
             persona_id = await self._persona_id(event)
             ident = self.service.identity_from_event(event, persona_id=persona_id)
@@ -366,6 +399,30 @@ class SavageTypePlugin(Star):
         yield event.plain_result(str(result))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @stype.command("pending")
+    async def cmd_pending(self, event: AstrMessageEvent):
+        """列出待审记忆"""
+        items = self.store.list_memory_reviews("pending", limit=12)
+        if not items:
+            yield event.plain_result("没有待审记忆。")
+            return
+        lines = [f"#{r.id} [{r.scope}] {clip(r.plain or r.raw_text, 60)}（{r.speaker_name or r.speaker_id}）" for r in items]
+        lines.append("用 /stype pass <id> 通过，/stype drop <id> 删除。")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @stype.command("pass")
+    async def cmd_pass(self, event: AstrMessageEvent, review_id: int):
+        """通过一条待审记忆"""
+        yield event.plain_result(self.service.resolve_memory_review(review_id, True))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @stype.command("drop")
+    async def cmd_drop(self, event: AstrMessageEvent, review_id: int):
+        """删除一条待审记忆"""
+        yield event.plain_result(self.service.resolve_memory_review(review_id, False))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @stype.command("export")
     async def cmd_export(self, event: AstrMessageEvent):
         """导出 JSONL 档案"""
@@ -453,8 +510,8 @@ class SavageTypePlugin(Star):
             content(string): 要记住的稳定事实
         """
         ident = await self._ident(event)
-        if not self.service.is_admin_event(event):
-            return "ok=false action=denied reason=admin_only"
+        if not self.service.is_owner_event(event):
+            return "ok=false action=denied reason=owner_only"
         result = self.service.remember(ident, content)
         if result.get("action") in {"insert", "refresh", "supersede", "wrote_uncertain"}:
             return f"ok=true action={result.get('action')} fact_id={result.get('fact_id')}"
@@ -589,8 +646,155 @@ class SavageTypePlugin(Star):
 
     async def page_facts(self):
         status = request.query.get("status", "live")
+        scope = request.query.get("scope", "") or ""
         facts = self.store.facts_by_status(status, limit=200)
+        if scope:
+            facts = [f for f in facts if (f.scope or "") == scope]
         return json_response({"items": [self._fact_view(f) for f in facts]})
+
+    async def page_memory(self):
+        q = (request.query.get("q", "") or "").strip()
+        facts = self.store.owner_facts(limit=200)
+        if q:
+            needle = q.lower()
+            facts = [
+                f
+                for f in facts
+                if needle in (f.plain or f.content or "").lower()
+                or needle in (f.speaker_name or "").lower()
+                or needle in (f.value or "").lower()
+            ]
+        overview = self.service.overview()
+        return json_response(
+            {
+                "items": [self._fact_view(f) for f in facts],
+                "owner": overview.get("owner", {}),
+                "data_dir": overview.get("data_dir", ""),
+            }
+        )
+
+    def _memory_review_view(self, r) -> dict:
+        return {
+            "id": r.id,
+            "scope": r.scope,
+            "speaker_id": r.speaker_id,
+            "speaker_name": r.speaker_name,
+            "platform": r.platform,
+            "window_tag": r.window_tag,
+            "source_event_id": r.source_event_id,
+            "raw_text": r.raw_text,
+            "plain": r.plain,
+            "keywords": r.keywords,
+            "payload": r.payload,
+            "status": r.status,
+            "attempts": r.attempts,
+            "trace": r.trace,
+            "notified_at": r.notified_at,
+            "created_at": r.created_at,
+            "updated_at": r.updated_at,
+        }
+
+    async def page_memory_pending(self):
+        items = self.store.list_memory_reviews("pending", limit=80)
+        return json_response({"items": [self._memory_review_view(r) for r in items]})
+
+    async def page_memory_review(self):
+        payload = await request.json(default={})
+        review_id = int(payload.get("id") or 0)
+        if not review_id:
+            return error_response("missing id", status_code=400)
+        status = str(payload.get("status") or "").strip().lower()
+        plain = str(payload.get("plain") or "").strip()
+        if plain:
+            item = self.store.get_memory_review(review_id)
+            if item and item.status == "pending":
+                new_payload = dict(item.payload or {})
+                new_payload["plain"] = plain
+                self.store.update_memory_review(review_id, plain=plain, payload=new_payload)
+        if status in {"approved", "approve", "pass", "yes"}:
+            return json_response({"ok": True, "message": self.service.resolve_memory_review(review_id, True)})
+        if status in {"rejected", "reject", "delete", "no"}:
+            return json_response({"ok": True, "message": self.service.resolve_memory_review(review_id, False)})
+        return error_response("bad status", status_code=400)
+
+    def _profile_view(self, profile) -> dict:
+        if profile is None:
+            return {}
+        return {
+            "speaker_id": profile.speaker_id,
+            "speaker_name": profile.speaker_name,
+            "platform": profile.platform,
+            "is_owner": profile.is_owner,
+            "note": profile.note,
+            "first_seen": profile.first_seen,
+            "last_seen": profile.last_seen,
+            "seen_count": profile.seen_count,
+            "fact_count": profile.fact_count,
+        }
+
+    async def page_profiles(self):
+        items = self.store.list_profiles(limit=300)
+        return json_response({"items": [self._profile_view(p) for p in items]})
+
+    async def page_profile(self):
+        speaker_id = (request.query.get("speaker_id", "") or "").strip()
+        if not speaker_id:
+            return error_response("missing speaker_id", status_code=400)
+        profile = self.store.get_profile(speaker_id)
+        facts = self.store.person_facts(speaker_id, limit=200)
+        return json_response(
+            {
+                "profile": self._profile_view(profile),
+                "items": [self._fact_view(f) for f in facts],
+            }
+        )
+
+    async def page_profile_update(self):
+        payload = await request.json(default={})
+        speaker_id = str(payload.get("speaker_id") or "").strip()
+        if not speaker_id:
+            return error_response("missing speaker_id", status_code=400)
+        updated = self.store.update_profile(
+            speaker_id,
+            speaker_name=payload.get("speaker_name"),
+            note=payload.get("note"),
+        )
+        if not updated:
+            return error_response("profile not found", status_code=404)
+        return json_response({"ok": True, "profile": self._profile_view(self.store.get_profile(speaker_id))})
+
+    async def page_fact_update(self):
+        payload = await request.json(default={})
+        fact_id = int(payload.get("id") or 0)
+        if not fact_id:
+            return error_response("missing id", status_code=400)
+        fact = self.store.get_fact(fact_id)
+        if fact is None:
+            return error_response("fact not found", status_code=404)
+        fields = {}
+        if "plain" in payload:
+            fields["plain"] = str(payload.get("plain") or "")
+        if "value" in payload:
+            fields["value"] = str(payload.get("value") or "")
+        if "content" in payload:
+            fields["content"] = str(payload.get("content") or "")
+        if "keywords" in payload:
+            fields["keywords"] = payload.get("keywords") or []
+        if fields:
+            fields["edited_at"] = now_ts()
+            fields["edited_by"] = "ui"
+            fields["review_status"] = "manual"
+            self.store.update_fact(fact_id, **fields)
+        return json_response({"ok": True, "fact": self._fact_view(self.store.get_fact(fact_id))})
+
+    async def page_reset(self):
+        payload = await request.json(default={})
+        if str(payload.get("confirm") or "") != "reset":
+            return error_response("missing confirm=reset", status_code=400)
+        backup = self.service.backup_now(self.data_dir / "backups")
+        counts = self.store.clear_dirty_v280()
+        self.store.add_diag("clean_rebuild", {"backup": str(backup), "cleared": counts})
+        return json_response({"ok": True, "backup": str(backup), "cleared": counts})
 
     async def page_pending(self):
         items = self.store.pending_open(80)
@@ -804,7 +1008,7 @@ class SavageTypePlugin(Star):
         if hasattr(self.config, "save_config"):
             self.config.save_config()
         self.service.config = self.config
-        self.service._sync_embed_fn()
+        self.service.apply_config()
         return json_response({"ok": True, "saved": saved, "values": self._config_values()})
 
     async def page_facts_archive(self):
@@ -834,6 +1038,14 @@ class SavageTypePlugin(Star):
             "attribute": f.attribute,
             "value": f.value,
             "content": f.content,
+            "plain": getattr(f, "plain", ""),
+            "keywords": getattr(f, "keywords", []),
+            "scope": getattr(f, "scope", ""),
+            "origin": getattr(f, "origin", ""),
+            "review_status": getattr(f, "review_status", ""),
+            "source_event_id": getattr(f, "source_event_id", 0),
+            "edited_at": getattr(f, "edited_at", 0),
+            "edited_by": getattr(f, "edited_by", ""),
             "speaker_id": f.speaker_id,
             "speaker_name": f.speaker_name,
             "status": f.status,

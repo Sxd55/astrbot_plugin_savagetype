@@ -2,87 +2,122 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Savage Type</title>
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
     <div id="toast" hidden></div>
     <div class="wrap">
-      <header>
+      <header class="topbar glass">
         <div class="brand">
           <img class="cover" src="./_logo.webp" alt="" />
           <div>
             <h1>Savage Type</h1>
-            <p class="lede">人格读 AstrBot。这里管事实、改口、审查后的学习草稿。</p>
+            <p class="lede">人格读 AstrBot。主人记忆全局生效，人物档案点名才用。</p>
           </div>
         </div>
         <nav class="tabs">
-          <button type="button" data-act="tab" data-tab="ops" class="on">工作台</button>
+          <button type="button" data-act="tab" data-tab="memory" class="on">记忆库</button>
+          <button type="button" data-act="tab" data-tab="profiles">人物档案</button>
+          <button type="button" data-act="tab" data-tab="diag">诊断</button>
           <button type="button" data-act="tab" data-tab="settings">设置</button>
         </nav>
       </header>
 
-      <section id="page-ops">
+      <!-- 记忆库 -->
+      <section id="page-memory">
         <div class="row toolbar">
           <button type="button" data-act="refresh">刷新</button>
-          <button type="button" class="ghost" data-act="extract">抽取事实</button>
+          <button type="button" class="ghost" data-act="extract">抽取/整理</button>
           <button type="button" class="ghost" data-act="sleep">维护</button>
           <button type="button" class="ghost" data-act="learn">跑一轮学习</button>
           <button type="button" class="ghost" data-act="export">导出 JSONL</button>
         </div>
         <div class="kpis" id="kpis"></div>
         <p id="coexist" class="lede"></p>
+        <p id="owner-line" class="lede"></p>
 
-        <div class="grid">
-          <section class="card full">
-            <h2>记忆显微镜</h2>
-            <p class="lede">检索、删除、手动写入都在这里。说话人可选已有 QQ，或手填。</p>
+        <div class="grid two">
+          <section class="card glass">
+            <h2>主人记忆</h2>
+            <p class="lede">主人在 QQ 里的指令与自述，经 AI 缩写和审核后写入；这些内容全局可注入。</p>
             <div class="row">
-              <input id="q" placeholder="关键词" />
-              <input id="speaker" placeholder="筛选 QQ（可空）" />
-              <button type="button" data-act="search">检索</button>
-              <button type="button" class="ghost" data-act="batch-archive">删除所选</button>
+              <input id="memory-q" placeholder="搜索直白文本 / 关键词 / 来源" />
+              <button type="button" data-act="memory-search">搜索</button>
             </div>
-            <textarea id="remember-text" placeholder="手动记住一条事实"></textarea>
+            <textarea id="remember-text" placeholder="主人手动补记一条（直接生效，标记 manual）"></textarea>
             <div class="row">
               <select id="remember-speaker"></select>
               <input id="remember-speaker-custom" placeholder="或手填 QQ / id" />
               <button type="button" data-act="remember">写入</button>
             </div>
-            <div class="scroll" id="hits"></div>
+            <div class="scroll" id="memory-list"></div>
           </section>
 
-          <section class="card">
-            <h2>人物档案</h2>
-            <p class="lede">每人一张，键是 QQ。有 live 事实才出现。回复时只读当前说话人的短卡。</p>
-            <div class="scroll" id="dossiers"></div>
+          <section class="card glass">
+            <h2>待审记忆</h2>
+            <p class="lede">审核不通过的条目。通过才写入；删除即丢弃。主人会收到 QQ 通知，回复「是/否 + 编号」也可以。</p>
+            <div class="scroll" id="memory-pending"></div>
           </section>
+        </div>
 
-          <section class="card">
+        <div class="grid three">
+          <section class="card glass">
             <h2>学习审查</h2>
             <p class="lede">黑话、few-shot、人格草稿。批准后才注入。</p>
-            <div class="scroll" id="reviews"></div>
+            <div class="scroll short" id="reviews"></div>
           </section>
 
-          <section class="card">
+          <section class="card glass">
             <h2>待确认覆盖</h2>
-            <div class="scroll" id="pending"></div>
+            <p class="lede">高证据事实被挑战时的确认队列。</p>
+            <div class="scroll short" id="pending"></div>
           </section>
 
-          <section class="card">
+          <section class="card glass">
             <h2>说话人归并</h2>
             <p class="lede">同名不同 QQ 不会自动合并。</p>
-            <div class="scroll" id="alias-suggestions"></div>
+            <div class="scroll short" id="alias-suggestions"></div>
+          </section>
+        </div>
+      </section>
+
+      <!-- 人物档案 -->
+      <section id="page-profiles" hidden>
+        <div class="grid archive">
+          <section class="card glass">
+            <div class="row">
+              <input id="profile-q" placeholder="搜索昵称 / QQ" />
+              <button type="button" data-act="profiles-refresh">刷新档案</button>
+            </div>
+            <p class="lede">QQ 里出现过的每个人自动建档，空档案默认 7 天后清理。</p>
+            <div class="scroll tall" id="profile-list"></div>
           </section>
 
-          <section class="card full">
+          <section class="card glass">
+            <h2 id="profile-title">选一个人</h2>
+            <div id="profile-detail">
+              <p class="lede">左侧点选档案查看、修改昵称备注和条目。</p>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <!-- 诊断 -->
+      <section id="page-diag" hidden>
+        <div class="kpis" id="kpis-diag"></div>
+        <p id="coexist-diag" class="lede"></p>
+        <div class="grid two">
+          <section class="card glass">
             <h2>注入显微镜</h2>
+            <p class="lede">最近几轮主链实际注入了什么：路由、来源、字数。</p>
             <div class="scroll" id="microscope"></div>
           </section>
 
-          <section class="card full">
+          <section class="card glass">
             <h2>聊天导入</h2>
-            <p class="lede">默认读取插件数据目录。可改成其它 JSONL 路径。</p>
+            <p class="lede">导入的聊天记录标记为 import / 未审核，不烧 AI 审核。</p>
             <div class="row">
               <input id="archive-path" placeholder="JSONL 路径" />
               <button type="button" class="ghost" data-act="archive-preview">预览档案</button>
@@ -96,18 +131,21 @@
               <button type="button" data-act="chat-import">导入聊天</button>
             </div>
           </section>
-
-          <section class="card full">
-            <h2>诊断</h2>
-            <div class="scroll diag" id="diag"></div>
-          </section>
         </div>
+        <section class="card glass">
+          <h2>原始诊断</h2>
+          <div class="row">
+            <button type="button" class="danger" data-act="reset">清空并重建（先自动备份）</button>
+          </div>
+          <div class="scroll diag" id="diag"></div>
+        </section>
       </section>
 
+      <!-- 设置 -->
       <section id="page-settings" hidden>
-        <section class="card full">
+        <section class="card glass">
           <h2>插件设置</h2>
-          <p class="lede">字段与 AstrBot 插件配置页相同。</p>
+          <p class="lede">字段与 AstrBot 插件配置页相同，保存后立刻生效。</p>
           <form id="settings-form" class="settings"></form>
           <div class="row">
             <button type="button" data-act="settings-save">保存设置</button>

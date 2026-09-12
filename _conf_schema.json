@@ -127,6 +127,74 @@
     "hint": "发现 memory_companion / LivingMemory 等重叠能力时跳过对应采集或注入，并在面板显示原因。",
     "default": true
   },
+  "owner_qq": {
+    "description": "主人 QQ",
+    "type": "string",
+    "hint": "只允许一个。留空时回退 AstrBot 管理员判定。非主人的关系自称（如「我是主人」）一律拒绝。",
+    "default": ""
+  },
+  "notify_umo": {
+    "description": "待审通知窗口",
+    "type": "string",
+    "hint": "主人没有私聊记录时的通知目标（unified_msg_origin）。一般不用填：插件会记住主人最近一次私聊会话。",
+    "default": ""
+  },
+  "memory_source_platforms": {
+    "description": "记忆来源平台",
+    "type": "string",
+    "hint": "逗号分隔。默认只记录 QQ（aiocqhttp / qq_official）。webchat（ChatUI）不在名单内，不会被记录。",
+    "default": "aiocqhttp,qq_official"
+  },
+  "pipeline_enabled": {
+    "description": "AI 记忆整理与审核",
+    "type": "bool",
+    "hint": "关闭后退回启发式写入并标记「未审核」。开启时：AI 缩写原文 → 审核是否脱离原意 → 最多改 2 轮 → 通过才写入。",
+    "default": true
+  },
+  "normalize_provider_id": {
+    "description": "记忆整理模型",
+    "type": "string",
+    "hint": "负责把聊天原文缩写成直白文字。留空使用「事实抽取模型」，再留空使用当前会话模型。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "verify_provider_id": {
+    "description": "记忆审核模型",
+    "type": "string",
+    "hint": "负责对照原文审核整理结果。留空与整理模型相同。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "pipeline_max_revisions": {
+    "description": "审核不通过后的最大修改轮数",
+    "type": "int",
+    "hint": "超过后进入待审列表并 QQ 通知主人。默认 2。",
+    "default": 2
+  },
+  "pipeline_batch_size": {
+    "description": "每批处理消息数",
+    "type": "int",
+    "hint": "后台批量处理，避免每条消息都打模型。",
+    "default": 8
+  },
+  "pipeline_notify_cooldown_seconds": {
+    "description": "待审通知冷却（秒）",
+    "type": "int",
+    "hint": "两次 QQ 通知的最小间隔，多条待审会合并成一条。",
+    "default": 300
+  },
+  "empty_profile_ttl_days": {
+    "description": "空档案清理天数",
+    "type": "int",
+    "hint": "没有任何记忆内容的档案超过该天数会在维护时删除。0=不清理。",
+    "default": 7
+  },
+  "ui_theme_color": {
+    "description": "面板主题色",
+    "type": "string",
+    "hint": "十六进制颜色，例如 #7c5cff。",
+    "default": "#7c5cff"
+  },
   "learning_enabled": {
     "description": "启用自主学习",
     "type": "bool",

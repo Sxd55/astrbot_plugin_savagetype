@@ -1,58 +1,62 @@
-# Savage Type 实机联调（约 10 分钟）
+# Savage Type 实机联调（约 15 分钟）
 
-离线 28 测过的是库和规则。这里确认 AstrBot 真的挂上了采集、注入、面板。
+离线测试只验证库和规则。这里确认 AstrBot 真的挂上了采集、管线、通知和面板。
 
-## 0. 安装
+## 0. 安装与升级
 
-1. 把整个 `astrbot_plugin_savagetype` 目录放到 AstrBot 插件目录，名字不要改。常见位置：
-   - `AstrBot\data\plugins\astrbot_plugin_savagetype`
-   - `%USERPROFILE%\.astrbot\data\plugins\astrbot_plugin_savagetype`
+1. 把整个 `astrbot_plugin_savagetype` 目录放到 AstrBot 插件目录，名字不要改。
 2. 重启 AstrBot，或在插件管理里重新加载。
-3. 日志应出现 `Savage Type loaded, db=...`。没有这句话 = 没装上。
+3. 日志应出现 `Savage Type loaded, db=...`。首次以 v2.8.0 启动还会出现 `clean rebuild done`：自动备份并清空旧脏数据（迁移设计，见 README）。
 
-联调时建议先关掉 / 不要同时开 `memory_companion`、LivingMemory。开着的话 Savage Type 会降级采集或注入，显微镜会是空的，这是设计不是故障。`self_learning` 开着则风格/黑话会让出，事实记忆仍应工作。
+联调时建议关掉 `memory_companion` / LivingMemory。`self_learning` 开着时风格/黑话会让出，事实记忆仍应工作。
 
-Embedding 保持默认关。这一轮不测向量。
+## 1. 基础配置
 
-## 1. 加载
+插件设置里填「主人 QQ」（建议填，只有一个）。确认「记忆来源平台」包含你用的 QQ 适配器（默认 `aiocqhttp,qq_official`）。
 
-对 Bot 发：`/stype status`
+对 Bot 发：`/stype status`，应看到时间线、live、采集/注入开关。
 
-应看到时间线/live 数量、采集与注入是否开启、Embedding 状态（关闭 / 缺 Provider / 实际启用）。报未知命令 = 插件没进加载列表。
+## 2. 采集与建档
 
-## 2. 采集
+在主人在的 QQ 群里，用一个非主人账号发消息。打开面板「人物档案」，应自动出现这个人的空档案。
 
-对 Bot 说一句稳定事实，例如：`我喜欢喝美式，不喜欢拿铁。`
+如果非主人说「我是主人」，等待抽取后：不应产生任何身份事实。这是关系词守卫。
 
-再发：`/stype recent 5`
+## 3. 主人记忆（AI 管线）
 
-应能看到刚才那句用户消息。没有 = `on_message` 没挂上，或消息被当成指令丢掉了。
+主人私聊 Bot：`我喜欢喝美式，不喜欢拿铁。`
 
-等一两分钟（抽取阈值默认 8 条；联调可在面板点「抽取」或发 `/stype extract`），再发：`/stype search 美式`
+等待防抖（默认 45 秒）或面板点「抽取/整理」。打开「记忆库」：
 
-应出现 live 事实。没有 = 抽取没跑，看日志里有没有 `Savage Type extract failed`。
+- 应出现一条主人记忆，直白文本像「喜欢美式 / 不喜欢拿铁」；
+- 可以展开原文；标签为「AI 通过 / 未审核 / 手动」；
+- 若审核反复不通过，会进「待审记忆」，同时 QQ 私聊主人收到通知。
 
-## 3. 注入
+在 QQ 私聊里回复 `是 <编号>` 或 `否 <编号>`，对应条目应通过或删除。
 
-再问：`我喜欢喝什么来着？`
+## 4. 注入
 
-Bot 应能答美式。然后发：`/stype microscope`
+主人问：`我喜欢喝什么来着？` Bot 应能答美式。
 
-应有一条 route / core / pack_chars。没有快照 = `on_llm_request` 没跑到 `build_injection`（常见原因：共存降级、总开关关了、问题被当成低信息）。
+其他人问同样的问题，主人记忆是全局可注入的，也可答；但别人的档案只在本人出现或点名时注入。
 
-打开拓展页 Savage Type，看「注入显微镜」是否同一条记录。
+打开「诊断 → 注入显微镜」应有一条 route / core / pack_chars 快照。
 
-## 4. 改口
+## 5. 改口与维护
 
-说：`我改口了，喜欢拿铁。`
+主人说：`我改口了，喜欢拿铁。` 抽取后再问，应答拿铁。面板「待确认覆盖」会出现高证据旧事实的确认队列。
 
-抽取后再问喜欢什么。应答拿铁。`/stype search 美式` 里旧条应是 superseded，或显微镜出现改口摘要。
+点「维护」：空档案超过 7 天（默认）会被清理，老时间线保留被记忆引用的原文。
 
-## 5. 面板
+## 6. 学习审查（旧能力）
 
-拓展页应能：总览 KPI、检索、待确认覆盖、待审学习、显微镜。点不开 = Pages 没注册，看启动日志。
+「记忆库 → 学习审查」里的黑话 / few-shot / 人格草稿逻辑不变，批准后才注入。
+
+## 7. 面板
+
+应能切换：记忆库 / 人物档案 / 诊断 / 设置。玻璃拟态、主题色（设置里的 `ui_theme_color`）应生效。人物档案里可改昵称、备注、增删条目。
 
 ## 判定
 
-- 1–5 都过：实机联调通过，savagetype 可以收口。
-- 某步失败：把该步的聊天原文、`/stype status`、`/stype microscope`、相关日志贴回来。不要先开 Bili Learn。
+- 1–7 都过：联调通过。
+- 失败：把聊天原文、`/stype status`、`/stype pending`、`/stype microscope` 和相关日志贴回来。

@@ -11,6 +11,7 @@ from .store import Store
 from .util import (
     LOW_INFO_RE,
     RECALL_RE,
+    SCOPE_OWNER,
     STATUS_RE,
     TIME_WINDOW_RE,
     now_ts,
@@ -296,6 +297,8 @@ class Retriever:
         ids = set(speaker_ids or [speaker_id])
         if fact.speaker_id in ids:
             score += 0.15
+        if getattr(fact, "scope", "") == SCOPE_OWNER:
+            score += 0.12
         if route == "current_status" and age_days > 2:
             score -= 0.5
         return score
@@ -316,6 +319,8 @@ class Retriever:
             return "expired"
         if persona_id and fact.persona_id and fact.persona_id != persona_id:
             return "other_persona"
+        if getattr(fact, "scope", "") == SCOPE_OWNER:
+            return ""
         ids = set(speaker_ids or [speaker_id]) | {"", "bot_self"}
         if fact.speaker_id in ids:
             if route == "current_status":
@@ -352,7 +357,7 @@ class Retriever:
                     uncertain.append(fact)
                 continue
             if (
-                fact.speaker_id in ids
+                (fact.speaker_id in ids or getattr(fact, "scope", "") == SCOPE_OWNER)
                 and fact.confidence >= 0.7
                 and fact.attribute in {"likes", "dislikes", "name", "identity", "habit", "promise"}
                 and len(core) < core_limit

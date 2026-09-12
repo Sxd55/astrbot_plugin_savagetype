@@ -7,9 +7,16 @@ import threading
 from pathlib import Path
 from typing import Any, Iterable
 
-from .models import Fact, PendingOverride, ReviewItem, TimelineEvent
+from .models import Fact, MemoryReview, PendingOverride, Profile, ReviewItem, TimelineEvent
 from .slots import apply_slot
-from .util import dumps, loads, make_slot_key, now_ts
+from .util import (
+    MEMORY_STATUS_PENDING,
+    SCOPE_OWNER,
+    dumps,
+    loads,
+    make_slot_key,
+    now_ts,
+)
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -85,6 +92,42 @@ CREATE TABLE IF NOT EXISTS diagnostics (
     kind TEXT NOT NULL,
     payload TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS profiles (
+    speaker_id TEXT PRIMARY KEY,
+    speaker_name TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL DEFAULT '',
+    is_owner INTEGER NOT NULL DEFAULT 0,
+    note TEXT NOT NULL DEFAULT '',
+    first_seen INTEGER NOT NULL DEFAULT 0,
+    last_seen INTEGER NOT NULL DEFAULT 0,
+    seen_count INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_profiles_seen ON profiles(last_seen);
+
+CREATE TABLE IF NOT EXISTS memory_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL DEFAULT 'person',
+    speaker_id TEXT NOT NULL DEFAULT '',
+    speaker_name TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL DEFAULT '',
+    window_tag TEXT NOT NULL DEFAULT '',
+    source_event_id INTEGER NOT NULL DEFAULT 0,
+    raw_text TEXT NOT NULL DEFAULT '',
+    plain TEXT NOT NULL DEFAULT '',
+    keywords TEXT NOT NULL DEFAULT '[]',
+    payload TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    trace TEXT NOT NULL DEFAULT '[]',
+    notified_at INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_reviews_status ON memory_reviews(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_memory_reviews_speaker ON memory_reviews(speaker_id, status);
 """
 
 
@@ -130,6 +173,22 @@ class Store:
             self.execute("ALTER TABLE facts ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0")
         if "write_op" not in fact_cols:
             self.execute("ALTER TABLE facts ADD COLUMN write_op TEXT NOT NULL DEFAULT ''")
+        if "scope" not in fact_cols:
+            self.execute("ALTER TABLE facts ADD COLUMN scope TEXT NOT NULL DEFAULT ''")
+        if "plain" not in fact_cols:
+            self.execute("ALTER TABLE facts ADD COLUMN plain TEXT NOT NULL DEFAULT ''")
+        if "keywords" not in fact_cols:
+            self.execute("ALTER TABLE facts ADD COLUMN keywords TEXT NOT NULL DEFAULT ''")
+        if "source_event_id" not in fact_cols:
+            self.execute("ALTER TABLE facts ADD COLUMN source_event_id INTEGER NOT NULL DEFAULT 0")
+        if "review_status" not in fact_cols:
+            self.execute("ALTER TABLE facts ADD COLUMN review_status TEXT NOT NULL DEFAULT ''")
+        if "origin" not in fact_cols:
+            self.execute("ALTER TABLE facts ADD COLUMN origin TEXT NOT NULL DEFAULT ''")
+        if "edited_at" not in fact_cols:
+            self.execute("ALTER TABLE facts ADD COLUMN edited_at INTEGER NOT NULL DEFAULT 0")
+        if "edited_by" not in fact_cols:
+            self.execute("ALTER TABLE facts ADD COLUMN edited_by TEXT NOT NULL DEFAULT ''")
         tl_cols = self._table_cols("timeline")
         if "persona_id" not in tl_cols:
             self.execute("ALTER TABLE timeline ADD COLUMN persona_id TEXT NOT NULL DEFAULT ''")
@@ -308,6 +367,10 @@ class Store:
             "jargon_approved": n("SELECT COUNT(*) FROM reviews WHERE kind='jargon' AND status='approved'"),
             "fewshot_approved": n("SELECT COUNT(*) FROM reviews WHERE kind='fewshot' AND status='approved'"),
             "persona_drafts": n("SELECT COUNT(*) FROM reviews WHERE kind='persona' AND status='approved'"),
+            "owner_facts": n("SELECT COUNT(*) FROM facts WHERE status='live' AND scope='owner'"),
+            "person_facts": n("SELECT COUNT(*) FROM facts WHERE status='live' AND scope!='owner'"),
+            "memory_pending": n("SELECT COUNT(*) FROM memory_reviews WHERE status='pending'"),
+            "profiles": n("SELECT COUNT(*) FROM profiles"),
         }
 
     def add_fact(self, payload: dict[str, Any], bump: bool = True) -> int:
@@ -325,8 +388,9 @@ class Store:
                 subject, attribute, value, content, speaker_id, speaker_name, bot_id, window_tag,
                 status, confidence, evidence, mention_policy, first_person, explicit_correction,
                 source, created_at, updated_at, superseded_by, supersedes, fingerprint, embedding,
-                access_count, last_accessed, reason, persona_id, slot_key, expires_at, write_op
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                access_count, last_accessed, reason, persona_id, slot_key, expires_at, write_op,
+                scope, plain, keywords, source_event_id, review_status, origin, edited_at, edited_by
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 payload["subject"],
                 payload["attribute"],
@@ -356,6 +420,14 @@ class Store:
                 slot_key,
                 int(payload.get("expires_at", 0) or 0),
                 str(payload.get("write_op") or ""),
+                str(payload.get("scope") or ""),
+                str(payload.get("plain") or ""),
+                dumps(payload.get("keywords") or []),
+                int(payload.get("source_event_id", 0) or 0),
+                str(payload.get("review_status") or ""),
+                str(payload.get("origin") or ""),
+                int(payload.get("edited_at", 0) or 0),
+                str(payload.get("edited_by") or ""),
             ),
         )
         if bump:
@@ -371,6 +443,8 @@ class Store:
             fields["evidence"] = dumps(fields["evidence"])
         if "embedding" in fields and not isinstance(fields["embedding"], (str, type(None))):
             fields["embedding"] = dumps(fields["embedding"])
+        if "keywords" in fields and not isinstance(fields["keywords"], str):
+            fields["keywords"] = dumps(fields["keywords"])
         assignments = ", ".join(f"{k}=?" for k in fields)
         self.execute(f"UPDATE facts SET {assignments} WHERE id=?", (*fields.values(), fact_id))
         self.bump_revision()
@@ -396,7 +470,7 @@ class Store:
             params.append(persona_id)
         if ids:
             placeholders = ",".join("?" * (len(ids) + 2))
-            clauses.append(f"(speaker_id IN ({placeholders}))")
+            clauses.append(f"(speaker_id IN ({placeholders}) OR scope='owner')")
             params.extend([*ids, "", "bot_self"])
         params.append(limit)
         sql = f"SELECT * FROM facts WHERE {' AND '.join(clauses)} ORDER BY confidence DESC, updated_at DESC LIMIT ?"
@@ -511,7 +585,7 @@ class Store:
             params.append(persona_id)
         if ids:
             placeholders = ",".join("?" * (len(ids) + 2))
-            clauses.append(f"(speaker_id IN ({placeholders}))")
+            clauses.append(f"(speaker_id IN ({placeholders}) OR scope='owner')")
             params.extend([*ids, "", "bot_self"])
         params.append(limit)
         sql = f"SELECT * FROM facts WHERE {' AND '.join(clauses)} ORDER BY confidence DESC LIMIT ?"
@@ -881,4 +955,287 @@ class Store:
             slot_key_value=row["slot_key"] if "slot_key" in keys else "",
             expires_at=int(row["expires_at"] or 0) if "expires_at" in keys else 0,
             write_op=row["write_op"] if "write_op" in keys else "",
+            scope=row["scope"] if "scope" in keys else "",
+            plain=row["plain"] if "plain" in keys else "",
+            keywords=loads(row["keywords"], []) if "keywords" in keys else [],
+            source_event_id=int(row["source_event_id"] or 0) if "source_event_id" in keys else 0,
+            review_status=row["review_status"] if "review_status" in keys else "",
+            origin=row["origin"] if "origin" in keys else "",
+            edited_at=int(row["edited_at"] or 0) if "edited_at" in keys else 0,
+            edited_by=row["edited_by"] if "edited_by" in keys else "",
         )
+
+    # ------------------------------------------------------------------
+    # Profiles (auto-created per QQ sender)
+    # ------------------------------------------------------------------
+
+    def upsert_profile(
+        self,
+        speaker_id: str,
+        speaker_name: str = "",
+        platform: str = "",
+        is_owner: bool = False,
+    ) -> None:
+        sid = (speaker_id or "").strip()
+        if not sid:
+            return
+        now = now_ts()
+        rows = self.query("SELECT speaker_id, speaker_name FROM profiles WHERE speaker_id=?", (sid,))
+        if rows:
+            name = (speaker_name or "").strip() or rows[0]["speaker_name"]
+            self.execute(
+                "UPDATE profiles SET speaker_name=?, platform=?, is_owner=?, last_seen=?, seen_count=seen_count+1, updated_at=? WHERE speaker_id=?",
+                (name, platform or "", int(bool(is_owner)), now, now, sid),
+            )
+            return
+        self.execute(
+            """INSERT INTO profiles(speaker_id, speaker_name, platform, is_owner, note, first_seen, last_seen, seen_count, created_at, updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (sid, (speaker_name or "").strip(), platform or "", int(bool(is_owner)), "", now, now, 1, now, now),
+        )
+
+    def get_profile(self, speaker_id: str) -> Profile | None:
+        rows = self.query(
+            """SELECT p.*, (SELECT COUNT(*) FROM facts f WHERE f.speaker_id=p.speaker_id AND f.status='live') AS fact_count
+               FROM profiles p WHERE p.speaker_id=?""",
+            (speaker_id,),
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        return Profile(
+            speaker_id=r["speaker_id"],
+            speaker_name=r["speaker_name"],
+            platform=r["platform"],
+            is_owner=int(r["is_owner"] or 0),
+            note=r["note"] or "",
+            first_seen=int(r["first_seen"] or 0),
+            last_seen=int(r["last_seen"] or 0),
+            seen_count=int(r["seen_count"] or 0),
+            fact_count=int(r["fact_count"] or 0) if "fact_count" in r.keys() else 0,
+        )
+
+    def list_profiles(self, limit: int = 200, non_empty_only: bool = False) -> list[Profile]:
+        rows = self.query(
+            """SELECT p.*, (SELECT COUNT(*) FROM facts f WHERE f.speaker_id=p.speaker_id AND f.status='live') AS fact_count
+               FROM profiles p ORDER BY p.is_owner DESC, p.last_seen DESC LIMIT ?""",
+            (limit,),
+        )
+        out = []
+        for r in rows:
+            profile = Profile(
+                speaker_id=r["speaker_id"],
+                speaker_name=r["speaker_name"],
+                platform=r["platform"],
+                is_owner=int(r["is_owner"] or 0),
+                note=r["note"] or "",
+                first_seen=int(r["first_seen"] or 0),
+                last_seen=int(r["last_seen"] or 0),
+                seen_count=int(r["seen_count"] or 0),
+                fact_count=int(r["fact_count"] or 0) if "fact_count" in r.keys() else 0,
+            )
+            if non_empty_only and profile.fact_count <= 0:
+                continue
+            out.append(profile)
+        return out
+
+    def update_profile(
+        self,
+        speaker_id: str,
+        speaker_name: str | None = None,
+        note: str | None = None,
+        is_owner: bool | None = None,
+    ) -> bool:
+        sid = (speaker_id or "").strip()
+        if not sid:
+            return False
+        profile = self.get_profile(sid)
+        if profile is None:
+            return False
+        fields: dict[str, Any] = {"updated_at": now_ts()}
+        if speaker_name is not None:
+            fields["speaker_name"] = speaker_name.strip()
+        if note is not None:
+            fields["note"] = note.strip()
+        if is_owner is not None:
+            fields["is_owner"] = int(bool(is_owner))
+        assignments = ", ".join(f"{k}=?" for k in fields)
+        self.execute(
+            f"UPDATE profiles SET {assignments} WHERE speaker_id=?",
+            (*fields.values(), sid),
+        )
+        return True
+
+    def delete_empty_profiles(self, ttl_days: int = 7, limit: int = 200) -> int:
+        if ttl_days <= 0:
+            return 0
+        cutoff = now_ts() - ttl_days * 86400
+        rows = self.query(
+            """SELECT p.speaker_id FROM profiles p
+               WHERE p.last_seen < ? AND p.speaker_id != ''
+                 AND NOT EXISTS (
+                   SELECT 1 FROM facts f
+                   WHERE f.speaker_id=p.speaker_id AND f.status IN ('live','pending_confirm')
+                 )
+               ORDER BY p.last_seen ASC LIMIT ?""",
+            (cutoff, limit),
+        )
+        ids = [r["speaker_id"] for r in rows]
+        if not ids:
+            return 0
+        q = ",".join("?" * len(ids))
+        self.execute(f"DELETE FROM profiles WHERE speaker_id IN ({q})", ids)
+        return len(ids)
+
+    # ------------------------------------------------------------------
+    # Memory review queue (normalize + verify pipeline)
+    # ------------------------------------------------------------------
+
+    def add_memory_review(
+        self,
+        *,
+        scope: str,
+        speaker_id: str,
+        speaker_name: str = "",
+        platform: str = "",
+        window_tag: str = "",
+        source_event_id: int = 0,
+        raw_text: str = "",
+        plain: str = "",
+        keywords: list[str] | None = None,
+        payload: dict[str, Any] | None = None,
+        attempts: int = 0,
+        trace: list[dict[str, Any]] | None = None,
+    ) -> int:
+        now = now_ts()
+        cur = self.execute(
+            """INSERT INTO memory_reviews(
+                scope, speaker_id, speaker_name, platform, window_tag, source_event_id,
+                raw_text, plain, keywords, payload, status, attempts, trace, notified_at,
+                created_at, updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                scope or "person",
+                speaker_id or "",
+                speaker_name or "",
+                platform or "",
+                window_tag or "",
+                int(source_event_id or 0),
+                raw_text or "",
+                plain or "",
+                dumps(keywords or []),
+                dumps(payload or {}),
+                MEMORY_STATUS_PENDING,
+                int(attempts or 0),
+                dumps(trace or []),
+                0,
+                now,
+                now,
+            ),
+        )
+        self.bump_revision()
+        return int(cur.lastrowid)
+
+    def _memory_review(self, row: sqlite3.Row) -> MemoryReview:
+        return MemoryReview(
+            id=int(row["id"]),
+            scope=row["scope"] or "person",
+            speaker_id=row["speaker_id"] or "",
+            speaker_name=row["speaker_name"] or "",
+            platform=row["platform"] or "",
+            window_tag=row["window_tag"] or "",
+            source_event_id=int(row["source_event_id"] or 0),
+            raw_text=row["raw_text"] or "",
+            plain=row["plain"] or "",
+            keywords=loads(row["keywords"], []),
+            payload=loads(row["payload"], {}),
+            status=row["status"] or "pending",
+            attempts=int(row["attempts"] or 0),
+            trace=loads(row["trace"], []),
+            notified_at=int(row["notified_at"] or 0),
+            created_at=int(row["created_at"] or 0),
+            updated_at=int(row["updated_at"] or 0),
+        )
+
+    def list_memory_reviews(self, status: str = "pending", limit: int = 80) -> list[MemoryReview]:
+        rows = self.query(
+            "SELECT * FROM memory_reviews WHERE status=? ORDER BY id DESC LIMIT ?",
+            (status, limit),
+        )
+        return [self._memory_review(r) for r in rows]
+
+    def get_memory_review(self, review_id: int) -> MemoryReview | None:
+        rows = self.query("SELECT * FROM memory_reviews WHERE id=?", (review_id,))
+        return self._memory_review(rows[0]) if rows else None
+
+    def update_memory_review(self, review_id: int, **fields: Any) -> None:
+        if not fields:
+            return
+        fields["updated_at"] = now_ts()
+        if "keywords" in fields and not isinstance(fields["keywords"], str):
+            fields["keywords"] = dumps(fields["keywords"])
+        if "payload" in fields and not isinstance(fields["payload"], str):
+            fields["payload"] = dumps(fields["payload"])
+        if "trace" in fields and not isinstance(fields["trace"], str):
+            fields["trace"] = dumps(fields["trace"])
+        assignments = ", ".join(f"{k}=?" for k in fields)
+        self.execute(f"UPDATE memory_reviews SET {assignments} WHERE id=?", (*fields.values(), review_id))
+        self.bump_revision()
+
+    def delete_memory_review(self, review_id: int) -> bool:
+        cur = self.execute("DELETE FROM memory_reviews WHERE id=?", (review_id,))
+        self.bump_revision()
+        return cur.rowcount > 0
+
+    def pending_memory_unqueued(self, limit: int = 20) -> list[MemoryReview]:
+        rows = self.query(
+            "SELECT * FROM memory_reviews WHERE status='pending' AND notified_at=0 ORDER BY id ASC LIMIT ?",
+            (limit,),
+        )
+        return [self._memory_review(r) for r in rows]
+
+    def owner_facts(self, limit: int = 200) -> list[Fact]:
+        rows = self.query(
+            "SELECT * FROM facts WHERE status='live' AND scope=? ORDER BY updated_at DESC LIMIT ?",
+            (SCOPE_OWNER, limit),
+        )
+        return [self._fact(r) for r in rows]
+
+    def person_facts(self, speaker_id: str, limit: int = 200, include_archived: bool = False) -> list[Fact]:
+        clause = "" if include_archived else "AND status='live'"
+        rows = self.query(
+            f"SELECT * FROM facts WHERE speaker_id=? {clause} ORDER BY updated_at DESC LIMIT ?",
+            (speaker_id, limit),
+        )
+        return [self._fact(r) for r in rows]
+
+    def referenced_timeline_ids(self) -> set[int]:
+        ids: set[int] = set()
+        for table in ("facts", "memory_reviews"):
+            try:
+                rows = self.query(f"SELECT source_event_id FROM {table} WHERE source_event_id>0")
+            except sqlite3.OperationalError:
+                continue
+            for row in rows:
+                ids.add(int(row["source_event_id"]))
+        return ids
+
+    def clear_dirty_v280(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for table in (
+            "facts",
+            "timeline",
+            "pending_overrides",
+            "diagnostics",
+            "reviews",
+            "jargon_stats",
+            "usage_ledger",
+            "memory_reviews",
+        ):
+            try:
+                cur = self.execute(f"DELETE FROM {table}")
+                counts[table] = int(cur.rowcount or 0)
+            except sqlite3.OperationalError:
+                counts[table] = 0
+        self.bump_revision()
+        return counts

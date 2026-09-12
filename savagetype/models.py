@@ -51,6 +51,14 @@ class Fact:
     slot_key_value: str = ""
     expires_at: int = 0
     write_op: str = ""
+    scope: str = ""
+    plain: str = ""
+    keywords: list[str] = field(default_factory=list)
+    source_event_id: int = 0
+    review_status: str = ""
+    origin: str = ""
+    edited_at: int = 0
+    edited_by: str = ""
 
     def slot_key(self) -> str:
         from .slots import canonical_attribute, canonical_subject
@@ -116,3 +124,37 @@ class LearningPack:
     jargon: list[dict[str, Any]] = field(default_factory=list)
     fewshots: list[dict[str, Any]] = field(default_factory=list)
     persona_draft: str = ""
+
+
+@dataclass
+class Profile:
+    speaker_id: str
+    speaker_name: str = ""
+    platform: str = ""
+    is_owner: int = 0
+    note: str = ""
+    first_seen: int = 0
+    last_seen: int = 0
+    seen_count: int = 0
+    fact_count: int = 0
+
+
+@dataclass
+class MemoryReview:
+    id: int
+    scope: str
+    speaker_id: str
+    speaker_name: str
+    platform: str
+    window_tag: str
+    source_event_id: int
+    raw_text: str
+    plain: str
+    keywords: list[str]
+    payload: dict[str, Any]
+    status: str
+    attempts: int
+    trace: list[dict[str, Any]]
+    notified_at: int
+    created_at: int
+    updated_at: int

@@ -182,6 +182,8 @@ def _as_payload(row: dict[str, Any], drop: set[str]) -> dict[str, Any]:
         payload["embedding"] = loads(payload["embedding"], None)
     if "payload" in payload and isinstance(payload["payload"], str):
         payload["payload"] = loads(payload["payload"], {})
+    if "keywords" in payload and isinstance(payload["keywords"], str):
+        payload["keywords"] = loads(payload["keywords"], [])
     return payload
 
 
@@ -253,11 +255,12 @@ def import_transcript_events(store: Store, events: list[dict[str, Any]]) -> dict
 
 def compact_summarized_timeline(store: Store, retain_days: int = 30, limit: int = 2000) -> int:
     cutoff = now_ts() - max(1, retain_days) * 86400
+    keep = store.referenced_timeline_ids()
     rows = store.query(
         "SELECT id FROM timeline WHERE summarized=1 AND ts<? ORDER BY id ASC LIMIT ?",
-        (cutoff, limit),
+        (cutoff, max(limit, len(keep) + limit)),
     )
-    ids = [int(r["id"]) for r in rows]
+    ids = [int(r["id"]) for r in rows if int(r["id"]) not in keep][:limit]
     if not ids:
         return 0
     q = ",".join("?" * len(ids))

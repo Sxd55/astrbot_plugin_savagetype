@@ -44,7 +44,7 @@ def build_profile(speaker_id: str, facts: list[Fact], speaker_name: str = "") ->
         items = sorted(items, key=lambda f: (-float(f.confidence or 0), -(f.updated_at or 0)))[:2]
         bits = []
         for fact in items:
-            text = clip(fact.value or fact.content, 40)
+            text = clip(getattr(fact, "plain", "") or fact.value or fact.content, 40)
             if text:
                 bits.append(text)
                 evidence.append(fact.id)

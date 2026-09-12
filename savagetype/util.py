@@ -21,6 +21,23 @@ UNCERTAIN = "uncertain"
 
 ROLE_USER = "user"
 ROLE_ASSISTANT = "assistant"
+ROLE_BOT_ID = "bot_self"
+
+SCOPE_OWNER = "owner"
+SCOPE_PERSON = "person"
+
+ORIGIN_QQ = "qq"
+ORIGIN_MANUAL = "manual"
+ORIGIN_IMPORT = "import"
+
+REVIEW_AI_PASSED = "ai_passed"
+REVIEW_UNVERIFIED = "unverified"
+REVIEW_MANUAL = "manual"
+REVIEW_NEEDS = "needs_review"
+
+MEMORY_STATUS_PENDING = "pending"
+MEMORY_STATUS_APPROVED = "approved"
+MEMORY_STATUS_REJECTED = "rejected"
 
 LOW_INFO_RE = re.compile(
     r"^(哈+|啊+|嗯+|哦+|额+|好+|ok+|okay+|你好|在吗|早|晚安|谢谢|谢谢你)[\s!！。.~～]*$",
@@ -63,9 +80,40 @@ PREF_PATTERNS = [
 CLOSE_RE = re.compile(r"(做完了|完成了|已经寄了|已经办了|不用记了|算了当我没说|取消约定)")
 STATUS_NOW_RE = re.compile(r"(加班|熬夜|感冒|发烧|失眠|出差|请假)")
 
+OWNER_DIRECTIVE_RE = re.compile(
+    r"(记住|记一下|记下来|别忘了|帮我记|以后|从现在起|从今以后|不要|别再|别忘|必须|禁止|叫你|称呼我|改口)"
+)
+RELATION_GUARD_RE = re.compile(
+    r"(主人|owner|老公|老婆|男朋友|女朋友|男友|女友|未婚夫|未婚妻|"
+    r"爸爸|妈妈|父亲|母亲|儿子|女儿|哥哥|弟弟|姐姐|妹妹|"
+    r"老板|上司|领导|管理员|群主|admin)"
+)
+COMMAND_SPLIT_RE = re.compile(r"^[/／]")
+
 
 def now_ts() -> int:
     return int(time.time())
+
+
+def platform_of(window_tag: str) -> str:
+    return (window_tag or "").split(":", 1)[0].strip().lower()
+
+
+def is_private_window(window_tag: str) -> bool:
+    tag = (window_tag or "").lower()
+    if not tag:
+        return False
+    if "friend" in tag or "private" in tag:
+        return True
+    return False
+
+
+def parse_csv(raw: str) -> list[str]:
+    return [p.strip() for p in (raw or "").replace("\n", ",").split(",") if p.strip()]
+
+
+def has_relation_claim(*texts: str) -> bool:
+    return any(RELATION_GUARD_RE.search(t or "") for t in texts)
 
 
 def make_slot_key(persona_id: str, speaker_id: str, subject: str, attribute: str) -> str:

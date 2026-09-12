@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -24,16 +25,25 @@ from .contradiction import ContradictionEngine
 from .extract import Extractor
 from .inject import build_pack
 from .learn import LearningEngine
+from .pipeline import MemoryPipeline
 from .profiles import build_profile
 from .retrieve import Retriever, detect_other_speaker
 from .store import Store
 from .slots import apply_slot
 from .util import (
+    COMMAND_SPLIT_RE,
+    ORIGIN_MANUAL,
+    REVIEW_MANUAL,
     ROLE_ASSISTANT,
+    ROLE_BOT_ID,
     ROLE_USER,
+    SCOPE_OWNER,
+    SCOPE_PERSON,
     clip,
     fingerprint,
     now_ts,
+    parse_csv,
+    platform_of,
 )
 
 
@@ -55,6 +65,7 @@ class SavageTypeService:
         get_provider,
         logger,
         get_persona_text=None,
+        send_message=None,
     ):
         self.store = store
         self.config = config
@@ -62,12 +73,25 @@ class SavageTypeService:
         self.get_provider = get_provider
         self.logger = logger
         self.get_persona_text = get_persona_text
+        self.send_message = send_message
+        self._owner_ids: set[str] = set()
         self.coexistence = Coexistence(enabled=bool(config.get("coexistence_degrade", True)))
         self.contradiction = ContradictionEngine(
             store,
             high_evidence=float(config.get("high_evidence_confidence", 0.8)),
+            owner_ids=self._owner_ids,
         )
-        self.extractor = Extractor(store, self.contradiction, llm=self._llm)
+        self.extractor = Extractor(store, self.contradiction, llm=self._llm_for("normalize"))
+        self.pipeline = MemoryPipeline(
+            store,
+            self.contradiction,
+            self.extractor,
+            self.config,
+            logger,
+            llm=self._llm_for("normalize"),
+            verify_llm=self._llm_for("verify"),
+            is_owner_speaker=self.is_owner_speaker,
+        )
         self.learning = LearningEngine(store, llm=self._llm, config=self.config)
         self.retriever = Retriever(
             store,
@@ -125,6 +149,56 @@ class SavageTypeService:
     def enabled(self) -> bool:
         return bool(self.config.get("enabled", True))
 
+    def owner_qq(self) -> str:
+        return str(self.config.get("owner_qq") or "").strip()
+
+    def _rebuild_owner_ids(self) -> None:
+        ids = set(self._owner_ids)
+        owner = self.owner_qq()
+        if owner:
+            ids.add(self.store.resolve_speaker(owner))
+        self._owner_ids = ids
+        self.contradiction.owner_ids = set(ids)
+
+    def mark_owner_speaker(self, speaker_id: str) -> None:
+        if not speaker_id:
+            return
+        canonical = self.store.resolve_speaker(speaker_id)
+        if canonical and canonical not in self._owner_ids:
+            self._owner_ids.add(canonical)
+            self.contradiction.owner_ids = set(self._owner_ids)
+
+    def is_owner_speaker(self, speaker_id: str) -> bool:
+        if not speaker_id:
+            return False
+        return self.store.resolve_speaker(speaker_id) in self._owner_ids
+
+    def owner_notify_umo(self) -> str:
+        umo = str(self.store.get_meta("owner_umo") or "").strip()
+        if umo:
+            return umo
+        return str(self.config.get("notify_umo") or "").strip()
+
+    def apply_config(self) -> None:
+        self.config["_skip_style_learning"] = bool(self.coexistence.skip_style)
+        self.learning.config = self.config
+        self.pipeline.config = self.config
+        self._rebuild_owner_ids()
+        self._sync_embed_fn()
+
+    def platform_allowed(self, ident: dict[str, str] | None = None) -> bool:
+        ident = ident or {}
+        if not ident:
+            return True
+        raw = self.config.get("memory_source_platforms")
+        if raw is None:
+            raw = "aiocqhttp,qq_official"
+        allow = parse_csv(str(raw))
+        if not allow:
+            return True
+        platform = str(ident.get("platform") or "") or platform_of(str(ident.get("window_tag") or ""))
+        return platform in allow
+
     def whitelist_ids(self) -> list[str]:
         raw = str(self.config.get("memory_whitelist") or "")
         return [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
@@ -145,13 +219,15 @@ class SavageTypeService:
         hay = " ".join([window, speaker, group])
         return any(item and item in hay for item in allow)
 
-    def capture_ok(self, event: Any = None) -> bool:
-        return (
+    def capture_ok(self, event: Any = None, ident: dict[str, str] | None = None) -> bool:
+        if not (
             self.enabled()
             and bool(self.config.get("capture_enabled", True))
             and not self.coexistence.skip_capture
-            and self.window_allowed(event)
-        )
+        ):
+            return False
+        ident = ident or (self._ident_from_event(event) if event is not None else {})
+        return self.platform_allowed(ident) and self.window_allowed(event, ident)
 
     def inject_ok(self, event: Any = None) -> bool:
         return (
@@ -163,8 +239,7 @@ class SavageTypeService:
 
     def refresh_coexistence(self, stars: list[Any]) -> None:
         self.coexistence.refresh(stars)
-        self.config["_skip_style_learning"] = bool(self.coexistence.skip_style)
-        self.learning.config = self.config
+        self.apply_config()
 
     def _ident_from_event(self, event: Any) -> dict[str, str]:
         try:
@@ -206,6 +281,7 @@ class SavageTypeService:
             "speaker_name": speaker_name or canonical,
             "bot_id": bot_id,
             "window_tag": window_tag,
+            "platform": platform_of(window_tag),
             "persona_id": persona_id or "",
         }
 
@@ -239,19 +315,56 @@ class SavageTypeService:
             return True
         return bool(DIRECTIVE_RE.search(t) and FIRST_PERSON_RE.search(t))
 
+    def is_owner_event(self, event: Any) -> bool:
+        if event is None:
+            return False
+        owner = self.owner_qq()
+        if owner:
+            try:
+                sender = self.store.resolve_speaker(str(event.get_sender_id() or ""))
+            except Exception:
+                sender = ""
+            return bool(sender) and sender == self.store.resolve_speaker(owner)
+        return self.is_admin_event(event)
+
+    def remember_owner_window(self, event: Any) -> None:
+        """Track the owner's private session for pending-memory notifications."""
+        if not self.is_owner_event(event):
+            return
+        umo = ""
+        try:
+            umo = str(event.unified_msg_origin or "")
+        except Exception:
+            return
+        if not umo:
+            return
+        try:
+            if event.get_group_id():
+                return
+        except Exception:
+            pass
+        self.store.set_meta("owner_umo", umo)
+
     def capture_user(self, event: Any, text: str) -> int | None:
-        if not self.capture_ok(event):
+        ident = self._ident_from_event(event)
+        if not self.capture_ok(event, ident):
             return None
         text = (text or "").strip()
-        if not text:
+        if not text or COMMAND_SPLIT_RE.match(text):
             return None
-        if not self.is_admin_event(event):
-            return None
-        if not self.is_self_directive(text):
-            return None
-        ident = self._ident_from_event(event)
+        is_owner = self.is_owner_event(event)
+        if is_owner:
+            self.mark_owner_speaker(ident["speaker_id"])
+        self.store.upsert_profile(
+            ident["speaker_id"],
+            ident.get("speaker_name", ""),
+            ident.get("platform", ""),
+            is_owner=is_owner,
+        )
+        if is_owner:
+            self.learning.observe_message(text, persona_id=ident.get("persona_id") or "")
         ts = now_ts()
-        event_id = self.store.add_timeline(
+        return self.store.add_timeline(
             {
                 "ts": ts,
                 "role": ROLE_USER,
@@ -260,9 +373,6 @@ class SavageTypeService:
                 **ident,
             }
         )
-        if event_id:
-            self.learning.observe_message(text, persona_id=ident.get("persona_id") or "")
-        return event_id
 
     def capture_bot(self, event: Any, text: str) -> int | None:
         if not self.capture_ok(event):
@@ -277,8 +387,18 @@ class SavageTypeService:
                 "ts": ts,
                 "role": ROLE_ASSISTANT,
                 "content": clip(text, 2000),
-                "fingerprint": fingerprint(ident.get("persona_id"), ident.get("bot_id"), ROLE_ASSISTANT, text),
-                **ident,
+                "fingerprint": fingerprint(
+                    ident.get("persona_id"),
+                    ident.get("bot_id") or ROLE_BOT_ID,
+                    ROLE_ASSISTANT,
+                    ts,
+                    text,
+                ),
+                "speaker_id": ROLE_BOT_ID,
+                "speaker_name": "bot",
+                "bot_id": ident.get("bot_id") or "",
+                "window_tag": ident.get("window_tag") or "",
+                "persona_id": ident.get("persona_id") or "",
             }
         )
 
@@ -294,12 +414,13 @@ class SavageTypeService:
         if self._extract_lock.locked():
             return {"ok": True, "skipped": True, "reason": "busy"}
         async with self._extract_lock:
-            min_messages = int(self.config.get("extract_min_messages") or 8)
             try:
-                result = await self.extractor.maybe_extract(min_messages=min_messages, force=force)
+                result = await self.pipeline.run(force=force)
                 self._last_extract_at = now_ts()
                 if not result.get("skipped"):
                     self.store.add_usage("extract", ok=True, detail=str(result.get("events") or 0))
+                    if result.get("pending"):
+                        await self.notify_pending()
                 return result
             except Exception as exc:  # noqa: BLE001
                 fail_cd = int(self.config.get("extract_fail_cooldown_seconds") or 180)
@@ -307,6 +428,104 @@ class SavageTypeService:
                 self.store.add_usage("extract", ok=False, detail=str(exc)[:200])
                 self.store.add_diag("extract_fail", {"error": str(exc)})
                 return {"ok": False, "skipped": True, "reason": "extract_fail", "error": str(exc)}
+
+    async def notify_pending(self) -> bool:
+        items = self.store.pending_memory_unqueued(limit=10)
+        if not items:
+            return False
+        umo = self.owner_notify_umo()
+        if not umo or self.send_message is None:
+            self.store.add_diag("notify_skip", {"reason": "no_owner_window", "count": len(items)})
+            return False
+        now = now_ts()
+        cooldown = max(0, int(self.config.get("pipeline_notify_cooldown_seconds") or 300))
+        last = int(self.store.get_meta("notify_last_at") or "0")
+        if last and cooldown and now - last < cooldown:
+            return False
+        lines = ["【待审记忆】整理结果没通过审核，需要你确认："]
+        for item in items:
+            plain = item.plain or clip(item.raw_text, 60)
+            lines.append(f"#{item.id} {clip(plain, 80)}（{item.speaker_name or item.speaker_id}）")
+        lines.append("回复 是 <编号> 通过，否 <编号> 删除。")
+        ok = await self.send_text(umo, "\n".join(lines))
+        if ok:
+            for item in items:
+                self.store.update_memory_review(item.id, notified_at=now)
+            self.store.set_meta("notify_last_at", str(now))
+        return ok
+
+    async def send_text(self, umo: str, text: str) -> bool:
+        if not umo or self.send_message is None:
+            return False
+        try:
+            result = self.send_message(umo, text)
+            if asyncio.iscoroutine(result):
+                await result
+            return True
+        except Exception as exc:  # noqa: BLE001
+            if self.logger:
+                self.logger.warning("Savage Type notify failed: %s", exc)
+            self.store.add_diag("notify_fail", {"error": str(exc)[:200]})
+            return False
+
+    async def handle_owner_reply(self, text: str) -> str | None:
+        t = (text or "").strip()
+        if not t or len(t) > 24:
+            return None
+        yes = re.match(r"^(是|通过|批准|过审|yes|y|ok)[\s#:：]*(\d+)?$", t, re.I)
+        no = re.match(r"^(否|驳回|拒绝|删除|不过|no|n)[\s#:：]*(\d+)?$", t, re.I)
+        match = yes or no
+        if match is None:
+            return None
+        approved = yes is not None
+        items = self.store.list_memory_reviews("pending", limit=50)
+        if not items:
+            return "没有待审记忆。"
+        review_id = int(match.group(2)) if match.group(2) else 0
+        if review_id:
+            item = next((x for x in items if x.id == review_id), None)
+            if item is None:
+                return f"没有找到待审 #{review_id}。"
+        elif len(items) == 1:
+            item = items[0]
+        else:
+            ids = "、".join(f"#{x.id}" for x in items[:10])
+            return f"待审不止一条，请回复 是/否 + 编号：{ids}"
+        return self.resolve_memory_review(item.id, approved)
+
+    def resolve_memory_review(self, review_id: int, approved: bool) -> str:
+        item = self.store.get_memory_review(review_id)
+        if item is None or item.status != "pending":
+            return f"#{review_id} 不在待审列表。"
+        if not approved:
+            self.store.delete_memory_review(review_id)
+            self.store.add_diag(
+                "memory_rejected",
+                {"id": review_id, "plain": item.plain, "by": "owner"},
+            )
+            return f"已删除 #{review_id}。"
+        payload = dict(item.payload or {})
+        if not payload:
+            payload = {
+                "subject": "self",
+                "attribute": "note",
+                "value": item.plain or clip(item.raw_text, 80),
+                "content": item.raw_text,
+            }
+        payload["speaker_id"] = item.speaker_id
+        payload["speaker_name"] = item.speaker_name or item.speaker_id
+        payload["window_tag"] = item.window_tag or ""
+        payload["persona_id"] = payload.get("persona_id") or ""
+        payload["plain"] = item.plain or payload.get("plain") or ""
+        payload["keywords"] = item.keywords or payload.get("keywords") or []
+        payload["source_event_id"] = item.source_event_id or payload.get("source_event_id") or 0
+        payload["scope"] = item.scope or payload.get("scope") or SCOPE_PERSON
+        payload["origin"] = payload.get("origin") or "manual"
+        payload["review_status"] = REVIEW_MANUAL
+        result = self.contradiction.ingest(payload, source_text=item.raw_text or payload.get("content", ""))
+        self.store.update_memory_review(review_id, status="approved", payload=payload)
+        self.store.add_diag("memory_approved", {"id": review_id, "action": result.get("action"), "by": "owner"})
+        return f"已通过 #{review_id}。"
 
     def schedule_learn(self) -> None:
         if self._learn_task and not self._learn_task.done():
@@ -317,12 +536,30 @@ class SavageTypeService:
             return
         self._learn_task = loop.create_task(self._background_learn())
 
+    def auto_housekeeping(self) -> None:
+        """Cheap periodic cleanup (empty profiles), at most once per 6 hours."""
+        now = now_ts()
+        last = int(self.store.get_meta("housekeeping_last_at") or "0")
+        if last and now - last < 6 * 3600:
+            return
+        deleted = self.store.delete_empty_profiles(
+            ttl_days=int(self.config.get("empty_profile_ttl_days") or 7)
+        )
+        self.store.set_meta("housekeeping_last_at", str(now))
+        if deleted:
+            self.store.add_diag("housekeeping", {"deleted_empty_profiles": deleted})
+
     async def _background_learn(self) -> None:
         try:
             await self.maybe_extract()
         except Exception as exc:  # noqa: BLE001
             if self.logger:
                 self.logger.warning("Savage Type extract failed: %s", exc)
+        try:
+            self.auto_housekeeping()
+        except Exception as exc:  # noqa: BLE001
+            if self.logger:
+                self.logger.warning("Savage Type housekeeping failed: %s", exc)
         try:
             await self.run_learning()
         except Exception as exc:  # noqa: BLE001
@@ -417,14 +654,23 @@ class SavageTypeService:
 
     def remember(self, speaker: dict[str, str], content: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         extra = extra or {}
+        speaker_id = str(speaker.get("speaker_id") or "admin").strip() or "admin"
+        speaker_name = str(speaker.get("speaker_name") or speaker_id).strip() or speaker_id
+        owner = self.is_owner_speaker(speaker_id)
+        self.store.upsert_profile(
+            speaker_id,
+            speaker_name,
+            platform_of(str(speaker.get("window_tag") or "")),
+            is_owner=owner,
+        )
         payload = apply_slot(
             {
                 "subject": extra.get("subject") or "self",
                 "attribute": extra.get("attribute") or "note",
                 "value": extra.get("value") or clip(content, 80),
                 "content": clip(content, 240),
-                "speaker_id": "admin",
-                "speaker_name": extra.get("speaker_name") or "admin",
+                "speaker_id": speaker_id,
+                "speaker_name": speaker_name,
                 "bot_id": speaker.get("bot_id") or "",
                 "window_tag": speaker.get("window_tag") or "",
                 "persona_id": speaker.get("persona_id") or extra.get("persona_id") or "",
@@ -433,6 +679,11 @@ class SavageTypeService:
                 "explicit_correction": int(bool(extra.get("explicit_correction"))),
                 "source": extra.get("source") or "tool",
                 "mention_policy": extra.get("mention_policy") or "mention",
+                "origin": extra.get("origin") or ORIGIN_MANUAL,
+                "review_status": extra.get("review_status") or REVIEW_MANUAL,
+                "scope": SCOPE_OWNER if owner else SCOPE_PERSON,
+                "plain": extra.get("plain") or clip(content, 160),
+                "keywords": extra.get("keywords") or [],
             }
         )
         return self.contradiction.ingest(payload, source_text=content)
@@ -490,6 +741,9 @@ class SavageTypeService:
             self.store,
             ttl_seconds=int(self.config.get("persona_draft_ttl_seconds") or 14 * 86400),
         )
+        empty_profiles = self.store.delete_empty_profiles(
+            ttl_days=int(self.config.get("empty_profile_ttl_days") or 7),
+        )
         counts = self.store.counts()
         result = {
             "merged_duplicates": merged,
@@ -498,6 +752,7 @@ class SavageTypeService:
             "compacted_timeline": compacted,
             "archived_low_value": archived,
             "expired_persona_drafts": expired,
+            "deleted_empty_profiles": empty_profiles,
             **counts,
         }
         self.store.add_diag("sleep", result)
@@ -563,13 +818,14 @@ class SavageTypeService:
 
     def speaker_options(self) -> list[dict[str, str]]:
         seen: dict[str, str] = {"admin": "admin"}
+        for profile in self.store.list_profiles(limit=300):
+            sid = str(profile.speaker_id or "")
+            if sid and sid not in seen:
+                seen[sid] = str(profile.speaker_name or sid)
         for row in self.store.speaker_name_map():
             sid = str(row.get("speaker_id") or "")
             if sid and sid not in seen:
                 seen[sid] = str(row.get("speaker_name") or sid)
-        for fact in self.store.facts_by_status("live", limit=200):
-            if fact.speaker_id and fact.speaker_id not in seen:
-                seen[fact.speaker_id] = fact.speaker_name or fact.speaker_id
         return [{"id": k, "name": v} for k, v in seen.items()]
 
     def overview(self) -> dict[str, Any]:
@@ -584,12 +840,20 @@ class SavageTypeService:
             "speakers": self.speaker_options(),
             "data_dir": str(self.store.db_path.parent),
             "embedding": self.embedding_status(),
+            "owner": {
+                "qq": self.owner_qq(),
+                "ids": sorted(self._owner_ids),
+                "notify_umo": self.owner_notify_umo(),
+            },
             "config": {
                 "enabled": self.enabled(),
                 "capture": self.capture_ok(),
                 "inject": self.inject_ok(),
                 "retrieval_mode": self.config.get("retrieval_mode"),
                 "embedding_enabled": bool(self.config.get("embedding_enabled")),
+                "pipeline_enabled": bool(self.config.get("pipeline_enabled", True)),
+                "platforms": parse_csv(str(self.config.get("memory_source_platforms") or "")),
+                "theme_color": str(self.config.get("ui_theme_color") or "#7c5cff"),
             },
         }
 
@@ -606,8 +870,23 @@ class SavageTypeService:
                     f.write(json.dumps(payload, ensure_ascii=False) + "\n")
         return dest
 
-    async def _llm(self, prompt: str) -> str:
-        provider_id = str(self.config.get("summary_provider_id") or "").strip()
+    def _provider_for(self, kind: str) -> str:
+        if kind == "verify":
+            return str(
+                self.config.get("verify_provider_id")
+                or self.config.get("normalize_provider_id")
+                or self.config.get("summary_provider_id")
+                or ""
+            ).strip()
+        if kind == "normalize":
+            return str(
+                self.config.get("normalize_provider_id")
+                or self.config.get("summary_provider_id")
+                or ""
+            ).strip()
+        return str(self.config.get("summary_provider_id") or "").strip()
+
+    async def _llm_with_provider(self, prompt: str, provider_id: str) -> str:
         try:
             result = await self.llm_generate(prompt, provider_id)
             text, tokens_in, tokens_out = _unpack_llm_result(result)
@@ -624,6 +903,15 @@ class SavageTypeService:
         except Exception:
             self.store.add_usage("llm", provider_id, False, len(prompt), 0)
             raise
+
+    async def _llm(self, prompt: str) -> str:
+        return await self._llm_with_provider(prompt, self._provider_for("default"))
+
+    def _llm_for(self, kind: str):
+        async def call(prompt: str) -> str:
+            return await self._llm_with_provider(prompt, self._provider_for(kind))
+
+        return call
 
     async def navigate(
         self,

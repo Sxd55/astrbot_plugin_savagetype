@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from .learn import term_in_query
 from .models import Fact, LearningPack, RetrievalResult
-from .util import clip
+from .util import SCOPE_OWNER, clip
 
 
 INJECT_PREFIX = """<savagetype_memory>
@@ -16,8 +16,12 @@ INJECT_SUFFIX = "</savagetype_memory>"
 
 def render_fact(fact: Fact, policy: str | None = None) -> str:
     policy = policy or fact.mention_policy
-    who = fact.speaker_name or fact.speaker_id or "某人"
-    line = f"- [{who}/{fact.attribute}] {fact.content or (fact.subject + ' ' + fact.value)}"
+    if getattr(fact, "scope", "") == SCOPE_OWNER:
+        who = "主人"
+    else:
+        who = fact.speaker_name or fact.speaker_id or "某人"
+    text = getattr(fact, "plain", "") or fact.content or (fact.subject + " " + fact.value)
+    line = f"- [{who}/{fact.attribute}] {text}"
     if policy == "uncertain":
         line += "（不确定）"
     elif policy == "tone":

@@ -12,6 +12,7 @@ from .util import (
     FIRST_PERSON_RE,
     HEARSAY_RE,
     JOKE_RE,
+    RELATION_GUARD_RE,
     STATUS_PENDING,
     fingerprint,
     make_slot_key,
@@ -51,9 +52,31 @@ def values_conflict(old: str, new: str) -> bool:
 
 
 class ContradictionEngine:
-    def __init__(self, store: Store, high_evidence: float = 0.8):
+    def __init__(self, store: Store, high_evidence: float = 0.8, owner_ids: set[str] | None = None):
         self.store = store
         self.high_evidence = high_evidence
+        self.owner_ids = {str(x).strip() for x in (owner_ids or set()) if str(x).strip()}
+
+    def is_owner_speaker(self, speaker_id: str) -> bool:
+        return bool(speaker_id) and speaker_id in self.owner_ids
+
+    def _relation_guard(self, payload: dict[str, Any]) -> bool:
+        """Return True when the fact must be rejected as an unverifiable relation claim."""
+        attribute = str(payload.get("attribute") or "")
+        if attribute not in {"identity", "name"}:
+            return False
+        blob = " ".join(
+            str(payload.get(key) or "")
+            for key in ("value", "content", "plain", "subject")
+        )
+        if not RELATION_GUARD_RE.search(blob):
+            return False
+        speaker_id = str(payload.get("speaker_id") or "")
+        if self.is_owner_speaker(speaker_id):
+            payload["attribute"] = "note"
+            payload["mention_policy"] = "mention"
+            return False
+        return True
 
     def ingest(self, payload: dict[str, Any], source_text: str = "") -> dict[str, Any]:
         """Write a fact with guarded override. Conflicting live facts are deleted."""
@@ -91,11 +114,14 @@ class ContradictionEngine:
         if op == "ignore":
             return {"action": "ignored", "reason": payload.get("reason") or "extractor_ignore"}
 
+        if self._relation_guard(payload):
+            return {
+                "action": "rejected_relation",
+                "reason": "relation_claim_not_owner",
+                "speaker_id": payload.get("speaker_id"),
+            }
+
         if looks_like_joke(source_text) and not explicit:
-            payload["status"] = STATUS_PENDING
-            payload["reason"] = "joke_or_banter"
-            pending_id = self.store.add_pending(0, payload, "joke_or_banter")
-            return {"action": "ignored_joke", "pending_id": pending_id}
             payload["status"] = STATUS_PENDING
             payload["reason"] = "joke_or_banter"
             pending_id = self.store.add_pending(0, payload, "joke_or_banter")

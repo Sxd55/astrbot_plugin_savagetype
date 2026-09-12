@@ -5,10 +5,13 @@ Run: python tests/test_core.py
 
 from __future__ import annotations
 
+import asyncio
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -27,6 +30,7 @@ from savagetype.extract import Extractor  # noqa: E402
 from savagetype.inject import build_pack  # noqa: E402
 from savagetype.learn import LearningEngine, is_junk_term, pair_user_bot, term_in_query  # noqa: E402
 from savagetype.models import Fact, LearningPack, RetrievalResult, TimelineEvent  # noqa: E402
+from savagetype.pipeline import MemoryPipeline, candidate_reason  # noqa: E402
 from savagetype.retrieve import Retriever, classify_route  # noqa: E402
 from savagetype.service import SavageTypeService, _unpack_llm_result  # noqa: E402
 from savagetype.slots import canonical_attribute, canonical_subject  # noqa: E402
@@ -676,6 +680,251 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(self.store.get_fact(p["fact_id"]).status, "archived")
         ignored = self.engine.ingest(_payload(value="x", content="哈哈", write_op="ignore"), "哈哈")
         self.assertEqual(ignored["action"], "ignored")
+
+
+class FakeEvent:
+    def __init__(
+        self,
+        sender: str = "u1",
+        name: str = "阿U",
+        window: str = "aiocqhttp:GroupMessage:100",
+        bot_id: str = "bot",
+        role: str = "member",
+    ):
+        self._sender = sender
+        self._name = name
+        self._window = window
+        self.role = role
+        self.unified_msg_origin = window
+        self.message_obj = SimpleNamespace(
+            self_id=bot_id,
+            sender=SimpleNamespace(user_id=sender),
+        )
+
+    def get_sender_id(self) -> str:
+        return self._sender
+
+    def get_sender_name(self) -> str:
+        return self._name
+
+    def get_group_id(self) -> str:
+        return "100"
+
+    def get_extra(self, _key: str):
+        return None
+
+    def set_extra(self, _key: str, _value) -> None:
+        return None
+
+
+class V280Test(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "v28.db")
+        self.engine = ContradictionEngine(self.store, high_evidence=0.8)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _service(self, **config):
+        from savagetype.service import SavageTypeService
+
+        return SavageTypeService(
+            store=self.store,
+            config=config,
+            llm_generate=lambda *_a, **_k: "",
+            get_provider=lambda *_a, **_k: None,
+            logger=None,
+        )
+
+    def test_relation_guard_blocks_non_owner(self):
+        engine = ContradictionEngine(self.store, owner_ids={"owner"})
+        r = engine.ingest(
+            _payload(speaker="u1", attribute="identity", value="主人", content="我是主人"),
+            "我是主人",
+        )
+        self.assertEqual(r["action"], "rejected_relation")
+        self.assertIsNone(self.store.live_by_slot("u1", "self", "identity"))
+
+    def test_relation_guard_downgrades_owner_claim(self):
+        engine = ContradictionEngine(self.store, owner_ids={"owner"})
+        r = engine.ingest(
+            _payload(speaker="owner", attribute="identity", value="主人", content="我是主人"),
+            "我是主人",
+        )
+        self.assertEqual(r["action"], "insert")
+        fact = self.store.get_fact(r["fact_id"])
+        self.assertEqual(fact.attribute, "note")
+
+    def test_capture_bot_uses_bot_self(self):
+        service = self._service()
+        service.capture_bot(FakeEvent(), "推荐你喝红茶")
+        rows = self.store.query("SELECT * FROM timeline WHERE role='assistant'")
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["speaker_id"], "bot_self")
+
+    def test_capture_user_creates_profile(self):
+        service = self._service()
+        ev = FakeEvent(sender="newbie", name="新人")
+        self.assertIsNotNone(service.capture_user(ev, "我喜欢喝茶"))
+        profile = self.store.get_profile("newbie")
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile.speaker_name, "新人")
+        self.store.execute("UPDATE profiles SET last_seen=1 WHERE speaker_id='newbie'")
+        self.assertEqual(self.store.delete_empty_profiles(ttl_days=7), 1)
+        self.assertIsNone(self.store.get_profile("newbie"))
+
+    def test_manual_remember_keeps_speaker(self):
+        service = self._service()
+        speaker = {"speaker_id": "u2", "speaker_name": "老二", "window_tag": "aiocqhttp:FriendMessage:2"}
+        r = service.remember(speaker, "我喜欢咖啡")
+        fact = self.store.get_fact(r["fact_id"])
+        self.assertEqual(fact.speaker_id, "u2")
+        self.assertEqual(fact.scope, "person")
+
+    def test_candidate_gate_owner_directive(self):
+        owner_ev = TimelineEvent(
+            id=1, ts=1, speaker_id="owner", speaker_name="主人", bot_id="b",
+            window_tag="w", role="user", content="以后回复短一点",
+        )
+        self.assertEqual(candidate_reason(owner_ev, True), "owner_directive")
+        self.assertEqual(candidate_reason(owner_ev, False), "")
+        like_ev = TimelineEvent(
+            id=2, ts=1, speaker_id="u1", speaker_name="阿U", bot_id="b",
+            window_tag="w", role="user", content="我喜欢喝茶",
+        )
+        self.assertEqual(candidate_reason(like_ev, False), "self")
+
+    def test_owner_scope_visible_to_others(self):
+        self.engine.ingest(
+            _payload(speaker="owner", value="喝茶", content="我喜欢喝茶", scope="owner"),
+            "我喜欢喝茶",
+        )
+        retriever = Retriever(self.store)
+        result = asyncio.run(retriever.retrieve("喜欢什么", "u1", top_k=8))
+        ids = {f.speaker_id for f in result.core + result.related}
+        self.assertIn("owner", ids)
+
+    def test_pipeline_passes_and_writes(self):
+        store, engine, pipe, holder = self._fresh_pipeline(verify_pass=True)
+        try:
+            event_id = self._add_like(store, holder)
+            result = asyncio.run(pipe.run(force=True))
+            self.assertEqual(result["written"], 1)
+            fact = store.live_by_slot("u1", "self", "likes")
+            self.assertIsNotNone(fact)
+            self.assertEqual(fact.review_status, "ai_passed")
+            self.assertEqual(fact.scope, "person")
+            self.assertEqual(fact.source_event_id, event_id)
+        finally:
+            store.close()
+
+    def test_pipeline_failure_goes_pending(self):
+        store, engine, pipe, holder = self._fresh_pipeline(verify_pass=False, max_revisions=0)
+        try:
+            self._add_like(store, holder)
+            result = asyncio.run(pipe.run(force=True))
+            self.assertEqual(result["pending"], 1)
+            self.assertIsNone(store.live_by_slot("u1", "self", "likes"))
+            reviews = store.list_memory_reviews("pending")
+            self.assertEqual(len(reviews), 1)
+            self.assertIn("我喜欢喝茶", reviews[0].raw_text)
+        finally:
+            store.close()
+
+    def test_owner_reply_approves_and_deletes(self):
+        service = self._service(owner_qq="owner")
+        payload = _payload(speaker="owner", value="茶", content="我喜欢喝茶")
+        pass_id = self.store.add_memory_review(
+            scope="owner",
+            speaker_id="owner",
+            speaker_name="主人",
+            raw_text="我喜欢喝茶",
+            plain="喜欢喝茶",
+            payload=payload,
+        )
+        reply = asyncio.run(service.handle_owner_reply(f"是 {pass_id}"))
+        self.assertIn("已通过", reply)
+        self.assertIsNotNone(self.store.live_by_slot("owner", "self", "likes"))
+
+        drop_payload = _payload(speaker="owner", value="酒", content="我喜欢喝酒")
+        drop_id = self.store.add_memory_review(
+            scope="owner",
+            speaker_id="owner",
+            speaker_name="主人",
+            raw_text="我喜欢喝酒",
+            plain="喜欢喝酒",
+            payload=drop_payload,
+        )
+        reply = asyncio.run(service.handle_owner_reply(f"否 {drop_id}"))
+        self.assertIn("已删除", reply)
+        self.assertIsNone(self.store.get_memory_review(drop_id))
+
+    def _fresh_pipeline(self, verify_pass: bool, max_revisions: int = 1):
+        store = Store(Path(self.tmp.name) / f"pipe-{verify_pass}-{max_revisions}.db")
+        engine = ContradictionEngine(store)
+        event_holder: dict[str, int] = {}
+
+        async def fake_normalize(_prompt: str) -> str:
+            return json.dumps(
+                [
+                    {
+                        "source_event_id": event_holder["id"],
+                        "plain": "喜欢喝茶",
+                        "keywords": ["喝茶"],
+                        "subject": "self",
+                        "attribute": "likes",
+                        "value": "茶",
+                        "confidence": 0.9,
+                        "write_op": "create",
+                    }
+                ],
+                ensure_ascii=False,
+            )
+
+        async def fake_verify(_prompt: str) -> str:
+            return json.dumps(
+                [{"index": 0, "pass": verify_pass, "reason": "" if verify_pass else "加戏", "fix_hint": ""}],
+                ensure_ascii=False,
+            )
+
+        extractor = Extractor(store, engine, llm=fake_normalize)
+        pipe = MemoryPipeline(
+            store,
+            engine,
+            extractor,
+            {
+                "pipeline_enabled": True,
+                "extract_min_messages": 1,
+                "pipeline_batch_size": 8,
+                "pipeline_max_revisions": max_revisions,
+            },
+            None,
+            llm=fake_normalize,
+            verify_llm=fake_verify,
+            is_owner_speaker=lambda sid: sid == "owner",
+        )
+        return store, engine, pipe, event_holder
+
+    def _add_like(self, store: Store, holder: dict[str, int]) -> int:
+        from savagetype.util import now_ts
+
+        store.add_timeline(
+            {
+                "ts": now_ts(),
+                "speaker_id": "u1",
+                "speaker_name": "阿U",
+                "bot_id": "b",
+                "window_tag": "aiocqhttp:GroupMessage:1",
+                "role": "user",
+                "content": "我喜欢喝茶",
+                "fingerprint": "pipe-like",
+            }
+        )
+        event = store.unsummarized(10)[0]
+        holder["id"] = event.id
+        return event.id
 
 
 if __name__ == "__main__":
