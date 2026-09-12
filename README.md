@@ -2,7 +2,7 @@
 
 Savage Type 是面向 AstrBot 的全局人格记忆中枢。Savage 只是插件名。身份和语气永远读 AstrBot 当前人格；本插件只负责记住事实、处理改口、在需要时把少量相关记忆注入本轮对话。不改写人格文件，不做日程和主动陪伴。
 
-当前版本 `v3.0.0`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
+当前版本 `v3.1.1`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
 
 要求 AstrBot `>= 4.22.0`。
 
@@ -43,7 +43,7 @@ AstrBot WebUI → 插件 → Savage Type → 拓展页。三个主区 + 设置�
 - **诊断**：注入显微镜、聊天导入、原始 JSON 诊断、清空并重建（先自动备份）。
 - **设置**：字段与 AstrBot 插件配置页相同，保存后立刻生效。
 
-界面为 Shader Gradient 风格：近黑底上跑真实的 WebGL 片元着色器流动渐变（fbm 域扭曲），内容坐在冻毛玻璃面板上，只用主色一支 UI 强调色；devicePixelRatio 封顶 2、离屏暂停、`prefers-reduced-motion` 单帧、WebGL 不可用时回退静态渐变。主色与撞色共同驱动背景着色器场，设置页内置 8 组预设按钮并支持取色器自定义。
+界面为 Shader Gradient 风格：近黑底上跑真实的 WebGL 片元着色器流动渐变（fbm 域扭曲），内容坐在冻毛玻璃面板上，只用主色一支 UI 强调色；devicePixelRatio 封顶 2、离屏暂停、`prefers-reduced-motion` 单帧、WebGL 不可用时回退静态渐变。主色 + 两个副色三色驱动背景着色器场；设置页内置 5 组预设（默认「极光」，即 `#7c5cff / #22d3ee / #f472b6`），也支持三个取色器自定义。
 
 ## 审核与通知
 
@@ -107,6 +107,8 @@ LLM 工具：`savagetype_recall` 检索，`savagetype_remember` 写入（只有�
 https://github.com/Sxd55/astrbot_plugin_savagetype
 
 或拷到 `AstrBot/data/plugins/astrbot_plugin_savagetype` 后重载。
+
+插件 Logo：`logo.png`（256×256，由 `_logo.webp` 转换，遵循插件开发指南的 1:1 规范）。拓展页左上角使用 `pages/console/_logo.webp`。
 
 ## 离线测试
 

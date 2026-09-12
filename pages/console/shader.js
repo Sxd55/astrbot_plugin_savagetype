@@ -79,6 +79,7 @@ export function initShaderGradient(options = {}) {
   const state = {
     color1: options.color1 || "#7c5cff",
     color2: options.color2 || "#22d3ee",
+    color3: options.color3 || "#f472b6",
     speed: Number.isFinite(options.speed) ? options.speed : 1.0,
     blend: Number.isFinite(options.blend) ? options.blend : 0.6,
     grain: Number.isFinite(options.grain) ? options.grain : 0.5,
@@ -93,7 +94,7 @@ export function initShaderGradient(options = {}) {
     const root = document.documentElement.style;
     root.setProperty("--sg-c1", glow(state.color1));
     root.setProperty("--sg-c2", glow(state.color2));
-    root.setProperty("--sg-c3", glow(mixHex(state.color1, state.color2, 0.5)));
+    root.setProperty("--sg-c3", glow(state.color3));
     if (fallback) fallback.hidden = false;
   }
 
@@ -111,9 +112,10 @@ export function initShaderGradient(options = {}) {
     canvas.style.display = "none";
     applyFallback();
     return {
-      setColors(c1, c2) {
+      setColors(c1, c2, c3) {
         state.color1 = c1 || state.color1;
         state.color2 = c2 || state.color2;
+        state.color3 = c3 || state.color3;
         applyFallback();
       },
     };
@@ -160,7 +162,7 @@ export function initShaderGradient(options = {}) {
   function pushColors() {
     gl.uniform3fv(uC1, hexToRgb01(glow(state.color1)));
     gl.uniform3fv(uC2, hexToRgb01(glow(state.color2)));
-    gl.uniform3fv(uC3, hexToRgb01(glow(mixHex(state.color1, state.color2, 0.5))));
+    gl.uniform3fv(uC3, hexToRgb01(glow(state.color3)));
   }
   pushColors();
 
@@ -227,9 +229,10 @@ export function initShaderGradient(options = {}) {
   });
 
   controls = {
-    setColors(c1, c2) {
+    setColors(c1, c2, c3) {
       if (c1) state.color1 = c1;
       if (c2) state.color2 = c2;
+      if (c3) state.color3 = c3;
       pushColors();
       if (reduceMotion) renderFrame(0);
     },

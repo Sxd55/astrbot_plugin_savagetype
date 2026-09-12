@@ -1021,6 +1021,7 @@ class SavageTypeService:
                 "platforms": self.allowed_platforms(),
                 "theme_color": str(self.config.get("ui_theme_color") or "#7c5cff"),
                 "theme_color2": str(self.config.get("ui_theme_color2") or "#22d3ee"),
+                "theme_color3": str(self.config.get("ui_theme_color3") or "#f472b6"),
                 "capture_skip": self.last_capture_skip(),
             },
         }

@@ -83,14 +83,11 @@ function speakerLabel(name, id) {
 }
 
 const THEME_PRESETS = [
-  { name: "黑玫", a: "#1a1a1d", b: "#e6397c" },
-  { name: "酒红米", a: "#990033", b: "#ddcdb7" },
-  { name: "青蜜", a: "#01847f", b: "#ffaa93" },
-  { name: "蓝黄", a: "#0081ff", b: "#fef99d" },
-  { name: "粉紫", a: "#ffdbdd", b: "#652c97" },
-  { name: "藏蓝米白", a: "#122e8a", b: "#f5efea" },
-  { name: "炭黑青", a: "#2c2c34", b: "#00d4ff" },
-  { name: "淡紫银", a: "#b19cd9", b: "#d3d3d3" },
+  { name: "极光", a: "#7c5cff", b: "#22d3ee", c: "#f472b6" },
+  { name: "深海", a: "#22d3ee", b: "#3b82f6", c: "#7c5cff" },
+  { name: "玫瑰", a: "#f472b6", b: "#fb7185", c: "#7c5cff" },
+  { name: "翡翠", a: "#34d399", b: "#22d3ee", c: "#a3e635" },
+  { name: "琥珀", a: "#f59e0b", b: "#f472b6", c: "#7c5cff" },
 ];
 
 const PROVIDER_KEYS = {
@@ -125,37 +122,43 @@ function onColor(hex) {
   return relLuminance(hex) > 0.22 ? "#1c1b1f" : "#ffffff";
 }
 
-const themeState = { color: "#7c5cff", color2: "#22d3ee" };
+const themeState = { color: "#7c5cff", color2: "#22d3ee", color3: "#f472b6" };
 
-function applyTheme(color, color2) {
+function applyTheme(color, color2, color3) {
   const raw = normalizeHex(color) || "#7c5cff";
   const raw2 = normalizeHex(color2) || "#22d3ee";
+  const raw3 = normalizeHex(color3) || "#f472b6";
   themeState.color = raw;
   themeState.color2 = raw2;
+  themeState.color3 = raw3;
 
   const root = document.documentElement.style;
   root.setProperty("--accent", raw);
   root.setProperty("--accent2", raw2);
+  root.setProperty("--accent3", raw3);
   root.setProperty("--accent-soft", rgbaOf(raw, 0.16));
   root.setProperty("--accent2-soft", rgbaOf(raw2, 0.16));
+  root.setProperty("--accent3-soft", rgbaOf(raw3, 0.16));
   root.setProperty("--on-accent", onColor(raw));
 
-  if (shaderControls) shaderControls.setColors(raw, raw2);
+  if (shaderControls) shaderControls.setColors(raw, raw2, raw3);
 }
 
-function renderThemeControls(color, color2) {
+function renderThemeControls(color, color2, color3) {
   const box = $("theme-presets");
   const ca = normalizeHex(color) || "#7c5cff";
   const cb = normalizeHex(color2) || "#22d3ee";
+  const cc = normalizeHex(color3) || "#f472b6";
   if (box) {
     box.innerHTML = THEME_PRESETS.map((p) => `
-      <button type="button" class="theme-dot ${p.a === ca && p.b === cb ? "on" : ""}"
-        data-act="theme-preset" data-a="${p.a}" data-b="${p.b}">
-        <span class="dot" style="background:${p.a}"></span><span class="dot" style="background:${p.b}"></span>${esc(p.name)}
+      <button type="button" class="theme-dot ${p.a === ca && p.b === cb && p.c === cc ? "on" : ""}"
+        data-act="theme-preset" data-a="${p.a}" data-b="${p.b}" data-c="${p.c}">
+        <span class="dot" style="background:${p.a}"></span><span class="dot" style="background:${p.b}"></span><span class="dot" style="background:${p.c}"></span>${esc(p.name)}
       </button>`).join("");
   }
   if ($("theme-color")) $("theme-color").value = ca;
   if ($("theme-color2")) $("theme-color2").value = cb;
+  if ($("theme-color3")) $("theme-color3").value = cc;
 }
 
 function reviewBadge(status) {
@@ -238,7 +241,7 @@ async function loadOverview() {
     const skipText = skip ? `上次采集跳过：${skip.reason}（${skip.platform || "?"}）。` : "";
     $("owner-line").textContent = `${ownerText} 允许平台：${platforms}。${skipText}`;
   }
-  applyTheme(cfg.theme_color, cfg.theme_color2);
+  applyTheme(cfg.theme_color, cfg.theme_color2, cfg.theme_color3);
 
   const box = $("alias-suggestions");
   if (box) {
@@ -474,16 +477,16 @@ async function loadSettings() {
   const [data, providers] = await Promise.all([apiGet("config"), apiGet("providers")]);
   const schema = data.schema || {};
   const values = data.values || {};
-  renderThemeControls(values.ui_theme_color, values.ui_theme_color2);
+  renderThemeControls(values.ui_theme_color, values.ui_theme_color2, values.ui_theme_color3);
   $("settings-form").innerHTML = Object.entries(schema).map(([key, spec]) =>
     fieldControl(key, spec, values[key], providers)
   ).join("");
 }
 
-async function saveTheme(color, color2) {
-  const r = await apiPost("ui/theme", { color, color2 });
-  applyTheme(r.color, r.color2);
-  renderThemeControls(r.color, r.color2);
+async function saveTheme(color, color2, color3) {
+  const r = await apiPost("ui/theme", { color, color2, color3 });
+  applyTheme(r.color, r.color2, r.color3);
+  renderThemeControls(r.color, r.color2, r.color3);
   return r;
 }
 
@@ -654,8 +657,12 @@ async function onAct(act, el) {
     await reload();
     return r;
   });
-  if (act === "theme-preset") return run("主题已切换", () => saveTheme(el.dataset.a, el.dataset.b));
-  if (act === "theme-apply") return run("主题已切换", () => saveTheme($("theme-color").value, $("theme-color2").value));
+  if (act === "theme-preset") return run("主题已切换", () => saveTheme(el.dataset.a, el.dataset.b, el.dataset.c));
+  if (act === "theme-apply") {
+    return run("主题已切换", () =>
+      saveTheme($("theme-color").value, $("theme-color2").value, $("theme-color3").value)
+    );
+  }
   if (act === "settings-save") return run("已保存设置", async () => { const r = await apiPost("config/save", { values: readSettings() }); await loadSettings(); await loadOverview(); return r; });
 }
 
@@ -672,10 +679,16 @@ document.addEventListener("click", (ev) => {
 });
 
 async function boot() {
-  shaderControls = initShaderGradient({
-    color1: themeState.color,
-    color2: themeState.color2,
-  });
+  try {
+    shaderControls = initShaderGradient({
+      color1: themeState.color,
+      color2: themeState.color2,
+      color3: themeState.color3,
+    });
+  } catch (err) {
+    shaderControls = null;
+    console.error("shader background failed:", err);
+  }
   if (window.AstrBotPluginPage?.ready) {
     try { await window.AstrBotPluginPage.ready(); } catch (err) { showDiag(err); }
   }

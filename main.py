@@ -41,7 +41,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "3.0.0",
+    "3.1.1",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -874,14 +874,17 @@ class SavageTypePlugin(Star):
         payload = await request.json(default={})
         color = str(payload.get("color") or "").strip()
         color2 = str(payload.get("color2") or "").strip()
+        color3 = str(payload.get("color3") or "").strip()
         hex_re = re.compile(r"^#[0-9a-fA-F]{6}$")
         if not hex_re.match(color):
             return error_response("bad color", status_code=400)
         self.config["ui_theme_color"] = color.lower()
-        if color2:
-            if not hex_re.match(color2):
-                return error_response("bad color2", status_code=400)
-            self.config["ui_theme_color2"] = color2.lower()
+        for value, key, label in ((color2, "ui_theme_color2", "color2"), (color3, "ui_theme_color3", "color3")):
+            if not value:
+                continue
+            if not hex_re.match(value):
+                return error_response(f"bad {label}", status_code=400)
+            self.config[key] = value.lower()
         if hasattr(self.config, "save_config"):
             self.config.save_config()
         self.service.apply_config()
@@ -890,6 +893,7 @@ class SavageTypePlugin(Star):
                 "ok": True,
                 "color": self.config["ui_theme_color"],
                 "color2": self.config.get("ui_theme_color2", ""),
+                "color3": self.config.get("ui_theme_color3", ""),
             }
         )
 

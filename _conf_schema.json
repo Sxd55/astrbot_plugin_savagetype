@@ -194,10 +194,16 @@
     "default": "#7c5cff"
   },
   "ui_theme_color2": {
-    "description": "面板主题色（撞色 / 着色器副色）",
+    "description": "面板主题色（着色器副色 1）",
     "type": "string",
-    "hint": "与主色一起驱动背景的实时着色器渐变场。",
+    "hint": "与主色、副色 2 一起驱动背景的实时着色器渐变场。",
     "default": "#22d3ee"
+  },
+  "ui_theme_color3": {
+    "description": "面板主题色（着色器副色 2）",
+    "type": "string",
+    "hint": "着色器第三层虹彩色。默认 #f472b6（与主色、副色 1 组成极光三色）。",
+    "default": "#f472b6"
   },
   "learning_enabled": {
     "description": "启用自主学习",
