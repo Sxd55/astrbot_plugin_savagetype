@@ -42,17 +42,29 @@
 
         <div class="grid two">
           <section class="card glass">
-            <h2>主人记忆</h2>
-            <p class="lede">主人在 QQ 里的指令与自述，经 AI 缩写和审核后写入；这些内容全局可注入。</p>
+            <h2 id="memory-title">主人记忆</h2>
+            <p class="lede" id="memory-lede">主人（QQ 或 ChatUI）的指令与自述，经 AI 缩写和审核后写入；这些内容全局可注入。</p>
             <div class="row">
-              <input id="memory-q" placeholder="搜索直白文本 / 关键词 / 来源" />
-              <button type="button" data-act="memory-search">搜索</button>
+              <button type="button" class="tiny" data-act="memory-switch" data-mode="owner">主人记忆</button>
+              <button type="button" class="ghost tiny" data-act="memory-switch" data-mode="bot">Savage 记忆</button>
             </div>
-            <textarea id="remember-text" placeholder="主人手动补记一条（直接生效，标记 manual）"></textarea>
-            <div class="row">
-              <select id="remember-speaker"></select>
-              <input id="remember-speaker-custom" placeholder="或手填 QQ / id" />
-              <button type="button" data-act="remember">写入</button>
+            <div id="memory-owner-tools">
+              <div class="row">
+                <input id="memory-q" placeholder="搜索直白文本 / 关键词 / 来源" />
+                <button type="button" data-act="memory-search">搜索</button>
+              </div>
+              <textarea id="remember-text" placeholder="主人手动补记一条（直接生效，标记 manual）"></textarea>
+              <div class="row">
+                <select id="remember-speaker"></select>
+                <input id="remember-speaker-custom" placeholder="或手填 QQ / id" />
+                <button type="button" data-act="remember">写入</button>
+              </div>
+            </div>
+            <div id="memory-bot-tools" hidden>
+              <textarea id="remember-bot-text" placeholder="给 Savage 下定义 / 补记忆（直接生效，标记 manual）"></textarea>
+              <div class="row">
+                <button type="button" data-act="remember-bot">写入 Savage 记忆</button>
+              </div>
             </div>
             <div class="scroll" id="memory-list"></div>
           </section>
@@ -113,7 +125,7 @@
         <div class="grid two">
           <section class="card glass">
             <h2>注入显微镜</h2>
-            <p class="lede">最近几轮主链实际注入了什么：路由、来源、字数。</p>
+            <p class="lede">最近几轮主链实际注入了什么：路由、来源、去重、过滤原因、字数与窗口。</p>
             <div class="scroll" id="microscope"></div>
           </section>
 
@@ -160,12 +172,14 @@
             <label class="color-field">副色 1 <input type="color" id="theme-color2" value="#22d3ee" /></label>
             <label class="color-field">副色 2 <input type="color" id="theme-color3" value="#f472b6" /></label>
             <button type="button" data-act="theme-apply">应用主题</button>
+            <button type="button" class="ghost" data-act="dynamic-toggle" id="dynamic-toggle">动态颜色：关</button>
           </div>
+          <p class="lede">动态颜色开启后，按「极光 → 碧金 → 暮霞 → 午夜 → 森林」顺序循环，每 1 秒停留、5 秒平滑过渡；手动点预设会关闭动态。系统开启「减少动态效果」时不播放。</p>
         </section>
         <section class="card glass">
           <h2>插件设置</h2>
           <p class="lede">保存后立刻生效。模型下拉按类型分开：抽取/整理/审核只列对话模型，Embedding 与 Rerank 各自只列对应类型（AstrBot 原生配置页目前不支持这两类的选择器，需要手填 ID）。</p>
-          <form id="settings-form" class="settings"></form>
+          <form id="settings-form" class="settings" onsubmit="event.preventDefault()"></form>
           <div class="row">
             <button type="button" data-act="settings-save">保存设置</button>
           </div>

@@ -62,17 +62,20 @@ class Fact:
     importance: float = 0.0
     kind: str = ""
     pinned: int = 0
+    topic: str = ""
 
     def slot_key(self) -> str:
-        from .slots import canonical_attribute, canonical_subject
-        from .util import normalize_slot
+        from .util import make_slot_key
 
         if self.slot_key_value:
             return self.slot_key_value
-        attr = canonical_attribute(self.attribute)
-        subject = canonical_subject(self.subject, self.speaker_id, self.speaker_name)
-        persona = self.persona_id or ""
-        return f"{persona}|{self.speaker_id}|{normalize_slot(subject)}|{attr}"
+        return make_slot_key(
+            self.persona_id or "",
+            self.speaker_id,
+            self.subject,
+            self.attribute,
+            self.value,
+        )
 
 
 @dataclass

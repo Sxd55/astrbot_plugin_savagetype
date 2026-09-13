@@ -13,6 +13,7 @@ from .archive import (
     archive_low_value,
     backup_db,
     compact_summarized_timeline,
+    expire_pending_overrides,
     expire_persona_drafts,
     expire_status_facts,
     fold_preference_slots,
@@ -20,6 +21,7 @@ from .archive import (
     import_transcript_events,
     parse_transcript,
     preview_jsonl,
+    prune_jargon_stats,
 )
 from .coexistence import Coexistence
 from .contradiction import ContradictionEngine
@@ -28,7 +30,7 @@ from .inject import build_pack
 from .learn import LearningEngine
 from .pipeline import MemoryPipeline
 from .profiles import build_profile
-from .retrieve import Retriever, detect_other_speaker
+from .retrieve import Retriever
 from .store import Store
 from .slots import apply_slot
 from .util import (
@@ -41,6 +43,7 @@ from .util import (
     SCOPE_OWNER,
     SCOPE_PERSON,
     clip,
+    estimate_tokens,
     fingerprint,
     norm_platform,
     now_ts,
@@ -101,14 +104,18 @@ class SavageTypeService:
         self.get_persona_text = get_persona_text
         self.send_message = send_message
         self._owner_ids: set[str] = set()
-        self._recent_injections: dict[str, dict[int, int]] = {}
         self.coexistence = Coexistence(enabled=bool(config.get("coexistence_degrade", True)))
         self.contradiction = ContradictionEngine(
             store,
             high_evidence=float(config.get("high_evidence_confidence", 0.8)),
             owner_ids=self._owner_ids,
         )
-        self.extractor = Extractor(store, self.contradiction, llm=self._llm_for("normalize"))
+        self.extractor = Extractor(
+            store,
+            self.contradiction,
+            llm=self._llm_for("normalize"),
+            is_owner=self.is_owner_speaker,
+        )
         self.pipeline = MemoryPipeline(
             store,
             self.contradiction,
@@ -125,7 +132,7 @@ class SavageTypeService:
             embed=None,
             rerank=self._rerank,
             mode=str(config.get("retrieval_mode") or "auto"),
-            cache_ttl=int(config.get("cache_ttl_seconds") or 20),
+            cache_ttl=max(0, int(20 if config.get("cache_ttl_seconds") is None else config.get("cache_ttl_seconds"))),
         )
         self._extract_lock = asyncio.Lock()
         self._embed_lock = asyncio.Lock()
@@ -135,13 +142,17 @@ class SavageTypeService:
         self._sync_embed_fn()
 
     def embedding_auto_threshold(self) -> int:
-        return int(self.config.get("embedding_auto_threshold") or 2500)
+        raw = self.config.get("embedding_auto_threshold")
+        return int(2500 if raw is None else raw)
 
     def embedding_wanted(self) -> bool:
         if bool(self.config.get("embedding_enabled")):
             return True
+        threshold = self.embedding_auto_threshold()
+        if threshold <= 0:
+            return False
         live = int(self.store.counts().get("facts_live") or 0)
-        return live >= self.embedding_auto_threshold()
+        return live >= threshold
 
     def embedding_status(self) -> dict[str, Any]:
         live = int(self.store.counts().get("facts_live") or 0)
@@ -154,7 +165,7 @@ class SavageTypeService:
         reason = "off"
         if bool(self.config.get("embedding_enabled")):
             reason = "manual"
-        elif live >= self.embedding_auto_threshold():
+        elif self.embedding_auto_threshold() > 0 and live >= self.embedding_auto_threshold():
             reason = "auto_threshold"
         active = wanted and provider is not None
         if wanted and provider is None:
@@ -206,12 +217,25 @@ class SavageTypeService:
             return umo
         return str(self.config.get("notify_umo") or "").strip()
 
+    def clear_runtime_caches(self) -> None:
+        self.retriever._cache.clear()
+
     def apply_config(self) -> None:
         self.config["_skip_style_learning"] = bool(self.coexistence.skip_style)
         self.learning.config = self.config
         self.pipeline.config = self.config
+        mode = str(self.config.get("retrieval_mode") or "auto")
+        cache_ttl = max(0, int(self._cfg_value("cache_ttl_seconds", 20)))
+        if self.retriever.mode != mode or self.retriever.cache_ttl != cache_ttl:
+            self.retriever._cache.clear()
+        self.retriever.mode = mode
+        self.retriever.cache_ttl = cache_ttl
         self._rebuild_owner_ids()
+        was_active = self.retriever.embed is not None
         self._sync_embed_fn()
+        if was_active != (self.retriever.embed is not None):
+            # Embedding 开关切换后，旧缓存里的排序结果不再适用，必须清缓存。
+            self.retriever._cache.clear()
 
     def allowed_platforms(self) -> list[str]:
         raw = self.config.get("memory_source_platforms")
@@ -300,6 +324,10 @@ class SavageTypeService:
         if not self.window_allowed(event, ident):
             return "whitelist"
         return ""
+
+    def _clear_capture_skip(self) -> None:
+        if self.store.get_meta("capture_skip"):
+            self.store.set_meta("capture_skip", "")
 
     def _note_capture_skip(self, reason: str, event: Any = None, ident: dict[str, str] | None = None) -> None:
         now = now_ts()
@@ -395,7 +423,20 @@ class SavageTypeService:
         except Exception:
             window_tag = ""
         raw_id = speaker_id or "unknown"
+        platform = self.event_platform(event) or platform_of(window_tag)
         canonical = self.store.resolve_speaker(raw_id)
+        if platform == "webchat":
+            owner = self.owner_qq()
+            if owner:
+                owner_canonical = self.store.resolve_speaker(owner)
+                if canonical != owner_canonical:
+                    # ChatUI 的主人是同一个主人：合并到主人 QQ 身份。
+                    # 没有主人档案时不要用 ChatUI 的临时显示名去覆盖称呼，等 QQ 侧真实昵称。
+                    owner_profile = self.store.get_profile(owner_canonical)
+                    owner_name = owner_profile.speaker_name if owner_profile else ""
+                    self.store.reassign_speaker(canonical or raw_id, owner_canonical, owner_name)
+                    canonical = owner_canonical
+                    speaker_name = owner_name
         if raw_id != canonical:
             self.store.set_alias(raw_id, canonical, speaker_name or "")
         return {
@@ -403,7 +444,7 @@ class SavageTypeService:
             "speaker_name": speaker_name or canonical,
             "bot_id": bot_id,
             "window_tag": window_tag,
-            "platform": self.event_platform(event) or platform_of(window_tag),
+            "platform": platform,
             "persona_id": persona_id or "",
             "is_owner": self.is_owner_event(event),
         }
@@ -519,18 +560,20 @@ class SavageTypeService:
         is_owner = self.is_owner_event(event)
         if is_owner:
             self.mark_owner_speaker(ident["speaker_id"])
-        if self.platform_allowed(ident):
+            # 主人身份与人物档案分开：只同步称呼到事实，不建/不更档案。
+            self.store.sync_speaker_name(ident["speaker_id"], ident.get("speaker_name", ""))
+        elif self.platform_allowed(ident):
             # 档案只建在 QQ 侧；ChatUI（webchat）只进主人记忆，不建人物档案。
             self.store.upsert_profile(
                 ident["speaker_id"],
                 ident.get("speaker_name", ""),
                 ident.get("platform", ""),
-                is_owner=is_owner,
+                is_owner=False,
             )
-        if is_owner:
+        if is_owner and not text.startswith("[图片]"):
             self.learning.observe_message(text, persona_id=ident.get("persona_id") or "")
         ts = now_ts()
-        return self.store.add_timeline(
+        event_id = self.store.add_timeline(
             {
                 "ts": ts,
                 "role": ROLE_USER,
@@ -539,6 +582,9 @@ class SavageTypeService:
                 **ident,
             }
         )
+        if event_id:
+            self._clear_capture_skip()
+        return event_id
 
     def capture_bot(self, event: Any, text: str) -> int | None:
         ident = self._ident_from_event(event)
@@ -550,7 +596,7 @@ class SavageTypeService:
         if not text:
             return None
         ts = now_ts()
-        return self.store.add_timeline(
+        event_id = self.store.add_timeline(
             {
                 "ts": ts,
                 "role": ROLE_ASSISTANT,
@@ -569,6 +615,9 @@ class SavageTypeService:
                 "persona_id": ident.get("persona_id") or "",
             }
         )
+        if event_id:
+            self._clear_capture_skip()
+        return event_id
 
     def _cfg_value(self, key: str, default: Any) -> Any:
         raw = self.config.get(key)
@@ -587,7 +636,7 @@ class SavageTypeService:
         if not self.enabled() or not self.config.get("extract_enabled", True):
             return {"ok": True, "skipped": True, "reason": "extract disabled"}
         now = now_ts()
-        cooldown = int(self.config.get("extract_cooldown_seconds") or 45)
+        cooldown = max(0, int(self._cfg_value("extract_cooldown_seconds", 45)))
         if not force and now < self._extract_fail_until:
             return {"ok": True, "skipped": True, "reason": "cooldown_after_fail"}
         if not force and self._last_extract_at and now - self._last_extract_at < cooldown:
@@ -607,7 +656,7 @@ class SavageTypeService:
                         await self.notify_pending()
                 return result
             except Exception as exc:  # noqa: BLE001
-                fail_cd = int(self.config.get("extract_fail_cooldown_seconds") or 180)
+                fail_cd = max(0, int(self._cfg_value("extract_fail_cooldown_seconds", 180)))
                 self._extract_fail_until = now_ts() + fail_cd
                 self.store.add_usage("extract", ok=False, detail=str(exc)[:200])
                 self.store.add_diag("extract_fail", {"error": str(exc)})
@@ -622,7 +671,7 @@ class SavageTypeService:
             self.store.add_diag("notify_skip", {"reason": "no_owner_window", "count": len(items)})
             return False
         now = now_ts()
-        cooldown = max(0, int(self.config.get("pipeline_notify_cooldown_seconds") or 300))
+        cooldown = max(0, int(self._cfg_value("pipeline_notify_cooldown_seconds", 300)))
         last = int(self.store.get_meta("notify_last_at") or "0")
         if last and cooldown and now - last < cooldown:
             return False
@@ -652,14 +701,22 @@ class SavageTypeService:
             self.store.add_diag("notify_fail", {"error": str(exc)[:200]})
             return False
 
+    BARE_REPLY_WORDS = {
+        "是", "否", "通过", "批准", "过审", "同意", "驳回", "拒绝", "不过",
+        "yes", "no", "y", "n", "ok",
+    }
+
     async def handle_owner_reply(self, text: str) -> str | None:
         t = (text or "").strip()
         if not t or len(t) > 24:
             return None
-        yes = re.match(r"^(是|通过|批准|过审|yes|y|ok)[\s#:：]*(\d+)?$", t, re.I)
+        yes = re.match(r"^(是|通过|批准|过审|同意|yes|y|ok)[\s#:：]*(\d+)?$", t, re.I)
         no = re.match(r"^(否|驳回|拒绝|删除|不过|no|n)[\s#:：]*(\d+)?$", t, re.I)
         match = yes or no
         if match is None:
+            return None
+        if not match.group(2) and t.lower() not in self.BARE_REPLY_WORDS:
+            # 不带编号时必须是很短的明确答复，避免正常聊天里的「删除」误触。
             return None
         approved = yes is not None
         items = self.store.list_memory_reviews("pending", limit=50)
@@ -707,8 +764,15 @@ class SavageTypeService:
         payload["origin"] = payload.get("origin") or "manual"
         payload["review_status"] = REVIEW_MANUAL
         result = self.contradiction.ingest(payload, source_text=item.raw_text or payload.get("content", ""))
+        action = str(result.get("action") or "")
         self.store.update_memory_review(review_id, status="approved", payload=payload)
-        self.store.add_diag("memory_approved", {"id": review_id, "action": result.get("action"), "by": "owner"})
+        self.store.add_diag("memory_approved", {"id": review_id, "action": action, "by": "owner"})
+        if action == "pending":
+            return f"已通过 #{review_id}。和高证据旧记忆冲突，已进「待确认覆盖」。"
+        if action == "rejected_relation":
+            return f"已通过 #{review_id}。但被关系守卫拒收，没有写入。"
+        if action in {"ignored", "ignored_joke"}:
+            return f"已通过 #{review_id}。但这句按整理结果被忽略，没有写入。"
         return f"已通过 #{review_id}。"
 
     def schedule_learn(self) -> None:
@@ -727,11 +791,15 @@ class SavageTypeService:
         if last and now - last < 6 * 3600:
             return
         deleted = self.store.delete_empty_profiles(
-            ttl_days=int(self.config.get("empty_profile_ttl_days") or 7)
+            ttl_days=int(self._cfg_value("empty_profile_ttl_days", 7))
         )
+        folded = fold_preference_slots(self.store)
         self.store.set_meta("housekeeping_last_at", str(now))
-        if deleted:
-            self.store.add_diag("housekeeping", {"deleted_empty_profiles": deleted})
+        if deleted or folded:
+            self.store.add_diag(
+                "housekeeping",
+                {"deleted_empty_profiles": deleted, "folded_preferences": folded},
+            )
 
     async def _background_learn(self) -> None:
         try:
@@ -781,22 +849,27 @@ class SavageTypeService:
         window = max(0, int(self._cfg_value("inject_dedup_window_seconds", 600)))
         if window <= 0:
             return set()
-        seen = self._recent_injections.get(window_tag) or {}
-        now = now_ts()
-        fresh = {fid: ts for fid, ts in seen.items() if now - ts < window}
-        self._recent_injections[window_tag] = fresh
-        return set(fresh)
+        return self.store.recent_recall_ids(window_tag, now_ts() - window)
 
-    def _remember_injected(self, window_tag: str, facts: list[Any]) -> None:
-        if not window_tag or not facts:
+    def _remember_injected(self, window_tag: str, fact_ids: list[int]) -> None:
+        if not window_tag or not fact_ids:
             return
-        seen = self._recent_injections.setdefault(window_tag, {})
-        now = now_ts()
-        for fact in facts:
-            seen[int(fact.id)] = now
-        if len(self._recent_injections) > 200:
-            for key in list(self._recent_injections)[:100]:
-                self._recent_injections.pop(key, None)
+        self.store.add_recall(window_tag, [int(fid) for fid in fact_ids], now_ts())
+
+    def _retrieval_ctx(self, query: str, speaker_id: str, persona_id: str = "") -> tuple[str, list[str], str | None]:
+        canonical = self.store.resolve_speaker(speaker_id)
+        ids = self.store.speaker_ids_for(canonical)
+        ask_other = None
+        id_set = set(ids)
+        for row in self.store.distinct_live_speakers(persona_id=persona_id, limit=80):
+            sid = str(row["speaker_id"] or "")
+            if not sid or sid in id_set or sid == ROLE_BOT_ID:
+                continue
+            name = str(row["speaker_name"] or "").strip()
+            if (name and len(name) >= 2 and name in query) or (len(sid) >= 4 and sid in query):
+                ask_other = sid
+                break
+        return canonical, ids, ask_other
 
     async def retrieve_for(
         self,
@@ -804,11 +877,10 @@ class SavageTypeService:
         speaker_id: str,
         persona_id: str = "",
         skip_ids: set[int] | None = None,
+        skip_query_mentions: bool = False,
     ) -> Any:
         self._sync_embed_fn()
-        canonical = self.store.resolve_speaker(speaker_id)
-        ids = self.store.speaker_ids_for(canonical)
-        ask_other = detect_other_speaker(query, self.store.all_live(80, persona_id=persona_id), canonical)
+        canonical, ids, ask_other = self._retrieval_ctx(query, speaker_id, persona_id)
         return await self.retriever.retrieve(
             query=query,
             speaker_id=canonical,
@@ -820,6 +892,25 @@ class SavageTypeService:
             speaker_ids=ids,
             skip_ids=skip_ids,
             importance_cfg=self.importance_cfg(),
+            skip_query_mentions=skip_query_mentions,
+        )
+
+    async def warm_retrieval(self, query: str, speaker_id: str, persona_id: str = "") -> None:
+        """会话锁等待期间预热检索缓存，让检索和排队时间重叠。"""
+        if self.retriever.cache_ttl <= 0:
+            return
+        self._sync_embed_fn()
+        canonical, ids, ask_other = self._retrieval_ctx(query, speaker_id, persona_id)
+        await self.retriever.warm(
+            query=query,
+            speaker_id=canonical,
+            top_k=int(self.config.get("top_k") or 16),
+            related_limit=int(self.config.get("related_fact_limit") or 6),
+            core_limit=int(self.config.get("core_fact_limit") or 4),
+            ask_other_id=ask_other,
+            persona_id=persona_id,
+            speaker_ids=ids,
+            importance_cfg=self.importance_cfg(),
         )
 
     def dossier_for(self, speaker_id: str, persona_id: str = "") -> dict[str, Any]:
@@ -829,7 +920,7 @@ class SavageTypeService:
         name = ""
         if facts:
             name = facts[0].speaker_name or ""
-        return build_profile(canonical, facts, speaker_name=name)
+        return build_profile(canonical, facts, speaker_name=name, speaker_ids=ids)
 
     def list_dossiers(self, persona_id: str = "") -> list[dict[str, Any]]:
         out = []
@@ -847,25 +938,63 @@ class SavageTypeService:
         window_tag: str = "",
     ) -> tuple[str, Any, dict[str, Any]]:
         skip_ids = self._recent_ids(window_tag)
-        result = await self.retrieve_for(query, speaker_id, persona_id=persona_id, skip_ids=skip_ids)
-        self._remember_injected(window_tag, result.core + result.related)
+        result = await self.retrieve_for(
+            query,
+            speaker_id,
+            persona_id=persona_id,
+            skip_ids=skip_ids,
+            skip_query_mentions=bool(self._cfg_value("inject_novelty_filter", True)),
+        )
         learning = self.learning.pack_for(query, persona_id=persona_id, route=result.route)
         dossier = self.dossier_for(speaker_id, persona_id=persona_id)
+        card = dossier.get("card") or ""
+        shown_ids = (
+            {f.id for f in result.core}
+            | {f.id for f in result.related}
+            | {f.id for f in result.uncertain}
+        )
+        dossier_ids = {int(x) for x in (dossier.get("fact_ids") or [])}
+        suppressed_ids = {
+            h.fact.id
+            for h in result.blocked
+            if h.filter_reason in {"recently_injected", "query_mentioned"}
+        }
+        if card and dossier_ids and dossier_ids.issubset(shown_ids | suppressed_ids):
+            # 档案内容要么已在本轮事实里，要么被去重/新颖度有意压掉：不重复占预算。
+            card = ""
+        bot_facts = [
+            f
+            for f in self.store.person_facts(ROLE_BOT_ID, limit=12)
+            # Bot 设定也要遵守人格隔离：全局（空 persona）可见，特定人格的只在自己人格下注入。
+            if not f.persona_id or f.persona_id == persona_id
+        ][:6]
+        injected_ids: list[int] = []
         pack = build_pack(
             result,
-            budget=int(self.config.get("inject_budget_chars") or 800),
+            # 0 表示不限（见 inject._fits 的预算语义），显式 0 不能被 or 默认值吞掉。
+            budget=int(self._cfg_value("inject_budget_chars", 800)),
             companion_present=any("companion" in d for d in self.coexistence.detected),
             learning=learning,
-            dossier=dossier.get("card") or "",
+            dossier=card,
+            warm_triggered=bool(self._cfg_value("inject_warm_triggered", True)),
+            bot_facts=bot_facts,
+            out_ids=injected_ids,
         )
+        if pack:
+            # 只有真的进了包的事实才算「最近注入过」；被预算裁掉/未触发的都不占名额。
+            self._remember_injected(window_tag, injected_ids)
         snapshot = {
             "query": clip(query, 80),
             "speaker_id": speaker_id,
             "persona_id": persona_id,
+            "window": clip(window_tag, 80),
             "route": result.route,
             "path": result.path,
             "cache": result.cache,
             "pack_chars": len(pack),
+            "pack_tokens": estimate_tokens(pack),
+            "injected_ids": injected_ids,
+            "bot_facts": [f.id for f in bot_facts],
             "core": [f.id for f in result.core],
             "related": [f.id for f in result.related],
             "uncertain": [f.id for f in result.uncertain],
@@ -877,7 +1006,7 @@ class SavageTypeService:
             "jargon": [j.get("term") for j in (learning.jargon or [])],
             "fewshots": len(learning.fewshots or []),
             "persona_draft": bool(learning.persona_draft),
-            "dossier": bool(dossier.get("card")),
+            "dossier": bool(card),
             "injected": bool(pack),
             "dedup": len(skip_ids),
         }
@@ -887,37 +1016,86 @@ class SavageTypeService:
     def remember(self, speaker: dict[str, str], content: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         extra = extra or {}
         speaker_id = str(speaker.get("speaker_id") or "admin").strip() or "admin"
-        speaker_name = str(speaker.get("speaker_name") or speaker_id).strip() or speaker_id
+        known = self.store.get_profile(speaker_id)
+        speaker_name = (
+            str(speaker.get("speaker_name") or "").strip()
+            or (known.speaker_name if known else "")
+            or speaker_id
+        )
         owner = self.is_owner_speaker(speaker_id)
-        self.store.upsert_profile(
-            speaker_id,
-            speaker_name,
-            platform_of(str(speaker.get("window_tag") or "")),
-            is_owner=owner,
-        )
-        payload = apply_slot(
-            {
-                "subject": extra.get("subject") or "self",
-                "attribute": extra.get("attribute") or "note",
-                "value": extra.get("value") or clip(content, 80),
-                "content": clip(content, 240),
-                "speaker_id": speaker_id,
-                "speaker_name": speaker_name,
-                "bot_id": speaker.get("bot_id") or "",
-                "window_tag": speaker.get("window_tag") or "",
-                "persona_id": speaker.get("persona_id") or extra.get("persona_id") or "",
-                "confidence": float(extra.get("confidence") or 0.9),
-                "first_person": 1,
-                "explicit_correction": int(bool(extra.get("explicit_correction"))),
-                "source": extra.get("source") or "tool",
-                "mention_policy": extra.get("mention_policy") or "mention",
-                "origin": extra.get("origin") or ORIGIN_MANUAL,
-                "review_status": extra.get("review_status") or REVIEW_MANUAL,
-                "scope": SCOPE_OWNER if owner else SCOPE_PERSON,
-                "plain": extra.get("plain") or clip(content, 160),
-                "keywords": extra.get("keywords") or [],
-            }
-        )
+        if speaker_id == ROLE_BOT_ID:
+            # Bot 自己的记忆不建人物档案。
+            pass
+        elif owner:
+            # 主人不建人物档案，只保证事实上的称呼最新。
+            if not speaker_name or speaker_name == speaker_id:
+                rows = self.store.query(
+                    "SELECT speaker_name FROM facts WHERE speaker_id=? AND speaker_name!='' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (speaker_id,),
+                )
+                if rows and rows[0]["speaker_name"]:
+                    speaker_name = str(rows[0]["speaker_name"])
+            self.store.sync_speaker_name(speaker_id, speaker_name)
+        else:
+            platform = platform_of(str(speaker.get("window_tag") or ""))
+            if platform in {"", "console"}:
+                # 面板/工具写入没有真实平台信息：留空，别覆盖已有档案的平台。
+                platform = ""
+            self.store.upsert_profile(
+                speaker_id,
+                speaker_name,
+                platform,
+                is_owner=False,
+            )
+        attribute = str(extra.get("attribute") or "")
+        value = str(extra.get("value") or "")
+        plain = str(extra.get("plain") or "")
+
+        def build_payload(attr: str, val: str, text_plain: str) -> dict[str, Any]:
+            return apply_slot(
+                {
+                    "subject": extra.get("subject") or "self",
+                    "attribute": attr or "note",
+                    "value": val or clip(content, 80),
+                    "plain": text_plain or clip(content, 160),
+                    "content": clip(content, 240),
+                    "speaker_id": speaker_id,
+                    "speaker_name": speaker_name,
+                    "bot_id": speaker.get("bot_id") or "",
+                    "window_tag": speaker.get("window_tag") or "",
+                    "persona_id": speaker.get("persona_id") or extra.get("persona_id") or "",
+                    "confidence": float(extra.get("confidence") or 0.9),
+                    "first_person": 1,
+                    "explicit_correction": int(bool(extra.get("explicit_correction"))),
+                    "source": extra.get("source") or "tool",
+                    "mention_policy": extra.get("mention_policy") or "mention",
+                    "origin": extra.get("origin") or ORIGIN_MANUAL,
+                    "review_status": extra.get("review_status") or REVIEW_MANUAL,
+                    "scope": SCOPE_OWNER if owner else SCOPE_PERSON,
+                    "keywords": extra.get("keywords") or [],
+                }
+            )
+
+        if not attribute and not value:
+            # 手动补记也识别偏好句（可能多条）：避免「喜欢X」全进 note 单槽互相覆盖。
+            inferred = self.extractor.infer_preferences(content)
+            if inferred:
+                results = [
+                    self.contradiction.ingest(
+                        build_payload(
+                            item["attribute"],
+                            item["value"],
+                            plain or item["plain"],
+                        ),
+                        source_text=content,
+                    )
+                    for item in inferred
+                ]
+                last = dict(results[-1])
+                last["facts"] = results
+                return last
+        payload = build_payload(attribute, value, plain)
         return self.contradiction.ingest(payload, source_text=content)
 
     async def fill_embeddings(self, limit: int = 16) -> int:
@@ -942,26 +1120,7 @@ class SavageTypeService:
             return n
 
     def sleep_maintenance(self) -> dict[str, Any]:
-        merged = 0
-        for keeper, dup in self.store.live_near_duplicates():
-            if int(getattr(dup, "pinned", 0)):
-                continue
-            evidence = list(keeper.evidence)
-            for eid in dup.evidence:
-                if eid not in evidence:
-                    evidence.append(eid)
-            self.store.update_fact(
-                keeper.id,
-                evidence=evidence,
-                confidence=max(keeper.confidence, dup.confidence),
-            )
-            self.store.update_fact(
-                dup.id,
-                status="superseded",
-                superseded_by=keeper.id,
-                reason="sleep_near_duplicate",
-            )
-            merged += 1
+        merged = self.store.resolve_all_slot_conflicts()
         folded = fold_preference_slots(self.store)
         expired_status = expire_status_facts(self.store)
         retain_days = int(self.config.get("sleep_timeline_retain_days") or 30)
@@ -984,8 +1143,10 @@ class SavageTypeService:
             ttl_seconds=int(self.config.get("persona_draft_ttl_seconds") or 14 * 86400),
         )
         empty_profiles = self.store.delete_empty_profiles(
-            ttl_days=int(self.config.get("empty_profile_ttl_days") or 7),
+            ttl_days=int(self._cfg_value("empty_profile_ttl_days", 7)),
         )
+        pruned_jargon = prune_jargon_stats(self.store)
+        expired_pending = expire_pending_overrides(self.store)
         counts = self.store.counts()
         result = {
             "merged_duplicates": merged,
@@ -996,6 +1157,8 @@ class SavageTypeService:
             "archived_decayed": decayed,
             "expired_persona_drafts": expired,
             "deleted_empty_profiles": empty_profiles,
+            "pruned_jargon": pruned_jargon,
+            "expired_pending_overrides": expired_pending,
             **counts,
         }
         self.store.add_diag("sleep", result)
@@ -1010,6 +1173,7 @@ class SavageTypeService:
     def import_archive(self, path: Path, dest_dir: Path) -> dict[str, Any]:
         backup = backup_db(self.store, dest_dir)
         result = import_jsonl(self.store, path)
+        result["resolved_conflicts"] = self.store.resolve_all_slot_conflicts()
         result["backup"] = str(backup)
         self.store.add_diag("import_jsonl", {k: v for k, v in result.items() if k != "backup"})
         return result
@@ -1063,12 +1227,18 @@ class SavageTypeService:
         seen: dict[str, str] = {"admin": "admin"}
         for profile in self.store.list_profiles(limit=300):
             sid = str(profile.speaker_id or "")
-            if sid and sid not in seen:
+            if sid and sid != ROLE_BOT_ID and sid not in seen:
                 seen[sid] = str(profile.speaker_name or sid)
         for row in self.store.speaker_name_map():
             sid = str(row.get("speaker_id") or "")
-            if sid and sid not in seen:
+            if sid and sid != ROLE_BOT_ID and sid not in seen:
                 seen[sid] = str(row.get("speaker_name") or sid)
+        owner = self.owner_qq()
+        if owner:
+            # 配置了主人就保证主人可选，避免手动补记默认写到 admin 占位说话人。
+            canonical = self.store.resolve_speaker(owner)
+            if canonical and canonical not in seen:
+                seen[canonical] = "主人"
         return [{"id": k, "name": v} for k, v in seen.items()]
 
     def overview(self) -> dict[str, Any]:
@@ -1099,6 +1269,7 @@ class SavageTypeService:
                 "theme_color": str(self.config.get("ui_theme_color") or "#7c5cff"),
                 "theme_color2": str(self.config.get("ui_theme_color2") or "#22d3ee"),
                 "theme_color3": str(self.config.get("ui_theme_color3") or "#f472b6"),
+                "dynamic_colors": bool(self.config.get("ui_dynamic_colors")),
                 "capture_skip": self.last_capture_skip(),
             },
         }
@@ -1192,6 +1363,20 @@ class SavageTypeService:
             current = batch[0]["content"]
         return {"ok": True, "steps": steps, "unique": len(seen)}
 
+    def _provider_timeout(self) -> float:
+        try:
+            return max(0.0, float(self._cfg_value("provider_timeout_seconds", 5)))
+        except (TypeError, ValueError):
+            return 5.0
+
+    async def _wait_provider(self, call: Any, timeout: float) -> Any:
+        """Await a provider call with a hard timeout; sync results pass through."""
+        if not asyncio.iscoroutine(call):
+            return call
+        if timeout > 0:
+            return await asyncio.wait_for(call, timeout=timeout)
+        return await call
+
     async def _embed(self, texts: list[str]) -> list[list[float]]:
         provider = self.get_provider("embedding", str(self.config.get("embedding_provider_id") or ""))
         if provider is None:
@@ -1201,15 +1386,22 @@ class SavageTypeService:
             pid = provider.meta().id
         except Exception:
             pid = ""
+        timeout = self._provider_timeout()
         try:
             if hasattr(provider, "get_embeddings"):
-                vectors = await provider.get_embeddings(texts)
+                vectors = await self._wait_provider(provider.get_embeddings(texts), timeout)
             else:
-                vectors = [await provider.get_embedding(text) for text in texts]
+                vectors = []
+                for text in texts:
+                    vectors.append(await self._wait_provider(provider.get_embedding(text), timeout))
             self.store.add_usage("embed", pid, True, sum(len(t) for t in texts), 0)
             return vectors
-        except Exception:
-            self.store.add_usage("embed", pid, False, sum(len(t) for t in texts), 0)
+        except Exception as exc:
+            self.store.add_usage(
+                "embed", pid, False, sum(len(t) for t in texts), 0, detail=f"{type(exc).__name__}"
+            )
+            if isinstance(exc, asyncio.TimeoutError):
+                self.store.add_diag("provider_timeout", {"kind": "embed", "timeout": timeout})
             raise
 
     async def _rerank(self, query: str, documents: list[str], top_n: int) -> list[tuple[int, float]]:
@@ -1221,8 +1413,9 @@ class SavageTypeService:
             pid = provider.meta().id
         except Exception:
             pid = ""
+        timeout = self._provider_timeout()
         try:
-            results = await provider.rerank(query, documents, top_n=top_n)
+            results = await self._wait_provider(provider.rerank(query, documents, top_n=top_n), timeout)
             out: list[tuple[int, float]] = []
             for item in results or []:
                 idx = getattr(item, "index", None)
@@ -1235,6 +1428,8 @@ class SavageTypeService:
                 out.append((int(idx), float(score or 0)))
             self.store.add_usage("rerank", pid, True, len(query) + sum(len(d) for d in documents), 0)
             return out
-        except Exception:
-            self.store.add_usage("rerank", pid, False, len(query), 0)
+        except Exception as exc:
+            self.store.add_usage("rerank", pid, False, len(query), 0, detail=f"{type(exc).__name__}")
+            if isinstance(exc, asyncio.TimeoutError):
+                self.store.add_diag("provider_timeout", {"kind": "rerank", "timeout": timeout})
             raise

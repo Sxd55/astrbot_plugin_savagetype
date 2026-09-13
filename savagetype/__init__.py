@@ -1,5 +1,5 @@
 """Savage Type — global persona memory hub with review-gated learning."""
 
-__version__ = "3.2.1"
+__version__ = "3.4.20"
 PLUGIN_NAME = "astrbot_plugin_savagetype"
 PLUGIN_DISPLAY_NAME = "Savage Type"

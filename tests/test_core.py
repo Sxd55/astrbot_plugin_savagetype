@@ -67,21 +67,30 @@ class CoreTest(unittest.TestCase):
         r1 = self.engine.ingest(_payload(value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
         self.assertEqual(r1["action"], "insert")
         r2 = self.engine.ingest(
-            _payload(value="咖啡", content="我改口了，喜欢咖啡", explicit_correction=1),
-            "我改口了，喜欢咖啡",
+            _payload(value="不茶", content="我改口了，不喜欢茶了", explicit_correction=1),
+            "我改口了，不喜欢茶了",
         )
         self.assertEqual(r2["action"], "supersede")
-        live = self.store.live_by_slot("u1", "self", "likes")
-        self.assertEqual(live.value, "咖啡")
+        live = self.store.live_by_slot("u1", "self", "likes", value="不茶")
+        self.assertEqual(live.value, "不茶")
         self.assertIsNone(self.store.get_fact(r1["fact_id"]))
         rb = self.engine.rollback(live.id)
         self.assertFalse(rb["ok"])
+
+    def test_multiple_preferences_coexist(self):
+        r1 = self.engine.ingest(_payload(value="猫", content="我喜欢猫"), "我喜欢猫")
+        r2 = self.engine.ingest(_payload(value="狗", content="我喜欢狗"), "我喜欢狗")
+        r3 = self.engine.ingest(_payload(value="咖啡", content="我喜欢咖啡"), "我喜欢咖啡")
+        self.assertEqual([r1["action"], r2["action"], r3["action"]], ["insert", "insert", "insert"])
+        live = self.store.facts_by_status("live", limit=20)
+        values = {f.value for f in live if f.attribute == "likes"}
+        self.assertEqual(values, {"猫", "狗", "咖啡"})
 
     def test_joke_does_not_overwrite(self):
         self.engine.ingest(_payload(value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
         r = self.engine.ingest(_payload(value="汽油", content="我喜欢喝汽油哈哈哈开玩笑"), "我喜欢喝汽油哈哈哈开玩笑")
         self.assertEqual(r["action"], "ignored_joke")
-        self.assertEqual(self.store.live_by_slot("u1", "self", "likes").value, "茶")
+        self.assertEqual(self.store.live_by_slot("u1", "self", "likes", value="茶").value, "茶")
 
     def test_dislike_flip_stays_on_likes_slot(self):
         self.store.add_timeline(
@@ -116,7 +125,7 @@ class CoreTest(unittest.TestCase):
         r1 = self.engine.ingest(likes[0], likes[0]["content"])
         r2 = self.engine.ingest(likes[-1], likes[-1]["content"])
         self.assertIn(r2["action"], {"supersede", "refresh"})
-        live = self.store.live_by_slot("u1", "self", "likes")
+        live = self.store.live_by_slot("u1", "self", "likes", value=likes[-1]["value"])
         self.assertIsNotNone(live)
         self.assertTrue(live.value.startswith("不") or "不喜欢" in live.content)
         if r2["action"] == "supersede":
@@ -129,10 +138,10 @@ class CoreTest(unittest.TestCase):
             "我改口了我不喜欢hiphop",
         )
         self.assertEqual(r2["action"], "supersede")
-        live = self.store.live_by_slot("u1", "self", "likes")
+        live = self.store.live_by_slot("u1", "self", "likes", value="不hiphop")
         self.assertTrue(live.value.startswith("不") or "不喜欢" in live.content)
         self.assertIsNone(self.store.get_fact(r1["fact_id"]))
-        self.assertIsNone(self.store.live_by_slot("u1", "self", "dislikes"))
+        self.assertIsNone(self.store.live_by_slot("u1", "self", "dislikes", value="hiphop"))
 
     def test_sleep_folds_old_dislike_note(self):
         self.engine.ingest(_payload(attribute="likes", value="不hiphop", content="我改口了我不喜欢hiphop"), "我改口了我不喜欢hiphop")
@@ -195,7 +204,7 @@ class CoreTest(unittest.TestCase):
         )
         n = fold_preference_slots(self.store)
         self.assertEqual(n, 2)
-        self.assertIsNotNone(self.store.live_by_slot("u1", "self", "likes"))
+        self.assertIsNotNone(self.store.live_by_slot("u1", "self", "likes", value="不hiphop"))
         leftover = [f for f in self.store.facts_by_status("live", limit=20) if f.attribute in {"dislikes", "note"}]
         self.assertFalse(leftover)
 
@@ -211,13 +220,13 @@ class CoreTest(unittest.TestCase):
     def test_high_evidence_pending(self):
         r1 = self.engine.ingest(_payload(value="茶", content="我喜欢喝茶", confidence=0.9), "我喜欢喝茶")
         self.store.update_fact(r1["fact_id"], access_count=2, confidence=0.9)
-        r2 = self.engine.ingest(_payload(value="咖啡", content="我喜欢咖啡"), "我喜欢咖啡")
+        r2 = self.engine.ingest(_payload(value="不茶", content="我现在不喜欢茶了"), "我现在不喜欢茶了")
         self.assertEqual(r2["action"], "pending")
         self.assertEqual(r2["reason"], "high_evidence_needs_confirm")
-        self.assertEqual(self.store.live_by_slot("u1", "self", "likes").value, "茶")
+        self.assertEqual(self.store.live_by_slot("u1", "self", "likes", value="茶").value, "茶")
         confirmed = self.engine.confirm_pending(r2["pending_id"])
         self.assertTrue(confirmed["ok"])
-        self.assertEqual(self.store.live_by_slot("u1", "self", "likes").value, "咖啡")
+        self.assertEqual(self.store.live_by_slot("u1", "self", "likes", value="不茶").value, "不茶")
 
     def test_heuristic_likes(self):
         self.store.add_timeline(
@@ -291,19 +300,19 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(canonical_subject("用户", "u1", "阿U"), "self")
         r1 = self.engine.ingest(_payload(subject="用户", attribute="likes", value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
         r2 = self.engine.ingest(
-            _payload(subject="我", attribute="口味", value="咖啡", content="我改口了，喜欢咖啡", explicit_correction=1),
-            "我改口了，喜欢咖啡",
+            _payload(subject="我", attribute="口味", value="不茶", content="我改口了，不喜欢茶了", explicit_correction=1),
+            "我改口了，不喜欢茶了",
         )
         self.assertEqual(r2["action"], "supersede")
-        live = self.store.live_by_slot("u1", "self", "likes")
-        self.assertEqual(live.value, "咖啡")
+        live = self.store.live_by_slot("u1", "self", "likes", value="不茶")
+        self.assertEqual(live.value, "不茶")
         self.assertIsNone(self.store.get_fact(r1["fact_id"]))
 
     def test_persona_isolation(self):
         self.engine.ingest(_payload(value="茶", content="我喜欢喝茶", persona_id="p1"), "我喜欢喝茶")
         self.engine.ingest(_payload(value="酒", content="我喜欢喝酒", persona_id="p2"), "我喜欢喝酒")
-        a = self.store.live_by_slot("u1", "self", "likes", persona_id="p1")
-        b = self.store.live_by_slot("u1", "self", "likes", persona_id="p2")
+        a = self.store.live_by_slot("u1", "self", "likes", persona_id="p1", value="茶")
+        b = self.store.live_by_slot("u1", "self", "likes", persona_id="p2", value="酒")
         self.assertEqual(a.value, "茶")
         self.assertEqual(b.value, "酒")
 
@@ -323,7 +332,7 @@ class CoreTest(unittest.TestCase):
     def test_remember_without_correction_pending_on_high_evidence(self):
         r1 = self.engine.ingest(_payload(value="茶", content="我喜欢喝茶", confidence=0.9), "我喜欢喝茶")
         self.store.update_fact(r1["fact_id"], access_count=2, confidence=0.9)
-        r2 = self.engine.ingest(_payload(value="咖啡", content="记住我喜欢咖啡", first_person=1), "记住我喜欢咖啡")
+        r2 = self.engine.ingest(_payload(value="不茶", content="记住我不喜欢茶", first_person=1), "记住我不喜欢茶")
         self.assertEqual(r2["action"], "pending")
 
     def test_fewshot_pairs_go_to_review(self):
@@ -626,7 +635,7 @@ class CoreTest(unittest.TestCase):
     def test_store_reopens_after_close(self):
         self.engine.ingest(_payload(value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
         self.store.close()
-        live = self.store.live_by_slot("u1", "self", "likes")
+        live = self.store.live_by_slot("u1", "self", "likes", value="茶")
         self.assertIsNotNone(live)
         self.assertEqual(live.value, "茶")
 
@@ -863,7 +872,7 @@ class V280Test(unittest.TestCase):
             event_id = self._add_like(store, holder)
             result = asyncio.run(pipe.run(force=True))
             self.assertEqual(result["written"], 1)
-            fact = store.live_by_slot("u1", "self", "likes")
+            fact = store.live_by_slot("u1", "self", "likes", value="茶")
             self.assertIsNotNone(fact)
             self.assertEqual(fact.review_status, "ai_passed")
             self.assertEqual(fact.scope, "person")
@@ -897,7 +906,7 @@ class V280Test(unittest.TestCase):
         )
         reply = asyncio.run(service.handle_owner_reply(f"是 {pass_id}"))
         self.assertIn("已通过", reply)
-        self.assertIsNotNone(self.store.live_by_slot("owner", "self", "likes"))
+        self.assertIsNotNone(self.store.live_by_slot("owner", "self", "likes", value="茶"))
 
         drop_payload = _payload(speaker="owner", value="酒", content="我喜欢喝酒")
         drop_id = self.store.add_memory_review(
@@ -1029,7 +1038,7 @@ class V320Test(unittest.TestCase):
 
     def test_retrieve_dedup_and_pin_bypass(self):
         self.engine.ingest(_payload(speaker="u1", value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
-        fact = self.store.live_by_slot("u1", "self", "likes")
+        fact = self.store.live_by_slot("u1", "self", "likes", value="茶")
         retriever = Retriever(self.store)
 
         r1 = asyncio.run(retriever.retrieve("喜欢什么", "u1", skip_ids={fact.id}))
@@ -1056,7 +1065,7 @@ class V320Test(unittest.TestCase):
             confidence=0.9, kind="status", plain="最近加班",
         )
         result = RetrievalResult(
-            query="q", route="long_term", path="basic", cache="miss",
+            query="约定的蛋糕最近怎么样了", route="long_term", path="basic", cache="miss",
             hits=[], blocked=[], core=[], related=[promise, status],
             uncertain=[], superseded=[],
         )
@@ -1068,7 +1077,7 @@ class V320Test(unittest.TestCase):
     def test_restore_blocks_conflict(self):
         a = self.engine.ingest(_payload(speaker="u1", value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
         self.store.archive_facts([a["fact_id"]])
-        b = self.engine.ingest(_payload(speaker="u1", value="咖啡", content="我喜欢咖啡"), "我喜欢咖啡")
+        b = self.engine.ingest(_payload(speaker="u1", value="不茶", content="我现在不喜欢茶了"), "我现在不喜欢茶了")
         out = self.store.restore_facts([a["fact_id"]])
         self.assertEqual(out["restored"], [])
         self.assertEqual(len(out["blocked"]), 1)
@@ -1178,6 +1187,535 @@ class V320Test(unittest.TestCase):
             }
         )
         self.assertFalse(service.idle_pending())
+
+
+class V330Test(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "v33.db")
+        self.engine = ContradictionEngine(self.store, high_evidence=0.8)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _service(self, **config):
+        from savagetype.service import SavageTypeService
+
+        return SavageTypeService(
+            store=self.store,
+            config=config,
+            llm_generate=lambda *_a, **_k: "",
+            get_provider=lambda *_a, **_k: None,
+            logger=None,
+        )
+
+    def test_heuristic_splits_multiple_preferences(self):
+        from savagetype.extract import Extractor
+
+        self.store.add_timeline(
+            {
+                "ts": 1, "speaker_id": "u1", "speaker_name": "阿U", "bot_id": "b",
+                "window_tag": "aiocqhttp:GroupMessage:1", "role": "user",
+                "content": "我喜欢喝美式，不喜欢拿铁。", "fingerprint": "split-1",
+            }
+        )
+        facts = Extractor(self.store, self.engine).extract_heuristic(self.store.unsummarized(10))
+        values = {f["value"] for f in facts if f["attribute"] == "likes"}
+        self.assertIn("美式", values)
+        self.assertIn("不拿铁", values)
+
+    def test_topic_key_strips_particles(self):
+        from savagetype.util import topic_key
+
+        self.assertEqual(topic_key("不美式了"), "美式")
+        self.assertEqual(topic_key("不喝咖啡了"), "咖啡")
+        self.assertEqual(topic_key("我不喜欢喝美式了"), "美式")
+        self.assertEqual(topic_key("hiphop"), "hiphop")
+
+    def test_sentence_value_remap_covers_same_topic(self):
+        from savagetype.slots import apply_slot
+
+        cleaned = apply_slot(
+            {
+                "subject": "self",
+                "attribute": "note",
+                "value": "我不喜欢喝美式了",
+                "content": "我不喜欢喝美式了",
+                "speaker_id": "u1",
+            }
+        )
+        self.assertEqual(cleaned["attribute"], "likes")
+        self.assertEqual(cleaned["value"], "不美式")
+
+        r1 = self.engine.ingest(_payload(value="美式", content="我喜欢喝美式"), "我喜欢喝美式")
+        r2 = self.engine.ingest(
+            {
+                "subject": "self",
+                "attribute": "note",
+                "value": "我不喜欢喝美式了",
+                "content": "我不喜欢喝美式了",
+                "speaker_id": "u1",
+                "speaker_name": "u1",
+                "confidence": 0.9,
+                "first_person": 1,
+            },
+            "我不喜欢喝美式了",
+        )
+        self.assertEqual(r2["action"], "supersede")
+        self.assertIsNone(self.store.get_fact(r1["fact_id"]))
+
+    def test_heuristic_extracts_repeated_likes(self):
+        from savagetype.extract import Extractor
+
+        self.store.add_timeline(
+            {
+                "ts": 1, "speaker_id": "u1", "speaker_name": "阿U", "bot_id": "b",
+                "window_tag": "aiocqhttp:GroupMessage:1", "role": "user",
+                "content": "我喜欢猫，我喜欢狗，我喜欢羊", "fingerprint": "repeat-1",
+            }
+        )
+        facts = Extractor(self.store, self.engine).extract_heuristic(self.store.unsummarized(10))
+        values = {f["value"] for f in facts if f["attribute"] == "likes"}
+        self.assertEqual(values, {"猫", "狗", "羊"})
+
+    def test_correction_with_particle_covers_same_topic(self):
+        r1 = self.engine.ingest(_payload(value="美式", content="我喜欢喝美式"), "我喜欢喝美式")
+        r2 = self.engine.ingest(_payload(value="不美式了", content="我不喜欢喝美式了"), "我不喜欢喝美式了")
+        self.assertEqual(r2["action"], "supersede")
+        self.assertIsNone(self.store.get_fact(r1["fact_id"]))
+        live = self.store.live_by_slot("u1", "self", "likes", value="不美式了")
+        self.assertIsNotNone(live)
+        self.assertEqual(live.value, "不美式了")
+
+    def test_identity_merge_resolves_conflict(self):
+        old = self.engine.ingest(_payload(speaker="savage", value="香蕉", content="我喜欢吃香蕉"), "我喜欢吃香蕉")
+        self.store.update_fact(old["fact_id"], updated_at=100)
+        self.engine.ingest(_payload(speaker="2412260046", value="不香蕉", content="我不喜欢吃香蕉"), "我不喜欢吃香蕉")
+        moved = self.store.reassign_speaker("savage", "2412260046", "主人")
+        self.assertEqual(moved, 1)
+        live_values = {
+            f.value
+            for f in self.store.facts_by_status("live", limit=20)
+            if f.speaker_id == "2412260046"
+        }
+        self.assertIn("不香蕉", live_values)
+        self.assertNotIn("香蕉", live_values)
+        archived = self.store.facts_by_status("archived", limit=20)
+        self.assertTrue(any(f.reason == "identity_merge_conflict" for f in archived))
+
+    def test_webchat_owner_identity_merge(self):
+        service = self._service(owner_qq="2412260046")
+        self.engine.ingest(_payload(speaker="savage", value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        event = FakeEvent(sender="savage", name="savage", window="webchat:FriendMessage:webchat!savage!x")
+        event.get_platform_name = lambda: "webchat"
+        ident = service.identity_from_event(event)
+        self.assertEqual(ident["speaker_id"], "2412260046")
+        self.assertEqual(self.store.resolve_speaker("savage"), "2412260046")
+        moved = [f for f in self.store.facts_by_status("live", limit=10) if f.speaker_id == "2412260046"]
+        self.assertTrue(moved)
+
+    def test_pipeline_per_entry_verdicts(self):
+        from savagetype.extract import Extractor
+        from savagetype.pipeline import MemoryPipeline
+        from savagetype.util import now_ts
+
+        store = Store(Path(self.tmp.name) / "idx.db")
+        try:
+            engine = ContradictionEngine(store)
+            store.add_timeline(
+                {
+                    "ts": now_ts(), "speaker_id": "u1", "speaker_name": "u", "bot_id": "b",
+                    "window_tag": "aiocqhttp:GroupMessage:1", "role": "user",
+                    "content": "我喜欢美式，不喜欢拿铁", "fingerprint": "idx-1",
+                }
+            )
+            event = store.unsummarized(10)[0]
+
+            async def fake_normalize(_prompt):
+                return json.dumps(
+                    [
+                        {"source_event_id": event.id, "plain": "喜欢美式", "keywords": [],
+                         "subject": "self", "attribute": "likes", "value": "美式", "write_op": "create"},
+                        {"source_event_id": event.id, "plain": "不喜欢拿铁", "keywords": [],
+                         "subject": "self", "attribute": "likes", "value": "不拿铁", "write_op": "create"},
+                    ],
+                    ensure_ascii=False,
+                )
+
+            async def fake_verify(_prompt):
+                return json.dumps(
+                    [
+                        {"index": 0, "pass": True, "reason": "", "fix_hint": ""},
+                        {"index": 1, "pass": False, "reason": "加戏", "fix_hint": ""},
+                    ],
+                    ensure_ascii=False,
+                )
+
+            extractor = Extractor(store, engine, llm=fake_normalize)
+            pipe = MemoryPipeline(
+                store, engine, extractor,
+                {"extract_min_messages": 1, "pipeline_batch_size": 8, "pipeline_max_revisions": 0},
+                None, llm=fake_normalize, verify_llm=fake_verify, is_owner_speaker=lambda _s: False,
+            )
+            result = asyncio.run(pipe.run(force=True))
+            self.assertEqual(result["written"], 1)
+            self.assertEqual(result["pending"], 1)
+        finally:
+            store.close()
+
+    def test_dedup_bypasses_cache(self):
+        self.engine.ingest(_payload(speaker="u1", value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        fact = self.store.live_by_slot("u1", "self", "likes", value="茶")
+        retriever = Retriever(self.store)
+        r1 = asyncio.run(retriever.retrieve("喜欢什么", "u1"))
+        self.assertIn(fact.id, {f.id for f in r1.core + r1.related})
+        r2 = asyncio.run(retriever.retrieve("喜欢什么", "u1", skip_ids={fact.id}))
+        self.assertNotIn(fact.id, {f.id for f in r2.core + r2.related})
+        self.assertIn("recently_injected", {h.filter_reason for h in r2.blocked})
+
+    def test_ingest_resolves_alias(self):
+        self.store.set_alias("savage", "2412260046")
+        r = self.engine.ingest(_payload(speaker="savage", value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        self.assertEqual(self.store.get_fact(r["fact_id"]).speaker_id, "2412260046")
+
+    def test_reassign_moves_pending_reviews(self):
+        rid = self.store.add_memory_review(
+            scope="owner", speaker_id="savage", speaker_name="savage",
+            raw_text="x", plain="x",
+        )
+        self.store.reassign_speaker("savage", "2412260046", "主人")
+        self.assertEqual(self.store.get_memory_review(rid).speaker_id, "2412260046")
+
+    def test_pinned_conflict_goes_pending(self):
+        r1 = self.engine.ingest(_payload(speaker="u1", value="美式", content="我喜欢喝美式"), "我喜欢喝美式")
+        self.store.set_pinned(r1["fact_id"], True)
+        r2 = self.engine.ingest(
+            _payload(speaker="u1", value="不美式", content="我不喜欢喝美式了", explicit_correction=1),
+            "我不喜欢喝美式了",
+        )
+        self.assertEqual(r2["action"], "pending")
+        self.assertEqual(r2["reason"], "pinned_needs_confirm")
+        self.assertEqual(self.store.get_fact(r1["fact_id"]).status, "live")
+        self.assertEqual(self.store.live_by_slot("u1", "self", "likes", value="美式").value, "美式")
+
+    def test_pinned_survives_slot_conflict_resolution(self):
+        from savagetype.slots import apply_slot
+
+        r1 = self.engine.ingest(_payload(speaker="u1", value="美式", content="我喜欢喝美式"), "我喜欢喝美式")
+        self.store.update_fact(r1["fact_id"], updated_at=100)
+        self.store.set_pinned(r1["fact_id"], True)
+        payload = apply_slot(
+            {
+                "subject": "self", "attribute": "likes", "value": "不美式",
+                "content": "我不喜欢喝美式了", "speaker_id": "u1", "speaker_name": "u1",
+                "confidence": 0.9, "first_person": 1,
+            }
+        )
+        b_id = self.store.add_fact(payload)
+        self.store.resolve_all_slot_conflicts()
+        self.assertEqual(self.store.get_fact(r1["fact_id"]).status, "live")
+        self.assertEqual(self.store.get_fact(b_id).status, "archived")
+
+    def test_pipeline_conflict_pending_not_counted(self):
+        from savagetype.extract import Extractor
+        from savagetype.pipeline import MemoryPipeline
+        from savagetype.util import now_ts
+
+        store = Store(Path(self.tmp.name) / "pc.db")
+        try:
+            engine = ContradictionEngine(store, high_evidence=0.8)
+            r1 = engine.ingest(_payload(speaker="u1", value="茶", content="我喜欢喝茶", confidence=0.9), "我喜欢喝茶")
+            store.update_fact(r1["fact_id"], access_count=2, confidence=0.9)
+            store.add_timeline(
+                {
+                    "ts": now_ts(), "speaker_id": "u1", "speaker_name": "u", "bot_id": "b",
+                    "window_tag": "aiocqhttp:GroupMessage:1", "role": "user",
+                    "content": "我不喜欢喝茶", "fingerprint": "pc-1",
+                }
+            )
+            event = store.unsummarized(10)[0]
+
+            async def fake_normalize(_prompt):
+                return json.dumps(
+                    [{"source_event_id": event.id, "plain": "不喜欢喝茶", "keywords": [],
+                      "subject": "self", "attribute": "likes", "value": "不茶", "write_op": "create"}],
+                    ensure_ascii=False,
+                )
+
+            async def fake_verify(_prompt):
+                return json.dumps([{"index": 0, "pass": True, "reason": "", "fix_hint": ""}], ensure_ascii=False)
+
+            extractor = Extractor(store, engine, llm=fake_normalize)
+            pipe = MemoryPipeline(
+                store, engine, extractor,
+                {"extract_min_messages": 1, "pipeline_batch_size": 8, "pipeline_max_revisions": 0},
+                None, llm=fake_normalize, verify_llm=fake_verify, is_owner_speaker=lambda _s: False,
+            )
+            result = asyncio.run(pipe.run(force=True))
+            self.assertEqual(result["written"], 0)
+            self.assertEqual(store.counts()["pending"], 1)
+            self.assertEqual(store.live_by_slot("u1", "self", "likes", value="茶").value, "茶")
+        finally:
+            store.close()
+
+    def test_pipeline_revise_drop_goes_pending(self):
+        from savagetype.extract import Extractor
+        from savagetype.pipeline import MemoryPipeline
+        from savagetype.util import now_ts
+
+        store = Store(Path(self.tmp.name) / "revise.db")
+        try:
+            engine = ContradictionEngine(store)
+            store.add_timeline(
+                {
+                    "ts": now_ts(), "speaker_id": "u1", "speaker_name": "u", "bot_id": "b",
+                    "window_tag": "aiocqhttp:GroupMessage:1", "role": "user",
+                    "content": "我喜欢喝茶", "fingerprint": "revise-1",
+                }
+            )
+            event = store.unsummarized(10)[0]
+
+            async def fake_normalize(_prompt):
+                return json.dumps(
+                    [{"source_event_id": event.id, "plain": "喜欢喝茶", "keywords": [],
+                      "subject": "self", "attribute": "likes", "value": "茶", "write_op": "create"}],
+                    ensure_ascii=False,
+                )
+
+            async def fake_verify(_prompt):
+                return json.dumps(
+                    [{"index": 0, "pass": False, "reason": "加戏", "fix_hint": "删掉"}],
+                    ensure_ascii=False,
+                )
+
+            async def fake_revise(_prompt):
+                return "[]"
+
+            extractor = Extractor(store, engine, llm=fake_normalize)
+            pipe = MemoryPipeline(
+                store, engine, extractor,
+                {"extract_min_messages": 1, "pipeline_batch_size": 8, "pipeline_max_revisions": 1},
+                None, llm=fake_revise, verify_llm=fake_verify, is_owner_speaker=lambda _s: False,
+            )
+            result = asyncio.run(pipe.run(force=True))
+            self.assertEqual(result["written"], 0)
+            self.assertEqual(result["pending"], 1)
+            self.assertEqual(len(store.list_memory_reviews("pending")), 1)
+        finally:
+            store.close()
+
+    def test_heuristic_skips_hearsay_preference(self):
+        from savagetype.extract import Extractor
+
+        self.store.add_timeline(
+            {
+                "ts": 1, "speaker_id": "u1", "speaker_name": "阿U", "bot_id": "b",
+                "window_tag": "aiocqhttp:GroupMessage:1", "role": "user",
+                "content": "我喜欢猫，朋友说不喜欢狗", "fingerprint": "hearsay-1",
+            }
+        )
+        facts = Extractor(self.store, self.engine).extract_heuristic(self.store.unsummarized(10))
+        values = {f["value"] for f in facts if f["attribute"] == "likes"}
+        self.assertIn("猫", values)
+        self.assertNotIn("不狗", values)
+        self.assertNotIn("狗", values)
+
+    def test_profile_includes_alias_facts(self):
+        from savagetype.profiles import build_profile
+
+        self.store.set_alias("old-id", "new-id")
+        self.engine.ingest(_payload(speaker="old-id", value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        ids = self.store.speaker_ids_for("new-id")
+        facts = self.store.live_by_speaker("new-id", speaker_ids=ids, limit=20)
+        card = build_profile("new-id", facts, speaker_name="某人", speaker_ids=ids)
+        self.assertTrue(any("茶" in line for line in card["lines"]))
+
+    def test_llm_likes_with_negated_content_flips(self):
+        from savagetype.slots import apply_slot
+
+        cleaned = apply_slot(
+            {
+                "subject": "self",
+                "attribute": "likes",
+                "value": "拿铁",
+                "content": "我不喜欢拿铁",
+                "speaker_id": "u1",
+            }
+        )
+        self.assertEqual(cleaned["attribute"], "likes")
+        self.assertTrue(cleaned["value"].startswith("不"))
+
+    def test_empty_profile_cleanup_keeps_archived_facts(self):
+        self.engine.ingest(_payload(speaker="u1", value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        self.store.upsert_profile("u1", "阿U", "aiocqhttp")
+        fact = self.store.live_by_slot("u1", "self", "likes", value="茶")
+        self.store.archive_facts([fact.id])
+        self.store.execute("UPDATE profiles SET last_seen=1 WHERE speaker_id='u1'")
+        self.assertEqual(self.store.delete_empty_profiles(ttl_days=7), 0)
+        self.assertIsNotNone(self.store.get_profile("u1"))
+
+    def test_archive_decayed_targets_oldest(self):
+        from savagetype.archive import archive_decayed
+        from savagetype.util import now_ts
+
+        ids = []
+        for i, value in enumerate(["a", "b", "c"]):
+            r = self.engine.ingest(_payload(speaker="u1", value=value, content=f"我喜欢{value}"), f"我喜欢{value}")
+            self.store.update_fact(
+                r["fact_id"], importance=0.05, updated_at=now_ts() - (90 - i) * 86400
+            )
+            ids.append(r["fact_id"])
+        self.assertEqual(
+            archive_decayed(self.store, min_age_days=30, threshold=0.12, limit=1), 1
+        )
+        self.assertEqual(self.store.get_fact(ids[0]).status, "archived")
+        self.assertEqual(self.store.get_fact(ids[2]).status, "live")
+
+    def test_memory_review_dedupe_by_source(self):
+        rid1 = self.store.add_memory_review(
+            scope="person", speaker_id="u1", source_event_id=5, raw_text="x", plain="y"
+        )
+        rid2 = self.store.add_memory_review(
+            scope="person", speaker_id="u1", source_event_id=5, raw_text="x", plain="y"
+        )
+        self.assertEqual(rid1, rid2)
+        self.assertEqual(len(self.store.list_memory_reviews("pending")), 1)
+
+    def test_idle_trigger_processes_small_batch(self):
+        from savagetype.util import now_ts
+
+        service = self._service(
+            extract_idle_seconds=1,
+            pipeline_enabled=False,
+            extract_min_messages=8,
+        )
+        self.store.add_timeline(
+            {
+                "ts": now_ts() - 3600, "speaker_id": "u1", "speaker_name": "u",
+                "bot_id": "b", "window_tag": "aiocqhttp:GroupMessage:1", "role": "user",
+                "content": "我喜欢喝茶", "fingerprint": "idle-int",
+            }
+        )
+        result = asyncio.run(service.maybe_extract())
+        self.assertTrue(result.get("idle"))
+        self.assertIsNotNone(self.store.live_by_slot("u1", "self", "likes", value="茶"))
+
+    def test_dedup_is_per_window(self):
+        self.engine.ingest(_payload(speaker="u1", value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        service = self._service()
+        r1 = asyncio.run(service.build_injection("我喜欢什么", "u1", window_tag="w-a"))
+        self.assertTrue(r1[1].core or r1[1].related)
+        r2 = asyncio.run(service.build_injection("我喜欢什么", "u1", window_tag="w-b"))
+        self.assertTrue(r2[1].core or r2[1].related)
+        r3 = asyncio.run(service.build_injection("我喜欢什么", "u1", window_tag="w-a"))
+        self.assertEqual(r3[2]["dedup"], 1)
+        self.assertEqual([f.id for f in r3[1].core], [])
+
+    def test_sleep_prunes_jargon_and_stale_pending(self):
+        from savagetype.archive import expire_pending_overrides, prune_jargon_stats
+
+        self.store.bump_jargon("孤词", persona_id="p")
+        self.store.execute("UPDATE jargon_stats SET last_seen=1 WHERE term='孤词'")
+        self.assertEqual(prune_jargon_stats(self.store, min_age_days=30), 1)
+        self.assertEqual(self.store.hot_jargon(min_count=1), [])
+
+        pending_id = self.store.add_pending(0, {"subject": "self"}, "joke_or_banter")
+        self.store.execute("UPDATE pending_overrides SET created_at=1 WHERE id=?", (pending_id,))
+        self.assertEqual(expire_pending_overrides(self.store, max_age_days=30), 1)
+        self.assertEqual(self.store.pending_open(), [])
+
+    def test_both_pinned_duplicates_stay_live(self):
+        from savagetype.slots import apply_slot
+
+        a = self.engine.ingest(_payload(speaker="u1", value="美式", content="我喜欢喝美式"), "我喜欢喝美式")
+        self.store.set_pinned(a["fact_id"], True)
+        payload = apply_slot(
+            {
+                "subject": "self", "attribute": "likes", "value": "不美式",
+                "content": "我不喜欢喝美式了", "speaker_id": "u1", "speaker_name": "u1",
+                "confidence": 0.9, "first_person": 1,
+            }
+        )
+        b_id = self.store.add_fact(payload)
+        self.store.set_pinned(b_id, True)
+        self.store.resolve_all_slot_conflicts()
+        self.assertEqual(self.store.get_fact(a["fact_id"]).status, "live")
+        self.assertEqual(self.store.get_fact(b_id).status, "live")
+
+    def test_reset_clears_transient_meta(self):
+        self.store.set_meta("capture_skip", '{"reason":"platform:webchat"}')
+        self.store.set_meta("notify_last_at", "123")
+        self.store.set_meta("owner_umo", "default:FriendMessage:1")
+        self.store.clear_dirty_v280()
+        self.assertIsNone(self.store.get_meta("capture_skip"))
+        self.assertIsNone(self.store.get_meta("notify_last_at"))
+        self.assertEqual(self.store.get_meta("owner_umo"), "default:FriendMessage:1")
+
+    def test_alias_chain_resolves(self):
+        self.store.set_alias("a", "b")
+        self.store.set_alias("b", "c")
+        self.assertEqual(self.store.resolve_speaker("a"), "c")
+        self.assertEqual(self.store.resolve_speaker("b"), "c")
+        self.assertEqual(self.store.resolve_speaker("c"), "c")
+
+    def test_apply_config_keeps_cache_until_change(self):
+        import time as _time
+
+        service = self._service()
+        service.retriever._cache["k"] = (_time.time(), None)
+        service.apply_config()
+        self.assertIn("k", service.retriever._cache)
+        service.config["retrieval_mode"] = "basic"
+        service.apply_config()
+        self.assertNotIn("k", service.retriever._cache)
+
+    def test_export_import_roundtrip_new_tables(self):
+        from savagetype.archive import import_jsonl
+
+        service = self._service()
+        self.engine.ingest(_payload(speaker="u1", value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        self.store.upsert_profile("u1", "阿U", "aiocqhttp")
+        self.store.add_memory_review(
+            scope="person", speaker_id="u1", raw_text="我喜欢喝茶", plain="喜欢喝茶"
+        )
+        path = Path(self.tmp.name) / "exp.jsonl"
+        service.export_jsonl(path)
+        store2 = Store(Path(self.tmp.name) / "imported.db")
+        try:
+            result = import_jsonl(store2, path)
+            self.assertGreaterEqual(result["facts"], 1)
+            self.assertGreaterEqual(result["profiles"], 1)
+            self.assertGreaterEqual(result["memory_reviews"], 1)
+            self.assertIsNotNone(store2.get_profile("u1"))
+        finally:
+            store2.close()
+
+    def test_embedding_auto_threshold_zero_disables(self):
+        service = self._service(embedding_auto_threshold=0)
+        self.assertFalse(service.embedding_wanted())
+
+    def test_owner_reply_bare_words(self):
+        service = self._service(owner_qq="owner")
+        rid = self.store.add_memory_review(
+            scope="owner", speaker_id="owner", speaker_name="主人",
+            raw_text="我喜欢喝茶", plain="喜欢喝茶",
+            payload=_payload(speaker="owner", value="茶", content="我喜欢喝茶"),
+        )
+        self.assertIsNone(asyncio.run(service.handle_owner_reply("删除")))
+        self.assertIsNotNone(self.store.get_memory_review(rid))
+        reply = asyncio.run(service.handle_owner_reply("是"))
+        self.assertIn("已通过", reply)
+
+    def test_dedup_persists_across_service_instances(self):
+        self.engine.ingest(_payload(speaker="u1", value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        first = self._service()
+        r1 = asyncio.run(first.build_injection("我喜欢什么", "u1", window_tag="w1"))
+        self.assertTrue(r1[1].core or r1[1].related)
+        second = self._service()  # 模拟插件重载：新实例，同一个库
+        r2 = asyncio.run(second.build_injection("我喜欢什么", "u1", window_tag="w1"))
+        self.assertEqual(r2[2]["dedup"], 1)
+        self.assertEqual([f.id for f in r2[1].core], [])
 
 
 if __name__ == "__main__":

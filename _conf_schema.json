@@ -63,8 +63,26 @@
   "inject_budget_chars": {
     "description": "注入字数预算",
     "type": "int",
-    "hint": "记忆包最大汉字/字符数。不含包装说明时也会被截断到此预算。",
+    "hint": "记忆包最大汉字/字符数。不含包装说明时也会被截断到此预算。0=不限。",
     "default": 800
+  },
+  "provider_timeout_seconds": {
+    "description": "Embedding/Rerank 超时（秒）",
+    "type": "int",
+    "hint": "单次 Embedding 或 Rerank 调用的等待上限；超时会回退到关键词检索并记 provider_timeout 诊断，不拖死回复。0=不限。",
+    "default": 5
+  },
+  "inject_warm_triggered": {
+    "description": "约定/近况按需注入",
+    "type": "bool",
+    "hint": "开启后，只有在消息谈到约定或近况（触发词或主题命中）时才注入这两块，平时不占预算。关闭则回到每轮都注入。",
+    "default": true
+  },
+  "inject_novelty_filter": {
+    "description": "已提到的事实不重复注入",
+    "type": "bool",
+    "hint": "开启后，用户当前消息里已经说到的记忆值（如刚说「感冒了」）不再重复注入。0 秒去重窗口之外的额外一层。",
+    "default": true
   },
   "core_fact_limit": {
     "description": "常驻核心事实条数",
@@ -217,6 +235,12 @@
     "hint": "着色器第三层虹彩色。默认 #f472b6（与主色、副色 1 组成极光三色）。",
     "default": "#f472b6"
   },
+  "ui_dynamic_colors": {
+    "description": "动态颜色",
+    "type": "bool",
+    "hint": "开启后按「极光 → 碧金 → 暮霞 → 午夜 → 森林」顺序循环，每 1 秒停留、5 秒平滑过渡（背景与界面强调色一起变）。手动点预设会关闭；系统「减少动态效果」时不播放。",
+    "default": false
+  },
   "learning_enabled": {
     "description": "启用自主学习",
     "type": "bool",
@@ -328,9 +352,15 @@
   "image_caption_provider_id": {
     "description": "图片转述模型",
     "type": "string",
-    "hint": "留空=不额外调用模型，只使用 AstrBot 已生成的图片转述（如果有）。填了之后，图片消息会用该对话模型转述并写入记忆。",
+    "hint": "留空=图片消息只记一条 [图片] 占位，不调用模型。选了对话/视觉模型后，会用它转述图片并写入记忆。",
     "default": "",
     "_special": "select_provider"
+  },
+  "image_caption_timeout_seconds": {
+    "description": "图片转述超时（秒）",
+    "type": "int",
+    "hint": "转述模型的等待上限，超时该条图片只记 [图片] 占位。慢模型可调大；0=不转述。",
+    "default": 30
   },
   "memory_whitelist": {
     "description": "记忆白名单",

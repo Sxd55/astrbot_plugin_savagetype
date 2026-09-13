@@ -389,6 +389,22 @@ textarea { width: 100%; min-height: 76px; resize: vertical; }
 
 /* ---------- Settings ---------- */
 
+.setting-group {
+  border: 1px solid var(--sg-border);
+  border-radius: var(--sg-radius-sm);
+  padding: 12px 16px;
+  margin-bottom: 14px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.setting-group > summary {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--sg-text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.setting-group[open] > summary { margin-bottom: 12px; }
 .settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px 24px; }
 .setting { display: flex; flex-direction: column; gap: 6px; }
 .setting > label { font-weight: 600; color: var(--sg-text); }

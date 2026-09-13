@@ -9,6 +9,7 @@ let editingReviewId = 0;
 let currentProfileId = "";
 let profilesCache = [];
 let memoryCache = [];
+let memoryMode = "owner";
 
 function unwrap(result) {
   if (result && typeof result === "object" && "status" in result && "data" in result) {
@@ -84,16 +85,17 @@ function speakerLabel(name, id) {
 
 const THEME_PRESETS = [
   { name: "极光", a: "#7c5cff", b: "#22d3ee", c: "#f472b6" },
-  { name: "深海", a: "#22d3ee", b: "#3b82f6", c: "#7c5cff" },
-  { name: "玫瑰", a: "#f472b6", b: "#fb7185", c: "#7c5cff" },
-  { name: "翡翠", a: "#34d399", b: "#22d3ee", c: "#a3e635" },
-  { name: "琥珀", a: "#f59e0b", b: "#f472b6", c: "#7c5cff" },
+  { name: "碧金", a: "#14b8a6", b: "#fbbf24", c: "#38bdf8" },
+  { name: "暮霞", a: "#7c3aed", b: "#ec4899", c: "#fb923c" },
+  { name: "午夜", a: "#2563eb", b: "#8b5cf6", c: "#f472b6" },
+  { name: "森林", a: "#10b981", b: "#22d3ee", c: "#818cf8" },
 ];
 
 const PROVIDER_KEYS = {
   summary_provider_id: "chat",
   normalize_provider_id: "chat",
   verify_provider_id: "chat",
+  image_caption_provider_id: "chat",
   embedding_provider_id: "embedding",
   rerank_provider_id: "rerank",
 };
@@ -142,6 +144,90 @@ function applyTheme(color, color2, color3) {
   root.setProperty("--on-accent", onColor(raw));
 
   if (shaderControls) shaderControls.setColors(raw, raw2, raw3);
+}
+
+const PREFERS_REDUCED = Boolean(
+  window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches
+);
+const DYNAMIC_DWELL_MS = 1000;
+const DYNAMIC_MORPH_MS = 5000;
+let dynamicOn = false;
+let dynamicFrame = 0;
+
+function lerpHex(a, b, t) {
+  const ra = [1, 3, 5].map((i) => parseInt(a.slice(i, i + 2), 16));
+  const rb = [1, 3, 5].map((i) => parseInt(b.slice(i, i + 2), 16));
+  const out = ra.map((v, i) => Math.round(v + (rb[i] - v) * t));
+  return `#${out.map((v) => Math.max(0, Math.min(255, v)).toString(16).padStart(2, "0")).join("")}`;
+}
+
+function easeInOut(t) {
+  return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+}
+
+function updateDynamicButton() {
+  const btn = $("dynamic-toggle");
+  if (!btn) return;
+  btn.textContent = dynamicOn ? "动态颜色：开" : "动态颜色：关";
+  btn.classList.toggle("on", dynamicOn);
+  btn.classList.toggle("ghost", !dynamicOn);
+  // 设置表单里的同名复选框同步，否则点「保存设置」会用旧值把动态颜色关掉。
+  const box = document.querySelector('#settings-form [name="ui_dynamic_colors"]');
+  if (box) box.checked = dynamicOn;
+}
+
+function startDynamic() {
+  if (dynamicOn || PREFERS_REDUCED) return;
+  dynamicOn = true;
+  updateDynamicButton();
+  let idx = THEME_PRESETS.findIndex(
+    (p) => p.a === themeState.color && p.b === themeState.color2 && p.c === themeState.color3
+  );
+  if (idx < 0) idx = 0;
+  let from = [themeState.color, themeState.color2, themeState.color3];
+  let target = null;
+  let phase = "hold";
+  let holdUntil = performance.now() + DYNAMIC_DWELL_MS;
+  let morphStart = 0;
+  const step = () => {
+    if (!dynamicOn) return;
+    const now = performance.now();
+    if (phase === "hold") {
+      if (now >= holdUntil) {
+        idx = (idx + 1) % THEME_PRESETS.length;
+        const preset = THEME_PRESETS[idx];
+        target = [preset.a, preset.b, preset.c];
+        from = [themeState.color, themeState.color2, themeState.color3];
+        morphStart = now;
+        phase = "morph";
+      }
+    } else {
+      const t = Math.min(1, (now - morphStart) / DYNAMIC_MORPH_MS);
+      const e = easeInOut(t);
+      applyTheme(
+        lerpHex(from[0], target[0], e),
+        lerpHex(from[1], target[1], e),
+        lerpHex(from[2], target[2], e)
+      );
+      if (t >= 1) {
+        phase = "hold";
+        holdUntil = now + DYNAMIC_DWELL_MS;
+      }
+    }
+    dynamicFrame = requestAnimationFrame(step);
+  };
+  dynamicFrame = requestAnimationFrame(step);
+}
+
+function stopDynamic(save) {
+  const was = dynamicOn;
+  dynamicOn = false;
+  if (dynamicFrame) {
+    cancelAnimationFrame(dynamicFrame);
+    dynamicFrame = 0;
+  }
+  updateDynamicButton();
+  if (save && was) apiPost("ui/dynamic", { enabled: false }).catch(() => {});
 }
 
 function renderThemeControls(color, color2, color3) {
@@ -212,6 +298,7 @@ function factCard(f, where) {
     <div class="item-head">
       <span class="chip">${esc(f.attribute)}</span>
       ${f.kind ? `<span class="chip gray">${esc(f.kind)}</span>` : ""}
+      ${f.topic ? `<span class="chip gray">领域 ${esc(f.topic)}</span>` : ""}
       <span class="chip gray">${esc(who)}</span>
       ${reviewBadge(f.review_status)}
       ${f.pinned ? `<span class="chip">置顶</span>` : ""}
@@ -253,7 +340,12 @@ async function loadOverview() {
     const skipText = skip ? `上次采集跳过：${skip.reason}（${skip.platform || "?"}）。` : "";
     $("owner-line").textContent = `${ownerText} 允许平台：${platforms}。${skipText}`;
   }
-  applyTheme(cfg.theme_color, cfg.theme_color2, cfg.theme_color3);
+  if (!dynamicOn) applyTheme(cfg.theme_color, cfg.theme_color2, cfg.theme_color3);
+  if (cfg.dynamic_colors && !dynamicOn) startDynamic();
+  if (!cfg.dynamic_colors && dynamicOn) {
+    stopDynamic(false);
+    applyTheme(cfg.theme_color, cfg.theme_color2, cfg.theme_color3);
+  }
 
   const box = $("alias-suggestions");
   if (box) {
@@ -266,9 +358,19 @@ async function loadOverview() {
   const sel = $("remember-speaker");
   if (sel) {
     const speakers = ov.speakers || [{ id: "admin", name: "admin" }];
+    const prev = sel.value;
     sel.innerHTML = speakers.map((s) =>
       `<option value="${esc(s.id)}">${esc(s.name)} (${esc(s.id)})</option>`
     ).join("");
+    if (prev && speakers.some((s) => s.id === prev)) {
+      sel.value = prev;
+    } else {
+      const ownerIds = (ov.owner && ov.owner.ids) || [];
+      const ownerId = ownerIds.find((id) => speakers.some((s) => s.id === id))
+        || (ov.owner && ov.owner.qq)
+        || "";
+      if (ownerId && speakers.some((s) => s.id === ownerId)) sel.value = ownerId;
+    }
   }
   const pathBox = $("archive-path");
   if (pathBox && !pathBox.value && ov.data_dir) {
@@ -278,14 +380,36 @@ async function loadOverview() {
   showDiag({ overview: ov });
 }
 
+function applyMemoryMode() {
+  const isBot = memoryMode === "bot";
+  if ($("memory-title")) $("memory-title").textContent = isBot ? "Savage 记忆" : "主人记忆";
+  if ($("memory-lede")) {
+    $("memory-lede").textContent = isBot
+      ? "Bot 自己的记忆（主体是 bot），由 AI 整理聊天时自动写入。"
+      : "主人（QQ 或 ChatUI）的指令与自述，经 AI 缩写和审核后写入；这些内容全局可注入。";
+  }
+  const tools = $("memory-owner-tools");
+  if (tools) tools.hidden = isBot;
+  const botTools = $("memory-bot-tools");
+  if (botTools) botTools.hidden = !isBot;
+  document.querySelectorAll('[data-act="memory-switch"]').forEach((b) => {
+    const on = b.dataset.mode === memoryMode;
+    b.classList.toggle("on", on);
+    b.classList.toggle("ghost", !on);
+  });
+}
+
 async function loadMemory() {
-  const q = $("memory-q") ? $("memory-q").value.trim() : "";
-  const data = await apiGet("memory", q ? { q } : {});
+  const isBot = memoryMode === "bot";
+  const q = !isBot && $("memory-q") ? $("memory-q").value.trim() : "";
+  const data = await apiGet(isBot ? "memory/bot" : "memory", q ? { q } : {});
   memoryCache = data.items || [];
   const box = $("memory-list");
   if (!box) return;
   if (!memoryCache.length) {
-    box.innerHTML = `<p class="lede">还没有主人记忆。主人在 QQ 里说「记住/我喜欢/以后…」并审核通过后会出现。</p>`;
+    box.innerHTML = isBot
+      ? `<p class="lede">Savage 还没有自己的记忆。Bot 在聊天里自述「记住/我喜欢…」并被 AI 整理后会出现。</p>`
+      : `<p class="lede">还没有主人记忆。主人（QQ 或 ChatUI）说「记住/我喜欢/以后…」并审核通过后会出现。</p>`;
     return;
   }
   box.innerHTML = memoryCache.map((f) => (
@@ -337,6 +461,21 @@ async function loadMemoryPending() {
   }).join("");
 }
 
+async function loadDiagnostics() {
+  const data = await apiGet("diagnostics");
+  const items = data.items || [];
+  const lines = items.slice(0, 15).map((it) => {
+    let payload = "";
+    try {
+      payload = JSON.stringify(it.payload);
+    } catch (err) {
+      payload = String(it.payload);
+    }
+    return `#${it.id} ${it.kind} ${payload.slice(0, 200)}`;
+  }).join("\n");
+  showDiag(`诊断条目（最近 ${items.length} 条）：\n${lines}\n\n总览：\n${JSON.stringify(data.overview, null, 2)}`);
+}
+
 async function loadArchived() {
   const box = $("archive-list");
   if (!box) return;
@@ -375,6 +514,14 @@ async function loadReviews() {
     : `<p class="lede">没有待审学习项。</p>`;
 }
 
+const PENDING_REASON_LABELS = {
+  joke_or_banter: "玩笑待确认",
+  pinned_needs_confirm: "置顶冲突待确认",
+  not_first_person_or_correction: "非第一人称/非纠正",
+  high_evidence_needs_confirm: "高证据冲突待确认",
+  domain_needs_confirm: "疑似同词不同义（通过=存成两条）",
+};
+
 async function loadPending() {
   const data = await apiGet("pending");
   const items = data.items || [];
@@ -382,7 +529,7 @@ async function loadPending() {
   if (!box) return;
   box.innerHTML = items.length
     ? items.map((p) => `<div class="item">
-        <div>#${esc(p.id)} ← old ${esc(p.old_fact_id)} · ${esc(p.reason)}</div>
+        <div>#${esc(p.id)} ← old ${esc(p.old_fact_id)} · ${esc(PENDING_REASON_LABELS[p.reason] || p.reason)}</div>
         <div class="actions">
           <button type="button" class="tiny" data-act="pending-confirm" data-id="${esc(p.id)}">确认覆盖</button>
           <button type="button" class="ghost tiny" data-act="pending-reject" data-id="${esc(p.id)}">驳回</button>
@@ -399,13 +546,24 @@ async function loadMicroscope() {
   box.innerHTML = items.length
     ? items.map((it) => {
         const p = it.payload || {};
+        const core = p.core || [];
+        const related = p.related || [];
+        const blocked = p.blocked || [];
+        const reasons = {};
+        blocked.forEach((b) => {
+          const key = b.reason || "?";
+          reasons[key] = (reasons[key] || 0) + 1;
+        });
+        const reasonText = Object.entries(reasons).map(([k, n]) => `${k}×${n}`).join("、");
         return `<div class="item">
           <div class="item-head">
             <span class="chip">${esc(p.route)}</span>
             <span class="chip gray">${esc(speakerLabel("", p.speaker_id))}</span>
+            <span class="chip gray">dedup ${esc(p.dedup ?? 0)}</span>
           </div>
           <div>${esc(p.query || "")}</div>
-          <div class="meta">chars=${esc(p.pack_chars)} · core=${esc(p.core)} related=${esc(p.related)} · ${esc(fmtTime(it.ts))}</div>
+          <div class="meta">chars=${esc(p.pack_chars)}${p.pack_tokens ? `（≈${esc(p.pack_tokens)} tok）` : ""} · core ${core.length} 条 [${esc(core.join(","))}] · related ${related.length} 条 [${esc(related.join(","))}]${reasonText ? ` · 过滤 ${esc(reasonText)}` : ""} · ${esc(fmtTime(it.ts))}</div>
+          ${p.window ? `<div class="meta">窗口 …${esc(String(p.window).slice(-30))}</div>` : ""}
         </div>`;
       }).join("")
     : `<p class="lede">还没有注入记录。</p>`;
@@ -506,14 +664,39 @@ function fieldControl(key, spec, value, providers) {
     ${hint}</div>`;
 }
 
+const SETTING_GROUPS = [
+  { title: "总开关与采集", keys: ["enabled", "capture_enabled", "inject_enabled", "owner_qq", "notify_umo", "memory_source_platforms", "memory_whitelist"] },
+  { title: "抽取与整理（AI 管线）", keys: ["extract_enabled", "pipeline_enabled", "summary_provider_id", "normalize_provider_id", "verify_provider_id", "extract_min_messages", "extract_cooldown_seconds", "extract_fail_cooldown_seconds", "extract_idle_seconds", "pipeline_max_revisions", "pipeline_batch_size", "pipeline_notify_cooldown_seconds"] },
+  { title: "检索与注入", keys: ["retrieval_mode", "provider_timeout_seconds", "inject_budget_chars", "inject_warm_triggered", "inject_novelty_filter", "top_k", "core_fact_limit", "related_fact_limit", "inject_dedup_window_seconds", "cache_ttl_seconds", "high_evidence_confidence", "debug_log_injection", "coexistence_degrade"] },
+  { title: "重要性与维护", keys: ["importance_weight", "importance_half_life_days", "importance_reinforce_factor", "importance_max_half_life_multiplier", "importance_prune_threshold", "sleep_timeline_retain_days", "sleep_low_value_days", "sleep_low_value_confidence", "empty_profile_ttl_days"] },
+  { title: "学习与人格草稿", keys: ["learning_enabled", "jargon_enabled", "jargon_min_count", "jargon_cooldown_seconds", "fewshot_enabled", "persona_draft_enabled", "persona_draft_min_fewshots", "persona_draft_cooldown_seconds", "persona_draft_ttl_seconds", "inject_jargon_limit", "inject_fewshot_limit"] },
+  { title: "图片", keys: ["image_caption_provider_id", "image_caption_timeout_seconds"] },
+  { title: "Embedding 与 Rerank", keys: ["embedding_enabled", "embedding_auto_threshold", "embedding_provider_id", "rerank_provider_id"] },
+  { title: "界面配色", keys: ["ui_dynamic_colors", "ui_theme_color", "ui_theme_color2", "ui_theme_color3"] },
+];
+
+function groupSchema(schema) {
+  const used = new Set();
+  const groups = SETTING_GROUPS.map((g) => {
+    const entries = g.keys.filter((k) => schema[k]).map((k) => [k, schema[k]]);
+    entries.forEach(([k]) => used.add(k));
+    return { title: g.title, entries };
+  }).filter((g) => g.entries.length);
+  const rest = Object.entries(schema).filter(([k]) => !used.has(k));
+  if (rest.length) groups.push({ title: "其他", entries: rest });
+  return groups;
+}
+
 async function loadSettings() {
   const [data, providers] = await Promise.all([apiGet("config"), apiGet("providers")]);
   const schema = data.schema || {};
   const values = data.values || {};
   renderThemeControls(values.ui_theme_color, values.ui_theme_color2, values.ui_theme_color3);
-  $("settings-form").innerHTML = Object.entries(schema).map(([key, spec]) =>
-    fieldControl(key, spec, values[key], providers)
-  ).join("");
+  $("settings-form").innerHTML = groupSchema(schema).map((g) => `
+    <details class="setting-group">
+      <summary>${esc(g.title)}<span class="chip gray">${g.entries.length}</span></summary>
+      <div class="settings">${g.entries.map(([key, spec]) => fieldControl(key, spec, values[key], providers)).join("")}</div>
+    </details>`).join("");
 }
 
 async function saveTheme(color, color2, color3) {
@@ -542,6 +725,11 @@ async function reload() {
   await loadPending();
   await loadMicroscope();
   await loadArchived();
+  try {
+    await loadDiagnostics();
+  } catch (err) {
+    showDiag(String(err));
+  }
 }
 
 function showTab(name) {
@@ -575,6 +763,15 @@ function attachRipple(ev) {
   setTimeout(() => ripple.remove(), 520);
 }
 
+async function safe(fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    showDiag(String(err));
+    return null;
+  }
+}
+
 async function saveFactEdit(el) {
   const id = Number(el.dataset.id);
   const where = el.dataset.where || "memory";
@@ -583,7 +780,10 @@ async function saveFactEdit(el) {
   if (!plain) return { ok: false, error: "empty" };
   const body = { id, plain };
   const imp = document.querySelector(`input[data-edit-importance="${id}"]`);
-  if (imp && imp.value !== "") body.importance = Number(imp.value);
+  if (imp && imp.value !== "") {
+    const n = Number(imp.value);
+    if (Number.isFinite(n)) body.importance = n;
+  }
   const r = await apiPost("facts/update", body);
   editingFactId = 0;
   if (where === "profile") await loadProfile(currentProfileId);
@@ -606,6 +806,11 @@ async function onAct(act, el) {
     const r = await apiGet("export");
     return { ok: true, filename: r && r.filename };
   });
+  if (act === "memory-switch") return safe(async () => {
+    memoryMode = el.dataset.mode === "bot" ? "bot" : "owner";
+    applyMemoryMode();
+    await loadMemory();
+  });
   if (act === "memory-search") return run("已搜索", loadMemory);
   if (act === "memory-pass") return run("已通过", async () => {
     const r = await apiPost("memory/review", { id: Number(el.dataset.id), status: "approved" });
@@ -617,8 +822,18 @@ async function onAct(act, el) {
     await loadMemoryPending(); await loadOverview();
     return r;
   });
-  if (act === "memory-edit") { editingReviewId = Number(el.dataset.id); await loadMemoryPending(); return; }
-  if (act === "memory-edit-cancel") { editingReviewId = 0; await loadMemoryPending(); return; }
+  if (act === "memory-edit") {
+    return safe(async () => {
+      editingReviewId = Number(el.dataset.id);
+      await loadMemoryPending();
+    });
+  }
+  if (act === "memory-edit-cancel") {
+    return safe(async () => {
+      editingReviewId = 0;
+      await loadMemoryPending();
+    });
+  }
   if (act === "memory-pass-edit") return run("已过审", async () => {
     const id = Number(el.dataset.id);
     const area = document.querySelector(`textarea[data-edit-review="${id}"]`);
@@ -641,20 +856,23 @@ async function onAct(act, el) {
   if (act === "fact-restore") return run("已恢复", async () => {
     const r = await apiPost("facts/restore", { ids: [Number(el.dataset.id)] });
     await reload();
+    if (r && (r.blocked || []).length) toast("槽位已被占用，恢复被阻止");
     return r;
   });
   if (act === "fact-edit") {
-    editingFactId = Number(el.dataset.id);
-    editingFactWhere = el.dataset.where || "memory";
-    if (editingFactWhere === "profile") await loadProfile(currentProfileId);
-    else await loadMemory();
-    return;
+    return safe(async () => {
+      editingFactId = Number(el.dataset.id);
+      editingFactWhere = el.dataset.where || "memory";
+      if (editingFactWhere === "profile") await loadProfile(currentProfileId);
+      else await loadMemory();
+    });
   }
   if (act === "fact-edit-cancel") {
-    editingFactId = 0;
-    if (editingFactWhere === "profile") await loadProfile(currentProfileId);
-    else await loadMemory();
-    return;
+    return safe(async () => {
+      editingFactId = 0;
+      if (editingFactWhere === "profile") await loadProfile(currentProfileId);
+      else await loadMemory();
+    });
   }
   if (act === "fact-edit-save") return run("已保存", () => saveFactEdit(el));
   if (act === "fact-del") return run("已删除", async () => {
@@ -662,6 +880,20 @@ async function onAct(act, el) {
     if (el.dataset.where === "profile") await loadProfile(currentProfileId);
     else await loadMemory();
     await loadOverview();
+    await loadArchived();
+  });
+  if (act === "remember-bot") return run("已写入", async () => {
+    const content = $("remember-bot-text").value.trim();
+    if (!content) return { ok: false, error: "empty" };
+    const r = await apiPost("remember", {
+      content,
+      speaker_id: "bot_self",
+      speaker_name: "bot",
+      subject: "bot",
+    });
+    $("remember-bot-text").value = "";
+    await loadMemory(); await loadOverview();
+    return r;
   });
   if (act === "remember") return run("已写入", async () => {
     const content = $("remember-text").value.trim();
@@ -691,9 +923,11 @@ async function onAct(act, el) {
     await loadProfile(currentProfileId); await loadOverview();
     return r;
   });
-  if (act === "alias") return run("已映射", async () => {
-    await apiPost("aliases/set", { alias: el.dataset.alias, canonical_id: el.dataset.canonical });
-    await loadOverview();
+  if (act === "alias") return run("已归并", async () => {
+    const r = await apiPost("aliases/set", { alias: el.dataset.alias, canonical_id: el.dataset.canonical });
+    await reload();
+    if (r && (r.moved || 0) > 0) toast(`已迁移 ${r.moved} 条事实`);
+    return r;
   });
   if (act === "pending-confirm") return run("已确认覆盖", async () => { await apiPost("pending/confirm", { id: Number(el.dataset.id) }); await reload(); });
   if (act === "pending-reject") return run("已驳回", async () => { await apiPost("pending/reject", { id: Number(el.dataset.id) }); await reload(); });
@@ -708,12 +942,26 @@ async function onAct(act, el) {
     await reload();
     return r;
   });
-  if (act === "theme-preset") return run("主题已切换", () => saveTheme(el.dataset.a, el.dataset.b, el.dataset.c));
+  if (act === "theme-preset") return run("主题已切换", () => {
+    if (dynamicOn) stopDynamic(true);
+    return saveTheme(el.dataset.a, el.dataset.b, el.dataset.c);
+  });
   if (act === "theme-apply") {
+    if (dynamicOn) stopDynamic(true);
     return run("主题已切换", () =>
       saveTheme($("theme-color").value, $("theme-color2").value, $("theme-color3").value)
     );
   }
+  if (act === "dynamic-toggle") return run("已切换", async () => {
+    if (PREFERS_REDUCED) {
+      toast("系统已开启「减少动态效果」，动态颜色不可用");
+      return { ok: false, error: "reduce_motion" };
+    }
+    const next = !dynamicOn;
+    if (next) startDynamic();
+    else stopDynamic(false);
+    return apiPost("ui/dynamic", { enabled: next });
+  });
   if (act === "settings-save") return run("已保存设置", async () => { const r = await apiPost("config/save", { values: readSettings() }); await loadSettings(); await loadOverview(); return r; });
 }
 
@@ -726,7 +974,7 @@ document.addEventListener("click", (ev) => {
   const el = ev.target.closest("[data-act]");
   if (!el) return;
   ev.preventDefault();
-  onAct(el.dataset.act, el);
+  Promise.resolve(onAct(el.dataset.act, el)).catch((err) => showDiag(String(err)));
 });
 
 async function boot() {

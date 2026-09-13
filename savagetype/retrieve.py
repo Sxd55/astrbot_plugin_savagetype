@@ -11,10 +11,12 @@ from .store import Store
 from .util import (
     LOW_INFO_RE,
     RECALL_RE,
+    ROLE_BOT_ID,
     SCOPE_OWNER,
     STATUS_RE,
     TIME_WINDOW_RE,
     fact_weight,
+    normalize_slot,
     now_ts,
 )
 
@@ -154,30 +156,130 @@ class Retriever:
         speaker_ids: list[str] | None = None,
         skip_ids: set[int] | None = None,
         importance_cfg: dict[str, Any] | None = None,
+        skip_query_mentions: bool = False,
     ) -> RetrievalResult:
+        """检索 + 出包前过滤。
+
+        昂贵的部分（DB 扫描、打分、Embedding、Rerank）按 query 缓存；
+        去重与新颖度过滤在缓存结果上做，避免每轮都重跑昂贵路径。
+        """
+        bundle = await self._ranked_bundle(
+            query,
+            speaker_id,
+            top_k,
+            related_limit,
+            core_limit,
+            ask_other_id,
+            persona_id,
+            speaker_ids,
+            importance_cfg,
+        )
+        route = str(bundle["route"])
+        hits: list[RetrievalHit] = bundle["hits"]
+        blocked: list[RetrievalHit] = list(bundle["blocked"])
+        skip_ids = skip_ids or set()
+        dedup_route = route in {"long_term", "current_status"}
+
+        mentioned_ids: set[int] = set()
+        if skip_query_mentions:
+            query_norm = normalize_slot(query)
+            if query_norm:
+                for hit in hits:
+                    value_norm = normalize_slot(hit.fact.value or "")
+                    if len(value_norm) >= 2 and value_norm in query_norm:
+                        mentioned_ids.add(hit.fact.id)
+
+        if skip_ids or mentioned_ids:
+            filtered: list[RetrievalHit] = []
+            for hit in hits:
+                fact = hit.fact
+                if dedup_route and fact.id in skip_ids and not int(getattr(fact, "pinned", 0)):
+                    blocked.append(
+                        RetrievalHit(fact=fact, score=0, source="filter", filter_reason="recently_injected")
+                    )
+                    continue
+                if fact.id in mentioned_ids:
+                    blocked.append(
+                        RetrievalHit(fact=fact, score=0, source="filter", filter_reason="query_mentioned")
+                    )
+                    continue
+                filtered.append(hit)
+            hits = mmr(filtered, k=top_k) if len(filtered) != len(hits) else filtered
+
+        core, related, uncertain = self._slot(
+            hits, bundle["ids"], core_limit, related_limit, route
+        )
+        for fact in core + related:
+            # 原子自增，避免用缓存里的旧 access_count 回写。
+            self.store.bump_access(fact.id)
+
+        return RetrievalResult(
+            query=query,
+            route=route,
+            path=str(bundle["path"]),
+            cache=str(bundle["cache"]),
+            hits=hits,
+            blocked=blocked[:12],
+            core=core,
+            related=related,
+            uncertain=uncertain,
+            superseded=bundle["superseded"],
+        )
+
+    async def warm(
+        self,
+        query: str,
+        speaker_id: str,
+        top_k: int = 16,
+        related_limit: int = 6,
+        core_limit: int = 4,
+        ask_other_id: str | None = None,
+        persona_id: str = "",
+        speaker_ids: list[str] | None = None,
+        importance_cfg: dict[str, Any] | None = None,
+    ) -> None:
+        """预热缓存（供 on_waiting_llm_request 使用）；不写访问计数、不出包。"""
+        if self.cache_ttl <= 0:
+            return
+        await self._ranked_bundle(
+            query, speaker_id, top_k, related_limit, core_limit,
+            ask_other_id, persona_id, speaker_ids, importance_cfg,
+        )
+
+    async def _ranked_bundle(
+        self,
+        query: str,
+        speaker_id: str,
+        top_k: int,
+        related_limit: int,
+        core_limit: int,
+        ask_other_id: str | None,
+        persona_id: str,
+        speaker_ids: list[str] | None,
+        importance_cfg: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         route = classify_route(query)
         key = self.cache_key(query, speaker_id, persona_id)
-        cached = self._cache.get(key)
-        if cached and time.time() - cached[0] < self.cache_ttl:
-            result = cached[1]
-            result.cache = "hit"
-            return result
+        if self.cache_ttl > 0:
+            cached = self._cache.get(key)
+            if cached and time.time() - cached[0] < self.cache_ttl:
+                bundle = dict(cached[1])
+                bundle["cache"] = "hit"
+                return bundle
 
         if route == "low_info":
-            result = RetrievalResult(
-                query=query,
-                route=route,
-                path="skip",
-                cache="miss",
-                hits=[],
-                blocked=[],
-                core=[],
-                related=[],
-                uncertain=[],
-                superseded=[],
-            )
-            self._cache[key] = (time.time(), result)
-            return result
+            bundle: dict[str, Any] = {
+                "route": route,
+                "path": "skip",
+                "cache": "miss",
+                "hits": [],
+                "blocked": [],
+                "ids": [],
+                "superseded": [],
+            }
+            if self.cache_ttl > 0:
+                self._cache[key] = (time.time(), dict(bundle))
+            return bundle
 
         ids = list(speaker_ids or [speaker_id])
         candidates = self.store.live_facts(
@@ -186,6 +288,10 @@ class Retriever:
             persona_id=persona_id,
             speaker_ids=ids,
         )
+        # 主人条目单独并入，避免大库时被候选截断挤掉。
+        owner_facts = self.store.owner_facts(limit=200)
+        seen_ids = {f.id for f in candidates}
+        candidates.extend(f for f in owner_facts if f.id not in seen_ids)
         if ask_other_id:
             extra = self.store.live_facts(
                 speaker_id=ask_other_id,
@@ -198,12 +304,11 @@ class Retriever:
 
         blocked: list[RetrievalHit] = []
         visible: list[Fact] = []
-        dedup_ids = skip_ids or set()
-        dedup_route = route in {"long_term", "current_status"}
         for fact in candidates:
+            if fact.speaker_id == ROLE_BOT_ID:
+                # Bot 设定走独立块注入，不占检索槽位（避免被包构建剔除后空占名额）。
+                continue
             reason = self._visibility(fact, speaker_id, query, ask_other_id, route, ids, persona_id)
-            if not reason and dedup_route and fact.id in dedup_ids and not int(getattr(fact, "pinned", 0)):
-                reason = "recently_injected"
             if reason:
                 blocked.append(RetrievalHit(fact=fact, score=0, source="filter", filter_reason=reason))
             else:
@@ -262,32 +367,22 @@ class Retriever:
                 path = "fallback_basic"
 
         hits = mmr(hits, k=top_k)
-        core, related, uncertain = self._slot(hits, ids, core_limit, related_limit, route)
         superseded = []
         if route in {"recall", "long_term"}:
             superseded = self.store.recent_superseded(ids, persona_id=persona_id, limit=6)[:3]
 
-        for fact in core + related:
-            self.store.update_fact(
-                fact.id,
-                access_count=fact.access_count + 1,
-                last_accessed=now_ts(),
-            )
-
-        result = RetrievalResult(
-            query=query,
-            route=route,
-            path=path,
-            cache="miss",
-            hits=hits,
-            blocked=blocked[:12],
-            core=core,
-            related=related,
-            uncertain=uncertain,
-            superseded=superseded,
-        )
-        self._cache[key] = (time.time(), result)
-        return result
+        bundle = {
+            "route": route,
+            "path": path,
+            "cache": "miss",
+            "hits": hits,
+            "blocked": blocked[:12],
+            "ids": ids,
+            "superseded": superseded,
+        }
+        if self.cache_ttl > 0:
+            self._cache[key] = (time.time(), dict(bundle))
+        return bundle
 
     def _local_score(
         self,

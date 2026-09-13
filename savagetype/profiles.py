@@ -20,14 +20,20 @@ ATTR_LABELS = {
 CARD_ATTRS = ("name", "identity", "likes", "habit", "promise", "note")
 
 
-def build_profile(speaker_id: str, facts: list[Fact], speaker_name: str = "") -> dict[str, Any]:
+def build_profile(
+    speaker_id: str,
+    facts: list[Fact],
+    speaker_name: str = "",
+    speaker_ids: list[str] | None = None,
+) -> dict[str, Any]:
     sid = (speaker_id or "").strip()
     if not sid:
         return {"speaker_id": "", "lines": [], "card": ""}
+    ids = {sid, *(speaker_ids or [])}
     by_attr: dict[str, list[Fact]] = {k: [] for k in CARD_ATTRS}
     name = speaker_name
     for fact in facts:
-        if fact.speaker_id != sid or fact.status != "live":
+        if fact.speaker_id not in ids or fact.status != "live":
             continue
         if getattr(fact, "expires_at", 0) and fact.expires_at > 0 and fact.expires_at < now_ts():
             continue

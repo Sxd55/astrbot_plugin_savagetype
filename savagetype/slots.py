@@ -11,6 +11,9 @@ from .util import (
     KIND_PREFERENCE,
     KIND_PROMISE,
     KIND_STATUS,
+    TOPIC_PARTICLES,
+    detect_domain,
+    normalize_domain,
     normalize_slot,
 )
 
@@ -61,6 +64,7 @@ SELF_SUBJECTS = {
     "本人",
     "说话人",
     "当前用户",
+    "主人",
 }
 
 BOT_SUBJECTS = {"bot", "机器人", "助手", "你"}
@@ -131,17 +135,52 @@ def apply_slot(payload: dict) -> dict:
     attribute = str(payload.get("attribute") or "note")
     value = str(payload.get("value") or "")
     content = str(payload.get("content") or "")
-    blob = f"{attribute} {value} {content}"
-    if re.search(r"(不喜欢|没喜欢|不再喜欢)", blob) and canonical_attribute(attribute) in {"likes", "dislikes", "note"}:
+    attr_canon = canonical_attribute(attribute)
+    neg = bool(re.search(r"(不喜欢|没喜欢|不再喜欢)", value))
+    if not neg and attr_canon in {"dislikes", "note"}:
+        # LLM 可能给出 dislikes/note，但内容其实是「不喜欢 X」，只在非偏好属性时看正文，
+        # 避免同一条消息里另一句「不喜欢」把「喜欢 X」也否定掉。
+        neg = bool(re.search(r"(不喜欢|没喜欢|不再喜欢)", content))
+    if (
+        not neg
+        and attr_canon == "likes"
+        and value
+        and not value.startswith("不")
+        and re.search(rf"不喜欢[^，。！!？?]{{0,6}}{re.escape(value)}", content)
+    ):
+        # 兜底：模型漏写否定，但正文里确实是「不喜欢 <这个值>」。
+        neg = True
+    if neg and attr_canon in {"likes", "dislikes", "note"}:
         payload["attribute"] = "likes"
-        if value and not value.startswith("不"):
-            payload["value"] = "不" + value
+        base = value or content
+        match = re.search(
+            r"(?:不再喜欢|不喜欢|没喜欢|喜欢|讨厌|受不了)(?:听|喝|吃|看|玩)?(.+?)(?:[，。！!？?\s]|$)",
+            base,
+        )
+        if match:
+            base = match.group(1).strip()
+        while base and base[-1] in TOPIC_PARTICLES:
+            base = base[:-1]
+        if base and not base.startswith("不"):
+            base = "不" + base
+        payload["value"] = base or value
     else:
-        payload["attribute"] = canonical_attribute(attribute)
+        payload["attribute"] = attr_canon
     payload["subject"] = canonical_subject(
         str(payload.get("subject") or ""),
         speaker_id=speaker_id,
         speaker_name=speaker_name,
     )
     payload["kind"] = str(payload.get("kind") or fact_kind(payload["attribute"]))
+    if payload["attribute"] in {"likes", "dislikes"}:
+        # 领域用于区分同一个词的不同含义（「美式」咖啡 / 「美式」穿搭）。
+        domain = normalize_domain(str(payload.get("topic") or ""))
+        if not domain:
+            # 优先用这条事实自己的短句判领域：整句里可能混着多个领域
+            # （「喜欢喝咖啡，打篮球」不能把打篮球也判成饮品）。
+            clue = str(payload.get("plain") or "").strip() or content
+            domain = detect_domain(clue, value)
+        payload["topic"] = domain
+    else:
+        payload["topic"] = ""
     return payload

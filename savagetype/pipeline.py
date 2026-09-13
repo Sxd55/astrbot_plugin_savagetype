@@ -45,8 +45,10 @@ VERIFY_PROMPT = """你是记忆审核员。下面每条包含原始聊天消息�
 REVISE_PROMPT = """你是记忆整理器。下面每条包含原始消息、上一次整理结果和不通过原因。
 按不通过原因修改整理结果，不能添加原文没有的信息。
 只输出 JSON 数组，字段与整理结果一致：
-source_event_id, plain, keywords, subject, attribute, value, confidence,
-first_person, explicit_correction, mention_policy, write_op, ttl_seconds
+index, source_event_id, plain, keywords, subject, attribute, value, confidence,
+first_person, explicit_correction, mention_policy, write_op, ttl_seconds, topic
+index 必须与输入的 index 一致；不要遗漏任何一条。
+除按原因需要修改的字段外，其余字段必须与 prev 保持一致（尤其 write_op、mention_policy、ttl_seconds）。
 {items}
 """
 
@@ -99,11 +101,15 @@ class MemoryPipeline:
         self.is_owner_speaker = is_owner_speaker
         self._lock = asyncio.Lock()
 
+    def _cfg_int(self, key: str, default: int) -> int:
+        raw = self.config.get(key)
+        return default if raw is None else int(raw)
+
     def max_revisions(self) -> int:
-        return max(0, int(self.config.get("pipeline_max_revisions") or 2))
+        return max(0, self._cfg_int("pipeline_max_revisions", 2))
 
     def batch_size(self) -> int:
-        return max(1, int(self.config.get("pipeline_batch_size") or 8))
+        return max(1, self._cfg_int("pipeline_batch_size", 8))
 
     @property
     def locked(self) -> bool:
@@ -154,6 +160,7 @@ class MemoryPipeline:
 
         try:
             entries = await self.extractor.normalize_llm(candidates)
+            entries = self.extractor.expand_split(entries)
         except Exception as exc:  # noqa: BLE001
             return await self._fallback(events, candidates, reason=f"normalize_error: {exc}", error=True)
 
@@ -170,9 +177,9 @@ class MemoryPipeline:
                 break
             verdicts = await self._verify(entries, by_id)
             failed: list[tuple[dict[str, Any], dict[str, Any]]] = []
-            for entry in entries:
+            for index, entry in enumerate(entries):
                 key = int(entry.get("source_event_id") or 0)
-                verdict = verdicts.get(key, {"pass": False, "reason": "no_verdict", "fix_hint": ""})
+                verdict = verdicts.get(index, {"pass": False, "reason": "no_verdict", "fix_hint": ""})
                 traces.setdefault(key, []).append(
                     {
                         "round": rounds,
@@ -184,9 +191,11 @@ class MemoryPipeline:
                 )
                 if verdict.get("pass"):
                     result = self._write(entry, raw=by_id.get(key))
-                    if result.get("action") in {"rejected_relation"}:
+                    action = str(result.get("action") or "")
+                    if action == "rejected_relation":
                         self.store.add_diag("memory_rejected", result)
-                    else:
+                    elif action != "pending":
+                        # 高证据冲突会进「待确认覆盖」，不算已写入。
                         written += 1
                 else:
                     failed.append((entry, verdict))
@@ -201,10 +210,16 @@ class MemoryPipeline:
                 self.store.add_diag("pipeline_revise_fail", {"error": str(exc)})
                 pending.extend(failed)
                 break
-            if not revised:
-                pending.extend(failed)
+            # revised 与 failed 按索引对应，空列表表示模型漏回了该条：转待审而不是丢弃。
+            next_entries: list[dict[str, Any]] = []
+            for (entry, verdict), new_entries in zip(failed, revised):
+                if not new_entries:
+                    pending.append((entry, verdict))
+                else:
+                    next_entries.extend(new_entries)
+            if not next_entries:
                 break
-            entries = revised
+            entries = next_entries
 
         for entry, verdict in pending:
             self._pending(entry, verdict, by_id, traces)
@@ -254,8 +269,7 @@ class MemoryPipeline:
                 except (TypeError, ValueError):
                     continue
                 if 0 <= idx < len(entries):
-                    eid = int(entries[idx].get("source_event_id") or 0)
-                    verdicts[eid] = {
+                    verdicts[idx] = {
                         "pass": bool(item.get("pass")),
                         "reason": str(item.get("reason") or ""),
                         "fix_hint": str(item.get("fix_hint") or ""),
@@ -266,13 +280,14 @@ class MemoryPipeline:
         self,
         failed: list[tuple[dict[str, Any], dict[str, Any]]],
         by_id: dict[int, TimelineEvent],
-    ) -> list[dict[str, Any]]:
+    ) -> list[list[dict[str, Any]]]:
         items = []
-        for entry, verdict in failed:
+        for index, (entry, verdict) in enumerate(failed):
             eid = int(entry.get("source_event_id") or 0)
             raw = by_id.get(eid)
             items.append(
                 {
+                    "index": index,
                     "source_event_id": eid,
                     "raw": clip(raw.content if raw else "", 300),
                     "prev": {
@@ -281,6 +296,10 @@ class MemoryPipeline:
                         "subject": entry.get("subject"),
                         "attribute": entry.get("attribute"),
                         "value": entry.get("value"),
+                        "write_op": entry.get("write_op"),
+                        "mention_policy": entry.get("mention_policy"),
+                        "ttl_seconds": entry.get("ttl_seconds"),
+                        "topic": entry.get("topic"),
                     },
                     "reason": verdict.get("reason"),
                     "fix_hint": verdict.get("fix_hint"),
@@ -290,13 +309,23 @@ class MemoryPipeline:
         raw_text = await self._llm_call(prompt, kind="normalize")
         parsed = safe_json_extract(raw_text)
         if not isinstance(parsed, list):
-            return []
-        out: list[dict[str, Any]] = []
+            return [[] for _ in failed]
+        mapping: dict[int, list[dict[str, Any]]] = {}
+        next_slot = 0
         for item in parsed:
+            if not isinstance(item, dict):
+                continue
             normalized = self.extractor._normalize_item(item, by_id)  # noqa: SLF001
-            if normalized is not None:
-                out.append(normalized)
-        return out
+            if normalized is None:
+                continue
+            try:
+                idx = int(item.get("index"))
+            except (TypeError, ValueError):
+                idx = next_slot
+            # 修订轮同样要走拆句兜底，否则模型合成的一条会带着整句 plain 直接入库。
+            mapping.setdefault(idx, []).extend(self.extractor.expand_split([normalized]))
+            next_slot = max(next_slot, idx + 1)
+        return [mapping.get(i) or [] for i in range(len(failed))]
 
     def _write(self, entry: dict[str, Any], raw: TimelineEvent | None) -> dict[str, Any]:
         payload = dict(entry)
@@ -321,15 +350,22 @@ class MemoryPipeline:
         raw = by_id.get(eid)
         speaker_id = str(entry.get("speaker_id") or "")
         trace = list(traces.get(eid) or [])
-        trace.append(
-            {
-                "round": len(trace) + 1,
-                "plain": entry.get("plain") or "",
-                "pass": False,
-                "reason": str(verdict.get("reason") or ""),
-                "fix_hint": str(verdict.get("fix_hint") or ""),
-            }
-        )
+        last = trace[-1] if trace else {}
+        if not (
+            last
+            and not last.get("pass")
+            and str(last.get("reason") or "") == str(verdict.get("reason") or "")
+            and str(last.get("plain") or "") == str(entry.get("plain") or "")
+        ):
+            trace.append(
+                {
+                    "round": len(trace) + 1,
+                    "plain": entry.get("plain") or "",
+                    "pass": False,
+                    "reason": str(verdict.get("reason") or ""),
+                    "fix_hint": str(verdict.get("fix_hint") or ""),
+                }
+            )
         payload = dict(entry)
         speaker_name = str(entry.get("speaker_name") or "")
         platform = platform_of(str(entry.get("window_tag") or ""))
@@ -361,7 +397,7 @@ class MemoryPipeline:
             payload["origin"] = origin
             payload["review_status"] = review_status
             result = self.contradiction.ingest(payload, source_text=payload.get("content", ""))
-            if result.get("action") not in {"rejected_relation"}:
+            if str(result.get("action") or "") not in {"rejected_relation", "pending"}:
                 written += 1
         return written
 

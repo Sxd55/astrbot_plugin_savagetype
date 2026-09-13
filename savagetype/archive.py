@@ -7,13 +7,12 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .store import Store
-from .util import clip, fingerprint, loads, now_ts
+from .util import clip, detect_domain, fingerprint, loads, now_ts
 
 HEAD_RE = re.compile(
     r"^(?P<name>.+?)[:：]\s*(?P<time>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}|\d{1,2}-\d{1,2}[ T]\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}|\d{1,2}-\d{1,2})$"
@@ -168,9 +167,8 @@ def preview_jsonl(path: Path, limit: int = 8) -> dict[str, Any]:
 
 
 def backup_db(store: Store, dest_dir: Path) -> Path:
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / f"savagetype-{store.revision()}-{now_ts()}.db"
-    shutil.copy2(store.db_path, dest)
+    dest = Path(dest_dir) / f"savagetype-{store.revision()}-{now_ts()}.db"
+    store.backup_to(dest)
     return dest
 
 
@@ -188,7 +186,17 @@ def _as_payload(row: dict[str, Any], drop: set[str]) -> dict[str, Any]:
 
 
 def import_jsonl(store: Store, path: Path) -> dict[str, Any]:
-    inserted = {"facts": 0, "timeline": 0, "reviews": 0, "pending": 0, "skipped": 0, "errors": 0}
+    inserted = {
+        "facts": 0,
+        "timeline": 0,
+        "reviews": 0,
+        "pending": 0,
+        "profiles": 0,
+        "memory_reviews": 0,
+        "aliases": 0,
+        "skipped": 0,
+        "errors": 0,
+    }
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -217,6 +225,30 @@ def import_jsonl(store: Store, path: Path) -> dict[str, Any]:
                 )
                 if store.add_timeline(event):
                     inserted["timeline"] += 1
+                else:
+                    inserted["skipped"] += 1
+            elif wrapper == "profiles" or (
+                "speaker_id" in row and "seen_count" in row and "first_seen" in row
+            ):
+                if store.import_profile(row):
+                    inserted["profiles"] += 1
+                else:
+                    inserted["skipped"] += 1
+            elif wrapper == "memory_reviews" or (
+                "raw_text" in row and "source_event_id" in row and "trace" in row
+            ):
+                if store.import_memory_review(row):
+                    inserted["memory_reviews"] += 1
+                else:
+                    inserted["skipped"] += 1
+            elif wrapper == "aliases" or (
+                row.get("alias") and row.get("canonical_id") and "payload" not in row
+            ):
+                alias = str(row.get("alias") or "").strip()
+                canonical = str(row.get("canonical_id") or "").strip()
+                if alias and canonical and alias != canonical:
+                    store.set_alias(alias, canonical, str(row.get("label") or ""))
+                    inserted["aliases"] += 1
                 else:
                     inserted["skipped"] += 1
             elif wrapper == "reviews" or review_kind or (row.get("fingerprint") and row.get("payload") is not None and row.get("status")):
@@ -299,7 +331,7 @@ def archive_decayed(
         return 0
     now = now_ts()
     cutoff = now - max(1, min_age_days) * 86400
-    live = store.facts_by_status("live", limit=max(limit * 3, 300))
+    live = store.live_oldest(limit=max(limit * 3, 300))
     n = 0
     for fact in live:
         if int(getattr(fact, "pinned", 0)):
@@ -312,6 +344,30 @@ def archive_decayed(
             if n >= limit:
                 break
     return n
+
+
+def prune_jargon_stats(store: Store, min_age_days: int = 30, limit: int = 500) -> int:
+    """Drop one-off jargon terms that have not been seen again for a while."""
+    cutoff = now_ts() - max(1, min_age_days) * 86400
+    rows = store.query(
+        "SELECT term FROM jargon_stats WHERE count<=1 AND last_seen<? LIMIT ?",
+        (cutoff, limit),
+    )
+    for row in rows:
+        store.drop_jargon_term(str(row["term"]))
+    return len(rows)
+
+
+def expire_pending_overrides(store: Store, max_age_days: int = 30, limit: int = 200) -> int:
+    """Close stale open overrides (mostly joke pendings) so the queue cannot grow forever."""
+    cutoff = now_ts() - max(1, max_age_days) * 86400
+    rows = store.query(
+        "SELECT id FROM pending_overrides WHERE status='open' AND created_at<? LIMIT ?",
+        (cutoff, limit),
+    )
+    for row in rows:
+        store.set_pending_status(int(row["id"]), "expired")
+    return len(rows)
 
 
 def expire_status_facts(store: Store, limit: int = 200) -> int:
@@ -327,36 +383,51 @@ def expire_status_facts(store: Store, limit: int = 200) -> int:
     return n
 
 
-def _topic_key(text: str) -> str:
+def _negated_topic(text: str) -> bool:
     from .util import normalize_slot
 
     t = normalize_slot(text)
-    for prefix in ("不", "没", "别", "非"):
-        if t.startswith(prefix):
-            t = t[len(prefix):]
-            break
-    t = t.replace("听", "").replace("喝", "").replace("吃", "")
-    return t[:24]
+    return t.startswith(("不", "没", "别", "非"))
 
 
-def _topics(fact) -> set[str]:
-    keys = set()
+def _extra_negative(fact) -> bool:
+    if fact.attribute == "dislikes":
+        return True
+    from .util import normalize_slot
+
+    blob = normalize_slot(f"{fact.value or ''} {fact.content or ''}")
+    return bool(re.search(r"(不喜欢|没喜欢|不再喜欢|不爱|讨厌|受不了)", blob))
+
+
+def _mentioned_in(fact, topic: str) -> bool:
+    """「extra 的正文里明确提到了 like 的主题」——主题词子串匹配。"""
+    from .util import normalize_slot
+
+    topic = normalize_slot(topic)
+    if not topic:
+        return False
     for raw in (fact.value, fact.content):
-        key = _topic_key(raw or "")
-        if key:
-            keys.add(key)
-            if len(key) >= 4:
-                keys.add(key[:6])
-                keys.add(key[-6:])
-    return {k for k in keys if len(k) >= 3}
+        text = normalize_slot(raw or "")
+        if not text or topic not in text:
+            continue
+        if len(topic) >= 2 or re.search(r"(喜欢|讨厌|爱喝|爱吃|受不了|习惯|怕)", text):
+            return True
+    return False
 
 
 def fold_preference_slots(store: Store) -> int:
-    """Merge leftover dislike/note copies of the same topic into likes."""
+    """Merge leftover dislike/note copies of the same topic into likes.
+
+    - 按说话人分组（人格空值=全局，可被任意人格的 likes 吸收）；
+    - 主题匹配用子串（「美式」命中「主人喜欢喝美式咖啡（Americano）」）；
+    - 正/反偏好并存时不删，交给人工。
+    """
+    from .util import topic_key
+
     live = store.facts_by_status("live", limit=400)
-    groups: dict[tuple[str, str], list] = {}
+    groups: dict[str, list] = {}
     for fact in live:
-        groups.setdefault((fact.speaker_id, fact.persona_id or ""), []).append(fact)
+        groups.setdefault(fact.speaker_id, []).append(fact)
     folded = 0
     for _key, items in groups.items():
         like_items = [f for f in items if f.attribute == "likes"]
@@ -364,13 +435,25 @@ def fold_preference_slots(store: Store) -> int:
         for extra in extras:
             if int(getattr(extra, "pinned", 0)):
                 continue
-            extra_topics = _topics(extra)
             keeper = None
             for like in like_items:
-                if extra_topics & _topics(like):
-                    keeper = like
-                    break
+                if like.persona_id and extra.persona_id and like.persona_id != extra.persona_id:
+                    # 不同人格的档案互不合并；全局条目可以被任意人格吸收。
+                    continue
+                if not _mentioned_in(extra, topic_key(like.value)):
+                    continue
+                extra_domain = getattr(extra, "topic", "") or detect_domain(
+                    extra.content or "", like.value
+                )
+                if like.topic and extra_domain and like.topic != extra_domain:
+                    # 同词不同义（美式饮品 vs 美式穿搭）：不折叠。
+                    continue
+                keeper = like
+                break
             if keeper is None:
+                continue
+            if _negated_topic(keeper.value) != _extra_negative(extra):
+                # 正/反偏好并存是真实矛盾：宁可留着两条，也不在维护里静默删掉可能更新的那条。
                 continue
             store.delete_fact(extra.id)
             folded += 1

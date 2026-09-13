@@ -207,6 +207,17 @@ export function initShaderGradient(options = {}) {
 
   resize();
   window.addEventListener("resize", resize, { passive: true });
+  if ("ResizeObserver" in window) {
+    // 初始化时布局可能还没完成，尺寸变化时补量，避免画布卡在 1×1。
+    new ResizeObserver(resize).observe(canvas);
+  }
+  canvas.addEventListener("webglcontextlost", (ev) => {
+    // GPU 上下文丢失：停下动画并让出 CSS 回退背景，避免画布冻结/发黑。
+    ev.preventDefault();
+    stop();
+    canvas.style.display = "none";
+    applyFallback();
+  });
   if (reduceMotion) {
     renderFrame(0);
   } else if ("IntersectionObserver" in window) {

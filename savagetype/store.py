@@ -13,6 +13,7 @@ from .util import (
     MEMORY_STATUS_PENDING,
     SCOPE_OWNER,
     default_importance,
+    detect_domain,
     dumps,
     loads,
     make_slot_key,
@@ -132,6 +133,14 @@ CREATE TABLE IF NOT EXISTS memory_reviews (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_reviews_status ON memory_reviews(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_memory_reviews_speaker ON memory_reviews(speaker_id, status);
+
+CREATE TABLE IF NOT EXISTS recall_log (
+    window_tag TEXT NOT NULL,
+    fact_id INTEGER NOT NULL,
+    ts INTEGER NOT NULL,
+    PRIMARY KEY (window_tag, fact_id)
+);
+CREATE INDEX IF NOT EXISTS idx_recall_log_ts ON recall_log(ts);
 """
 
 
@@ -199,6 +208,8 @@ class Store:
             self.execute("ALTER TABLE facts ADD COLUMN kind TEXT NOT NULL DEFAULT ''")
         if "pinned" not in fact_cols:
             self.execute("ALTER TABLE facts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+        if "topic" not in fact_cols:
+            self.execute("ALTER TABLE facts ADD COLUMN topic TEXT NOT NULL DEFAULT ''")
         tl_cols = self._table_cols("timeline")
         if "persona_id" not in tl_cols:
             self.execute("ALTER TABLE timeline ADD COLUMN persona_id TEXT NOT NULL DEFAULT ''")
@@ -228,10 +239,36 @@ class Store:
         if "tokens_out" not in usage_cols:
             self.execute("ALTER TABLE usage_ledger ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0")
         self.execute("CREATE INDEX IF NOT EXISTS idx_facts_slotkey ON facts(slot_key, status)")
-        self.execute("UPDATE facts SET importance=confidence WHERE importance<=0 AND confidence>0")
+        if self.get_meta("importance_backfill_v343") != "1":
+            # 一次性回填老数据的 importance；之后用户手动设为 0 的值不能再被覆盖。
+            self.execute("UPDATE facts SET importance=confidence WHERE importance<=0 AND confidence>0")
+            self.set_meta("importance_backfill_v343", "1")
         rows = self.query("SELECT id, attribute FROM facts WHERE kind='' OR kind IS NULL")
         for row in rows:
             self.execute("UPDATE facts SET kind=? WHERE id=?", (fact_kind(row["attribute"]), int(row["id"])))
+        if self.get_meta("slot_topic_v332") != "1":
+            rows = self.query(
+                "SELECT id, persona_id, speaker_id, subject, attribute, value FROM facts"
+            )
+            for row in rows:
+                key = make_slot_key(
+                    row["persona_id"] or "",
+                    row["speaker_id"],
+                    row["subject"],
+                    row["attribute"],
+                    row["value"],
+                )
+                self.execute("UPDATE facts SET slot_key=? WHERE id=?", (key, int(row["id"])))
+            self.resolve_all_slot_conflicts()
+            self.set_meta("slot_topic_v332", "1")
+        if self.get_meta("slot_domain_v3417") != "1":
+            # 回填领域（不改现有 slot_key，零风险）；之后新旧事实都能正确判域。
+            rows = self.query("SELECT id, value, content FROM facts")
+            for row in rows:
+                domain = detect_domain(row["content"] or "", row["value"] or "")
+                if domain:
+                    self.execute("UPDATE facts SET topic=? WHERE id=?", (domain, int(row["id"])))
+            self.set_meta("slot_domain_v3417", "1")
         self.execute("CREATE INDEX IF NOT EXISTS idx_facts_persona ON facts(persona_id, speaker_id, status)")
         self.execute("CREATE INDEX IF NOT EXISTS idx_timeline_persona ON timeline(persona_id, speaker_id, ts)")
         self.execute(
@@ -274,6 +311,21 @@ class Store:
                 "UPDATE facts SET subject=?, attribute=?, slot_key=?, persona_id=? WHERE id=?",
                 (payload["subject"], payload["attribute"], key, persona or "", row["id"]),
             )
+
+    def backup_to(self, dest: Path) -> None:
+        """Consistent snapshot via SQLite online backup (WAL-safe, unlike file copy)."""
+        import sqlite3 as _sqlite3
+
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            self._ensure_conn()
+            target = _sqlite3.connect(str(dest))
+            try:
+                self._conn.backup(target)
+                target.commit()
+            finally:
+                target.close()
 
     def close(self) -> None:
         with self._lock:
@@ -399,6 +451,7 @@ class Store:
             str(payload.get("speaker_id") or ""),
             str(payload.get("subject") or ""),
             str(payload.get("attribute") or ""),
+            str(payload.get("value") or ""),
         )
         cur = self.execute(
             """INSERT INTO facts(
@@ -407,8 +460,8 @@ class Store:
                 source, created_at, updated_at, superseded_by, supersedes, fingerprint, embedding,
                 access_count, last_accessed, reason, persona_id, slot_key, expires_at, write_op,
                 scope, plain, keywords, source_event_id, review_status, origin, edited_at, edited_by,
-                importance, kind, pinned
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                importance, kind, pinned, topic
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 payload["subject"],
                 payload["attribute"],
@@ -449,13 +502,14 @@ class Store:
                 float(payload.get("importance") or 0),
                 str(payload.get("kind") or ""),
                 int(payload.get("pinned", 0) or 0),
+                str(payload.get("topic") or ""),
             ),
         )
         if bump:
             self.bump_revision()
         return int(cur.lastrowid)
 
-    def update_fact(self, fact_id: int, **fields: Any) -> None:
+    def update_fact(self, fact_id: int, bump: bool = True, **fields: Any) -> None:
         if not fields:
             return
         if "updated_at" not in fields:
@@ -468,7 +522,8 @@ class Store:
             fields["keywords"] = dumps(fields["keywords"])
         assignments = ", ".join(f"{k}=?" for k in fields)
         self.execute(f"UPDATE facts SET {assignments} WHERE id=?", (*fields.values(), fact_id))
-        self.bump_revision()
+        if bump:
+            self.bump_revision()
 
     def get_fact(self, fact_id: int) -> Fact | None:
         rows = self.query("SELECT * FROM facts WHERE id=?", (fact_id,))
@@ -584,6 +639,13 @@ class Store:
         self.bump_revision()
         return cur.rowcount > 0
 
+    def bump_access(self, fact_id: int) -> None:
+        """Atomic access reinforcement; avoids stale write-back from cached fact objects."""
+        self.execute(
+            "UPDATE facts SET access_count=access_count+1, last_accessed=? WHERE id=?",
+            (now_ts(), int(fact_id)),
+        )
+
     def set_pinned(self, fact_id: int, pinned: bool) -> bool:
         fact = self.get_fact(fact_id)
         if fact is None:
@@ -614,6 +676,7 @@ class Store:
                 fact.attribute,
                 persona_id=fact.persona_id,
                 speaker_ids=self.speaker_ids_for(fact.speaker_id),
+                value=fact.value,
             )
             if conflict is not None and conflict.id != fid:
                 blocked.append({"id": fid, "conflict": conflict.id})
@@ -657,15 +720,17 @@ class Store:
         attribute: str,
         persona_id: str = "",
         speaker_ids: list[str] | None = None,
+        value: str = "",
     ) -> Fact | None:
         payload = apply_slot(
             {
                 "subject": subject,
                 "attribute": attribute,
                 "speaker_id": speaker_id,
+                "value": value,
             }
         )
-        key = make_slot_key(persona_id, speaker_id, payload["subject"], payload["attribute"])
+        key = make_slot_key(persona_id, speaker_id, payload["subject"], payload["attribute"], value)
         rows = self.query(
             """SELECT * FROM facts WHERE status='live' AND slot_key=?
                ORDER BY confidence DESC, updated_at DESC LIMIT 1""",
@@ -678,8 +743,22 @@ class Store:
         rows = self.query(
             f"""SELECT * FROM facts WHERE status='live' AND speaker_id IN ({placeholders})
                 AND subject=? AND attribute=? AND (persona_id=? OR persona_id='')
-                ORDER BY confidence DESC, updated_at DESC LIMIT 1""",
+                ORDER BY confidence DESC, updated_at DESC LIMIT 20""",
             (*ids, payload["subject"], payload["attribute"], persona_id),
+        )
+        for row in rows:
+            fact = self._fact(row)
+            if not fact.slot_key_value and fact.slot_key() == key:
+                return fact
+        return None
+
+    def live_fact_by_slot_key(self, slot_key: str) -> Fact | None:
+        if not slot_key:
+            return None
+        rows = self.query(
+            "SELECT * FROM facts WHERE status='live' AND slot_key=? "
+            "ORDER BY confidence DESC, updated_at DESC LIMIT 1",
+            (slot_key,),
         )
         return self._fact(rows[0]) if rows else None
 
@@ -688,6 +767,13 @@ class Store:
             return None
         rows = self.query("SELECT * FROM facts WHERE fingerprint=? LIMIT 1", (fingerprint,))
         return self._fact(rows[0]) if rows else None
+
+    def live_oldest(self, limit: int = 300) -> list[Fact]:
+        rows = self.query(
+            "SELECT * FROM facts WHERE status='live' AND pinned=0 ORDER BY updated_at ASC LIMIT ?",
+            (limit,),
+        )
+        return [self._fact(r) for r in rows]
 
     def missing_embeddings(self, limit: int = 32) -> list[Fact]:
         rows = self.query(
@@ -753,7 +839,92 @@ class Store:
             item = dict(r)
             item["review_kind"] = item.get("kind")
             reviews.append(item)
-        return {"facts": facts, "timeline": timeline, "pending": pending, "reviews": reviews}
+        profiles = [dict(r) for r in self.query("SELECT * FROM profiles")]
+        memory_reviews = [dict(r) for r in self.query("SELECT * FROM memory_reviews")]
+        aliases = [
+            dict(r)
+            for r in self.query("SELECT alias, canonical_id, label FROM speaker_aliases")
+        ]
+        return {
+            "facts": facts,
+            "timeline": timeline,
+            "pending": pending,
+            "reviews": reviews,
+            "profiles": profiles,
+            "memory_reviews": memory_reviews,
+            "aliases": aliases,
+        }
+
+    def import_profile(self, row: dict[str, Any]) -> bool:
+        sid = str(row.get("speaker_id") or "").strip()
+        if not sid:
+            return False
+        now = now_ts()
+        self.execute(
+            """INSERT INTO profiles(speaker_id, speaker_name, platform, is_owner, note, first_seen, last_seen, seen_count, created_at, updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(speaker_id) DO UPDATE SET
+                 speaker_name=CASE WHEN excluded.speaker_name!='' THEN excluded.speaker_name ELSE profiles.speaker_name END,
+                 note=CASE WHEN excluded.note!='' THEN excluded.note ELSE profiles.note END,
+                 is_owner=MAX(profiles.is_owner, excluded.is_owner),
+                 first_seen=CASE
+                   WHEN profiles.first_seen=0 OR (excluded.first_seen>0 AND excluded.first_seen<profiles.first_seen)
+                   THEN excluded.first_seen ELSE profiles.first_seen END,
+                 last_seen=CASE WHEN excluded.last_seen>profiles.last_seen THEN excluded.last_seen ELSE profiles.last_seen END,
+                 seen_count=MAX(profiles.seen_count, excluded.seen_count),
+                 updated_at=excluded.updated_at""",
+            (
+                sid,
+                str(row.get("speaker_name") or ""),
+                str(row.get("platform") or ""),
+                int(row.get("is_owner") or 0),
+                str(row.get("note") or ""),
+                int(row.get("first_seen") or 0),
+                int(row.get("last_seen") or 0),
+                int(row.get("seen_count") or 0),
+                int(row.get("created_at") or now),
+                now,
+            ),
+        )
+        return True
+
+    def import_memory_review(self, row: dict[str, Any]) -> bool:
+        speaker_id = str(row.get("speaker_id") or "")
+        source_event_id = int(row.get("source_event_id") or 0)
+        plain = str(row.get("plain") or "")
+        exists = self.query(
+            "SELECT id FROM memory_reviews WHERE speaker_id=? AND source_event_id=? AND plain=?",
+            (speaker_id, source_event_id, plain),
+        )
+        if exists:
+            return False
+        keywords = row.get("keywords")
+        if isinstance(keywords, str):
+            keywords = loads(keywords, [])
+        payload = row.get("payload")
+        if isinstance(payload, str):
+            payload = loads(payload, {})
+        trace = row.get("trace")
+        if isinstance(trace, str):
+            trace = loads(trace, [])
+        review_id = self.add_memory_review(
+            scope=str(row.get("scope") or "person"),
+            speaker_id=speaker_id,
+            speaker_name=str(row.get("speaker_name") or ""),
+            platform=str(row.get("platform") or ""),
+            window_tag=str(row.get("window_tag") or ""),
+            source_event_id=source_event_id,
+            raw_text=str(row.get("raw_text") or ""),
+            plain=plain,
+            keywords=list(keywords or []),
+            payload=dict(payload or {}),
+            attempts=int(row.get("attempts") or 0),
+            trace=list(trace or []),
+        )
+        status = str(row.get("status") or "pending")
+        if status in {"approved", "rejected"} and review_id:
+            self.update_memory_review(review_id, status=status)
+        return True
 
     def upsert_review(self, kind: str, fingerprint: str, title: str, payload: dict[str, Any], reason: str = "", speaker_id: str = "", persona_id: str = "") -> int:
         existing = self.query(
@@ -872,8 +1043,16 @@ class Store:
     def resolve_speaker(self, speaker_id: str) -> str:
         if not speaker_id:
             return speaker_id
-        rows = self.query("SELECT canonical_id FROM speaker_aliases WHERE alias=?", (speaker_id,))
-        return rows[0]["canonical_id"] if rows else speaker_id
+        current = speaker_id
+        for _ in range(4):
+            rows = self.query("SELECT canonical_id FROM speaker_aliases WHERE alias=?", (current,))
+            if not rows:
+                return current
+            nxt = str(rows[0]["canonical_id"] or "")
+            if not nxt or nxt == current:
+                return current
+            current = nxt
+        return current
 
     def speaker_ids_for(self, canonical_id: str) -> list[str]:
         ids = [canonical_id]
@@ -895,6 +1074,143 @@ class Store:
     def list_aliases(self) -> list[dict[str, str]]:
         rows = self.query("SELECT alias, canonical_id, label FROM speaker_aliases ORDER BY canonical_id, alias")
         return [{"alias": r["alias"], "canonical_id": r["canonical_id"], "label": r["label"]} for r in rows]
+
+    def reassign_speaker(self, old_id: str, new_id: str, new_name: str = "") -> int:
+        """Move facts/timeline/profile from one speaker id to another (identity merge)."""
+        if not old_id or not new_id or old_id == new_id:
+            return 0
+        rows = self.query(
+            "SELECT id, persona_id, subject, attribute, value, speaker_name FROM facts WHERE speaker_id=?",
+            (old_id,),
+        )
+        for row in rows:
+            key = make_slot_key(
+                row["persona_id"] or "",
+                new_id,
+                row["subject"],
+                row["attribute"],
+                row["value"],
+            )
+            self.execute(
+                "UPDATE facts SET speaker_id=?, speaker_name=?, slot_key=? WHERE id=?",
+                (new_id, new_name or row["speaker_name"], key, int(row["id"])),
+            )
+        if new_name:
+            self.execute(
+                "UPDATE timeline SET speaker_id=?, speaker_name=? WHERE speaker_id=?",
+                (new_id, new_name, old_id),
+            )
+        else:
+            self.execute("UPDATE timeline SET speaker_id=? WHERE speaker_id=?", (new_id, old_id))
+        if new_name:
+            self.execute(
+                "UPDATE memory_reviews SET speaker_id=?, speaker_name=? WHERE speaker_id=?",
+                (new_id, new_name, old_id),
+            )
+        else:
+            self.execute(
+                "UPDATE memory_reviews SET speaker_id=? WHERE speaker_id=?", (new_id, old_id)
+            )
+        old_profile = self.get_profile(old_id)
+        if old_profile is not None:
+            self.upsert_profile(
+                new_id,
+                new_name or old_profile.speaker_name,
+                old_profile.platform,
+                is_owner=bool(old_profile.is_owner),
+            )
+            self.execute("DELETE FROM profiles WHERE speaker_id=?", (old_id,))
+        self.set_alias(old_id, new_id, new_name)
+        self.resolve_slot_conflicts(new_id)
+        self.bump_revision()
+        return len(rows)
+
+    def _keep_and_archive_duplicate(self, keeper: Fact, dup: Fact, reason: str) -> tuple[Fact, bool]:
+        """Merge same-value evidence, archive the duplicate; pinned always wins.
+
+        Returns (keeper, archived). Both pinned -> (first, False) and a human decides.
+        """
+        from .contradiction import values_conflict
+
+        if int(dup.pinned or 0) and int(keeper.pinned or 0):
+            # 两条都置顶：都不归档，交给人工处理。
+            return keeper, False
+        if int(dup.pinned or 0) and not int(keeper.pinned or 0):
+            keeper, dup = dup, keeper
+        if not values_conflict(keeper.value, dup.value):
+            evidence = list(keeper.evidence)
+            for eid in dup.evidence:
+                if eid not in evidence:
+                    evidence.append(eid)
+            fields: dict[str, Any] = {
+                "evidence": evidence,
+                "confidence": max(keeper.confidence, dup.confidence),
+                "importance": max(float(keeper.importance or 0), float(dup.importance or 0)),
+            }
+            if not getattr(keeper, "topic", "") and getattr(dup, "topic", ""):
+                fields["topic"] = dup.topic
+            self.update_fact(keeper.id, **fields)
+        self.update_fact(dup.id, status="archived", reason=reason)
+        return keeper, True
+
+    def resolve_all_slot_conflicts(self) -> int:
+        """Keep the newest (or pinned) live fact per slot; archive older duplicates."""
+        rows = self.query(
+            "SELECT * FROM facts WHERE status='live' ORDER BY slot_key, pinned DESC, updated_at DESC, confidence DESC"
+        )
+        keepers: dict[str, Fact] = {}
+        archived = 0
+        for row in rows:
+            fact = self._fact(row)
+            key = fact.slot_key()
+            keeper = keepers.get(key)
+            if keeper is None:
+                keepers[key] = fact
+                continue
+            keepers[key], done = self._keep_and_archive_duplicate(keeper, fact, "slot_conflict")
+            archived += 1 if done else 0
+        return archived
+
+    def resolve_slot_conflicts(self, speaker_id: str) -> int:
+        """After an identity merge, keep the newest (or pinned) live fact per slot."""
+        rows = self.query(
+            "SELECT * FROM facts WHERE status='live' AND speaker_id=? "
+            "ORDER BY slot_key, pinned DESC, updated_at DESC, confidence DESC",
+            (speaker_id,),
+        )
+        keepers: dict[str, Fact] = {}
+        archived = 0
+        for row in rows:
+            fact = self._fact(row)
+            key = fact.slot_key()
+            keeper = keepers.get(key)
+            if keeper is None:
+                keepers[key] = fact
+                continue
+            keepers[key], done = self._keep_and_archive_duplicate(
+                keeper, fact, "identity_merge_conflict"
+            )
+            archived += 1 if done else 0
+        return archived
+
+    def recent_recall_ids(self, window_tag: str, since_ts: int) -> set[int]:
+        rows = self.query(
+            "SELECT fact_id FROM recall_log WHERE window_tag=? AND ts>=?",
+            (window_tag, int(since_ts)),
+        )
+        return {int(r["fact_id"]) for r in rows}
+
+    def add_recall(self, window_tag: str, fact_ids: list[int], ts: int) -> None:
+        if not window_tag or not fact_ids:
+            return
+        for fid in fact_ids:
+            self.execute(
+                "INSERT INTO recall_log(window_tag, fact_id, ts) VALUES(?,?,?) "
+                "ON CONFLICT(window_tag, fact_id) DO UPDATE SET ts=excluded.ts",
+                (window_tag, int(fid), int(ts)),
+            )
+        # 去重窗口允许设得很长，日志保留 7 天，避免窗口未到就被清掉。
+        self.execute("DELETE FROM recall_log WHERE ts < ?", (int(ts) - 7 * 86400,))
 
     def add_usage(
         self,
@@ -1025,11 +1341,29 @@ class Store:
             importance=float(row["importance"] or 0) if "importance" in keys else 0.0,
             kind=row["kind"] if "kind" in keys else "",
             pinned=int(row["pinned"] or 0) if "pinned" in keys else 0,
+            topic=row["topic"] if "topic" in keys else "",
         )
 
     # ------------------------------------------------------------------
     # Profiles (auto-created per QQ sender)
     # ------------------------------------------------------------------
+
+    def sync_speaker_name(self, speaker_id: str, speaker_name: str) -> int:
+        """Propagate a learned nickname to denormalized copies (facts/timeline)."""
+        sid = (speaker_id or "").strip()
+        name = (speaker_name or "").strip()
+        if not sid or not name or name == sid:
+            return 0
+        updated = 0
+        for table in ("facts", "timeline", "memory_reviews"):
+            cur = self.execute(
+                f"UPDATE {table} SET speaker_name=? WHERE speaker_id=? AND speaker_name!=?",
+                (name, sid, name),
+            )
+            updated += int(cur.rowcount or 0)
+        if updated:
+            self.bump_revision()
+        return updated
 
     def upsert_profile(
         self,
@@ -1042,12 +1376,18 @@ class Store:
         if not sid:
             return
         now = now_ts()
-        rows = self.query("SELECT speaker_id, speaker_name FROM profiles WHERE speaker_id=?", (sid,))
+        rows = self.query(
+            "SELECT speaker_id, speaker_name, platform FROM profiles WHERE speaker_id=?", (sid,)
+        )
         if rows:
             name = (speaker_name or "").strip() or rows[0]["speaker_name"]
+            platform_value = (platform or "").strip() or str(rows[0]["platform"] or "")
+            if name and name != str(rows[0]["speaker_name"] or ""):
+                # 昵称更新后同步事实/时间线上的冗余副本，避免旧名残留。
+                self.sync_speaker_name(sid, name)
             self.execute(
                 "UPDATE profiles SET speaker_name=?, platform=?, is_owner=?, last_seen=?, seen_count=seen_count+1, updated_at=? WHERE speaker_id=?",
-                (name, platform or "", int(bool(is_owner)), now, now, sid),
+                (name, platform_value, int(bool(is_owner)), now, now, sid),
             )
             return
         self.execute(
@@ -1136,8 +1476,7 @@ class Store:
             """SELECT p.speaker_id FROM profiles p
                WHERE p.last_seen < ? AND p.speaker_id != ''
                  AND NOT EXISTS (
-                   SELECT 1 FROM facts f
-                   WHERE f.speaker_id=p.speaker_id AND f.status IN ('live','pending_confirm')
+                   SELECT 1 FROM facts f WHERE f.speaker_id=p.speaker_id
                  )
                ORDER BY p.last_seen ASC LIMIT ?""",
             (cutoff, limit),
@@ -1170,6 +1509,13 @@ class Store:
         trace: list[dict[str, Any]] | None = None,
     ) -> int:
         now = now_ts()
+        existing = self.query(
+            "SELECT id FROM memory_reviews WHERE status=? AND speaker_id=? AND source_event_id=? AND plain=?",
+            (MEMORY_STATUS_PENDING, speaker_id or "", int(source_event_id or 0), plain or ""),
+        )
+        if existing:
+            # 同一来源重复入队（例如标记已总结前失败重试）直接复用。
+            return int(existing[0]["id"])
         cur = self.execute(
             """INSERT INTO memory_reviews(
                 scope, speaker_id, speaker_name, platform, window_tag, source_event_id,
@@ -1263,11 +1609,21 @@ class Store:
         )
         return [self._fact(r) for r in rows]
 
-    def person_facts(self, speaker_id: str, limit: int = 200, include_archived: bool = False) -> list[Fact]:
+    def person_facts(
+        self,
+        speaker_id: str,
+        limit: int = 200,
+        include_archived: bool = False,
+        speaker_ids: list[str] | None = None,
+    ) -> list[Fact]:
+        ids = list(speaker_ids or [speaker_id])
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
         clause = "" if include_archived else "AND status='live'"
         rows = self.query(
-            f"SELECT * FROM facts WHERE speaker_id=? {clause} ORDER BY updated_at DESC LIMIT ?",
-            (speaker_id, limit),
+            f"SELECT * FROM facts WHERE speaker_id IN ({placeholders}) {clause} ORDER BY updated_at DESC LIMIT ?",
+            (*ids, limit),
         )
         return [self._fact(r) for r in rows]
 
@@ -1293,11 +1649,22 @@ class Store:
             "jargon_stats",
             "usage_ledger",
             "memory_reviews",
+            "recall_log",
+            "profiles",
         ):
             try:
                 cur = self.execute(f"DELETE FROM {table}")
                 counts[table] = int(cur.rowcount or 0)
             except sqlite3.OperationalError:
                 counts[table] = 0
+        for key in (
+            "capture_skip",
+            "capture_skip_at",
+            "notify_last_at",
+            "jargon_last_at",
+            "persona_draft_last_at",
+            "housekeeping_last_at",
+        ):
+            self.execute("DELETE FROM meta WHERE key=?", (key,))
         self.bump_revision()
         return counts

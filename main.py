@@ -1,7 +1,10 @@
 from pathlib import Path
 import asyncio
+import base64
 import json
+import mimetypes
 import re
+import urllib.parse
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -15,13 +18,15 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path, get_astrbot_p
 try:
     from .savagetype import __version__ as PLUGIN_VERSION
     from .savagetype.service import SavageTypeService
+    from .savagetype.slots import apply_slot
     from .savagetype.store import Store
-    from .savagetype.util import PLUGIN_NAME, clip, fact_weight, now_ts
+    from .savagetype.util import PLUGIN_NAME, clip, fact_weight, make_slot_key, now_ts, parse_csv
 except ImportError:
     from savagetype import __version__ as PLUGIN_VERSION
     from savagetype.service import SavageTypeService
+    from savagetype.slots import apply_slot
     from savagetype.store import Store
-    from savagetype.util import PLUGIN_NAME, clip, fact_weight, now_ts
+    from savagetype.util import PLUGIN_NAME, clip, fact_weight, make_slot_key, now_ts, parse_csv
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "_conf_schema.json"
 
@@ -42,7 +47,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "3.2.1",
+    "3.4.20",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -124,6 +129,7 @@ class SavageTypePlugin(Star):
             ("dossiers", self.page_dossiers, ["GET"], "List QQ dossiers"),
             ("dossier", self.page_dossier, ["GET"], "One QQ dossier"),
             ("memory", self.page_memory, ["GET"], "Owner memory library"),
+            ("memory/bot", self.page_memory_bot, ["GET"], "Bot memory library"),
             ("memory/pending", self.page_memory_pending, ["GET"], "Pending memory reviews"),
             ("memory/review", self.page_memory_review, ["POST"], "Approve or reject memory"),
             ("profiles", self.page_profiles, ["GET"], "List profiles"),
@@ -135,6 +141,7 @@ class SavageTypePlugin(Star):
             ("reset", self.page_reset, ["POST"], "Clean rebuild with backup"),
             ("providers", self.page_providers, ["GET"], "List providers by type"),
             ("ui/theme", self.page_theme_set, ["POST"], "Save panel theme colors"),
+            ("ui/dynamic", self.page_dynamic_set, ["POST"], "Toggle dynamic colors"),
         ]
         for route, handler, methods, desc in apis:
             self.context.register_web_api(
@@ -148,8 +155,17 @@ class SavageTypePlugin(Star):
     async def on_message(self, event: AstrMessageEvent):
         try:
             text = (event.message_str or "").strip()
-            if not text:
-                text = await self._image_text(event)
+            if self._has_image(event):
+                image_text = await self._image_text(event)
+                if image_text:
+                    if not text or text in {"[图片]", "[image]", "[Image]", "<attachment>"}:
+                        text = image_text
+                    elif image_text not in text:
+                        text = f"{text} {image_text}"
+            try:
+                event.set_extra("_stype_text", text)
+            except Exception:
+                pass
             if not text:
                 return
             try:
@@ -182,13 +198,43 @@ class SavageTypePlugin(Star):
         except Exception as exc:  # noqa: BLE001
             logger.warning("Savage Type capture failed: %s", exc)
 
+    if hasattr(filter, "on_waiting_llm_request"):
+        @filter.on_waiting_llm_request()
+        async def on_waiting_llm_request(self, event: AstrMessageEvent, *args, **kwargs):
+            """会话锁等待期间预热检索缓存，让检索和排队时间重叠（AstrBot 支持时生效）。"""
+            try:
+                if not self.service.inject_ok(event):
+                    return
+                cached_text = ""
+                try:
+                    cached_text = str(event.get_extra("_stype_text") or "")
+                except Exception:
+                    cached_text = ""
+                query = (cached_text or event.message_str or "").strip()
+                if not query:
+                    return
+                persona_id = await self._persona_id(event)
+                ident = await self._ident(event)
+                await self.service.warm_retrieval(
+                    query,
+                    ident["speaker_id"],
+                    persona_id=persona_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Savage Type warm retrieval skipped: %s", exc)
+
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         try:
             self.service.refresh_coexistence(self.context.get_all_stars())
             if not self.service.inject_ok(event):
                 return
-            query = (event.message_str or req.prompt or "").strip()
+            cached_text = ""
+            try:
+                cached_text = str(event.get_extra("_stype_text") or "")
+            except Exception:
+                cached_text = ""
+            query = (cached_text or event.message_str or req.prompt or "").strip()
             if not query:
                 return
             persona_id = await self._persona_id(event)
@@ -299,9 +345,16 @@ class SavageTypePlugin(Star):
 
     @stype.command("dossier")
     async def cmd_dossier(self, event: AstrMessageEvent, speaker_id: str = ""):
-        """查看某人按 QQ 汇总的短档案"""
+        """查看某人按 QQ 汇总的短档案（查别人需管理员）"""
         ident = await self._ident(event)
         sid = (speaker_id or ident["speaker_id"]).strip()
+        if (
+            sid != ident["speaker_id"]
+            and not self.service.is_admin_event(event)
+            and not self.service.is_owner_event(event)
+        ):
+            yield event.plain_result("查看别人的档案需要管理员权限。")
+            return
         card = self.service.dossier_for(sid, persona_id=ident.get("persona_id") or "")
         if not card.get("card"):
             yield event.plain_result(f"{sid} 还没有短档案（需要至少一条 live 事实）。")
@@ -355,6 +408,7 @@ class SavageTypePlugin(Star):
         lines = [f"{r.id} {r.role} {clip(r.content, 60)}" for r in rows]
         yield event.plain_result("\n".join(lines))
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @stype.command("supersede")
     async def cmd_supersede(self, event: AstrMessageEvent, pending_id: int):
         """确认一条待覆盖"""
@@ -377,8 +431,8 @@ class SavageTypePlugin(Star):
     @stype.command("alias")
     async def cmd_alias(self, event: AstrMessageEvent, alias: str, canonical: str):
         """把说话人 id 归并到稳定 id：/stype alias 旧id 主id"""
-        self.store.set_alias(alias, canonical)
-        yield event.plain_result(f"已映射 {alias} -> {canonical}")
+        moved = self.store.reassign_speaker(alias, canonical)
+        yield event.plain_result(f"已归并 {alias} -> {canonical}（迁移事实 {moved} 条，同槽冲突已自动消解）")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @stype.command("aliases")
@@ -492,6 +546,7 @@ class SavageTypePlugin(Star):
         """睡眠维护：近重合并、时间线压缩、低价值归档"""
         yield event.plain_result(str(self.service.sleep_maintenance()))
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @stype.command("microscope")
     async def cmd_microscope(self, event: AstrMessageEvent, n: int = 3):
         """查看最近注入快照：路由、选中事实、过滤原因"""
@@ -591,6 +646,11 @@ class SavageTypePlugin(Star):
         except Exception:
             return []
 
+    def _has_image(self, event: AstrMessageEvent) -> bool:
+        return any(
+            "image" in type(comp).__name__.lower() for comp in self._message_components(event)
+        )
+
     def _image_caption_from_event(self, event: AstrMessageEvent) -> str:
         """Caption that AstrBot already produced for an image, if present on the component."""
         parts: list[str] = []
@@ -602,50 +662,117 @@ class SavageTypePlugin(Star):
                 parts.append(str(caption).strip())
         return " ".join(p for p in parts if p)
 
-    async def _caption_via_provider(self, event: AstrMessageEvent, provider_id: str) -> str:
-        provider = self.context.get_provider_by_id(provider_id)
-        if provider is None:
-            return ""
+    def _image_urls(self, event: AstrMessageEvent) -> tuple[list[str], str]:
         urls: list[str] = []
+        used = ""
         for comp in self._message_components(event):
             if "image" not in type(comp).__name__.lower():
                 continue
-            for attr in ("url", "file", "path"):
+            for attr in ("url", "file", "path", "base64", "image_url"):
                 value = getattr(comp, attr, None)
-                if value:
-                    urls.append(str(value))
-                    break
+                if callable(value):
+                    try:
+                        value = value()
+                    except Exception:
+                        value = None
+                if not value:
+                    continue
+                text = str(value)
+                if attr in {"file", "path"} or text.startswith("file://"):
+                    path_text = text[7:] if text.startswith("file://") else text
+                    path_text = urllib.parse.unquote(path_text)
+                    if re.match(r"^/[A-Za-z]:", path_text):
+                        path_text = path_text[1:]
+                    text = self._local_image_data_url(path_text) or text
+                elif attr == "base64" and not text.startswith("data:"):
+                    text = f"data:image/png;base64,{text}"
+                urls.append(text)
+                used = attr
+                break
+        return urls, used
+
+    @staticmethod
+    def _local_image_data_url(raw: str) -> str:
+        """Convert a local image path to a data URL so vision providers can read it."""
+        try:
+            path = Path(raw)
+            if not path.is_file():
+                return ""
+            mime = mimetypes.guess_type(path.name)[0] or "image/png"
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            return f"data:{mime};base64,{encoded}"
+        except Exception:
+            return ""
+
+    def _caption_timeout(self) -> int:
+        raw = self.config.get("image_caption_timeout_seconds")
+        return 30 if raw is None else int(raw)
+
+    async def _caption_via_provider(self, event: AstrMessageEvent, provider_id: str) -> str:
+        def note(kind: str, payload: dict) -> None:
+            try:
+                self.store.add_diag(kind, payload)
+            except Exception:
+                pass
+
+        timeout = self._caption_timeout()
+        if timeout <= 0:
+            note("image_caption_skip", {"reason": "timeout_disabled"})
+            return ""
+        provider = self.context.get_provider_by_id(provider_id)
+        if provider is None:
+            note("image_caption_fail", {"error": f"provider_not_found: {provider_id}"[:200]})
+            return ""
+        urls, used = self._image_urls(event)
         if not urls:
+            note("image_caption_fail", {"error": "no_image_url"})
             return ""
         call = getattr(provider, "text_chat", None)
         if not callable(call):
+            note("image_caption_fail", {"error": "provider_has_no_text_chat"})
             return ""
         result = call(prompt="用一句中文客观描述这张图片，不要推测。", image_urls=urls)
         if asyncio.iscoroutine(result):
-            result = await result
+            result = await asyncio.wait_for(result, timeout=timeout)
         text = getattr(result, "completion_text", "") or ""
-        return str(text).strip()
+        text = str(text).strip()
+        if text:
+            note("image_caption_ok", {"field": used, "chars": len(text)})
+        else:
+            note("image_caption_fail", {"error": "empty_response"})
+        return text
 
     async def _image_text(self, event: AstrMessageEvent) -> str:
-        """Turn an image-only message into text. Only captions when explicitly configured."""
+        """Turn an image message into text. Placeholder alone if no caption is available."""
         caption = self._image_caption_from_event(event)
+        if not self._has_image(event):
+            return ""
+        if not self.service.capture_ok(event) and not self.service.inject_ok(event):
+            return ""
         if not caption:
             provider_id = str(self.config.get("image_caption_provider_id") or "").strip()
-            has_image = any(
-                "image" in type(comp).__name__.lower() for comp in self._message_components(event)
-            )
-            if not provider_id or not has_image:
-                return ""
-            try:
-                caption = await self._caption_via_provider(event, provider_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Savage Type image caption failed: %s", exc)
+            if not provider_id:
                 try:
-                    self.store.add_diag("image_caption_fail", {"error": str(exc)[:200]})
+                    now = now_ts()
+                    last = int(self.store.get_meta("image_caption_skip_at") or "0")
+                    if now - last >= 60:
+                        self.store.set_meta("image_caption_skip_at", str(now))
+                        self.store.add_diag("image_caption_skip", {"reason": "no_provider"})
                 except Exception:
                     pass
-                return ""
-        return f"[图片] {caption}" if caption else ""
+            if provider_id:
+                try:
+                    caption = await self._caption_via_provider(event, provider_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Savage Type image caption failed: %s", exc)
+                    try:
+                        self.store.add_diag(
+                            "image_caption_fail",
+                            {"error": f"{type(exc).__name__}: {exc}"[:200], "timeout": self._caption_timeout()},
+                        )
+                    except Exception:
+                        pass
+        return f"[图片] {caption}".strip() if caption else "[图片]"
 
     async def _persona_id(self, event: AstrMessageEvent) -> str:
         umo = getattr(event, "unified_msg_origin", "") or ""
@@ -736,7 +863,9 @@ class SavageTypePlugin(Star):
         keyword = request.query.get("q", "")
         speaker_id = request.query.get("speaker_id", "") or None
         k = request.query.get("k", 12, type=int)
-        facts = self.store.search_facts(keyword, speaker_id=speaker_id, limit=k)
+        canonical = self.store.resolve_speaker(speaker_id) if speaker_id else None
+        ids = self.store.speaker_ids_for(canonical) if canonical else None
+        facts = self.store.search_facts(keyword, speaker_id=canonical, limit=k, speaker_ids=ids)
         return json_response({"items": [self._fact_view(f) for f in facts]})
 
     async def page_facts(self):
@@ -769,6 +898,10 @@ class SavageTypePlugin(Star):
             }
         )
 
+    async def page_memory_bot(self):
+        facts = self.store.person_facts("bot_self", limit=200)
+        return json_response({"items": [self._fact_view(f) for f in facts]})
+
     def _memory_review_view(self, r) -> dict:
         return {
             "id": r.id,
@@ -800,6 +933,10 @@ class SavageTypePlugin(Star):
         if not review_id:
             return error_response("missing id", status_code=400)
         status = str(payload.get("status") or "").strip().lower()
+        approve = status in {"approved", "approve", "pass", "yes"}
+        reject = status in {"rejected", "reject", "delete", "no"}
+        if not approve and not reject:
+            return error_response("bad status", status_code=400)
         plain = str(payload.get("plain") or "").strip()
         if plain:
             item = self.store.get_memory_review(review_id)
@@ -807,11 +944,9 @@ class SavageTypePlugin(Star):
                 new_payload = dict(item.payload or {})
                 new_payload["plain"] = plain
                 self.store.update_memory_review(review_id, plain=plain, payload=new_payload)
-        if status in {"approved", "approve", "pass", "yes"}:
-            return json_response({"ok": True, "message": self.service.resolve_memory_review(review_id, True)})
-        if status in {"rejected", "reject", "delete", "no"}:
-            return json_response({"ok": True, "message": self.service.resolve_memory_review(review_id, False)})
-        return error_response("bad status", status_code=400)
+        return json_response(
+            {"ok": True, "message": self.service.resolve_memory_review(review_id, approve)}
+        )
 
     def _profile_view(self, profile) -> dict:
         if profile is None:
@@ -829,15 +964,18 @@ class SavageTypePlugin(Star):
         }
 
     async def page_profiles(self):
-        items = self.store.list_profiles(limit=300)
+        # 主人身份与人物档案分开：人物档案列表不展示主人。
+        items = [p for p in self.store.list_profiles(limit=300) if not p.is_owner]
         return json_response({"items": [self._profile_view(p) for p in items]})
 
     async def page_profile(self):
         speaker_id = (request.query.get("speaker_id", "") or "").strip()
         if not speaker_id:
             return error_response("missing speaker_id", status_code=400)
-        profile = self.store.get_profile(speaker_id)
-        facts = self.store.person_facts(speaker_id, limit=200)
+        canonical = self.store.resolve_speaker(speaker_id)
+        ids = self.store.speaker_ids_for(canonical)
+        profile = self.store.get_profile(canonical)
+        facts = self.store.person_facts(canonical, limit=200, speaker_ids=ids)
         return json_response(
             {
                 "profile": self._profile_view(profile),
@@ -883,10 +1021,51 @@ class SavageTypePlugin(Star):
                 return error_response("bad importance", status_code=400)
             fields["importance"] = max(0.0, min(1.0, importance))
         if fields:
+            normalized = apply_slot(
+                {
+                    "subject": fact.subject,
+                    "attribute": fact.attribute,
+                    "value": fields.get("value", fact.value),
+                    "content": fields.get("content", fact.content),
+                    "speaker_id": fact.speaker_id,
+                    "speaker_name": fact.speaker_name,
+                    "persona_id": fact.persona_id,
+                    "topic": getattr(fact, "topic", ""),
+                }
+            )
+            fields["attribute"] = normalized["attribute"]
+            fields["value"] = normalized["value"]
+            fields["kind"] = normalized["kind"]
+            fields["topic"] = normalized.get("topic", "")
+            new_value = str(normalized["value"])
+            if new_value != fact.value or not fact.slot_key_value:
+                base_key = make_slot_key(
+                    fact.persona_id or "",
+                    fact.speaker_id,
+                    normalized["subject"],
+                    normalized["attribute"],
+                    new_value,
+                )
+                old_base = make_slot_key(
+                    fact.persona_id or "",
+                    fact.speaker_id,
+                    fact.subject,
+                    fact.attribute,
+                    fact.value,
+                )
+                if (
+                    fact.slot_key_value
+                    and fact.slot_key_value != old_base
+                    and fields.get("topic")
+                ):
+                    # 这条在「同词不同义」的分槽里，改值也要保持分槽，别撞回基础槽。
+                    base_key = f"{base_key}|{fields['topic']}"
+                fields["slot_key"] = base_key
             fields["edited_at"] = now_ts()
             fields["edited_by"] = "ui"
             fields["review_status"] = "manual"
             self.store.update_fact(fact_id, **fields)
+            self.store.resolve_slot_conflicts(fact.speaker_id)
         return json_response({"ok": True, "fact": self._fact_view(self.store.get_fact(fact_id))})
 
     async def page_reset(self):
@@ -895,6 +1074,7 @@ class SavageTypePlugin(Star):
             return error_response("missing confirm=reset", status_code=400)
         backup = self.service.backup_now(self.data_dir / "backups")
         counts = self.store.clear_dirty_v280()
+        self.service.clear_runtime_caches()
         self.store.add_diag("clean_rebuild", {"backup": str(backup), "cleared": counts})
         return json_response({"ok": True, "backup": str(backup), "cleared": counts})
 
@@ -979,6 +1159,19 @@ class SavageTypePlugin(Star):
             }
         )
 
+    async def page_dynamic_set(self):
+        payload = await request.json(default={})
+        raw = payload.get("enabled", True)
+        if isinstance(raw, str):
+            enabled = raw.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            enabled = bool(raw)
+        self.config["ui_dynamic_colors"] = enabled
+        if hasattr(self.config, "save_config"):
+            self.config.save_config()
+        self.service.apply_config()
+        return json_response({"ok": True, "enabled": enabled})
+
     async def page_pending(self):
         items = self.store.pending_open(80)
         return json_response(
@@ -1025,7 +1218,8 @@ class SavageTypePlugin(Star):
         speaker_id = str(payload.get("speaker_id") or "admin").strip() or "admin"
         speaker = {
             "speaker_id": speaker_id,
-            "speaker_name": str(payload.get("speaker_name") or speaker_id),
+            # 不给名字时留空：由 service 回退到已有档案昵称，避免 QQ 号覆盖昵称。
+            "speaker_name": str(payload.get("speaker_name") or ""),
             "bot_id": "",
             "window_tag": "console",
             "persona_id": str(payload.get("persona_id") or ""),
@@ -1044,8 +1238,11 @@ class SavageTypePlugin(Star):
         canonical = str(payload.get("canonical_id") or payload.get("canonical") or "").strip()
         if not alias or not canonical:
             return error_response("missing alias or canonical_id", status_code=400)
-        self.store.set_alias(alias, canonical, str(payload.get("label") or ""))
-        return json_response({"ok": True, "alias": alias, "canonical_id": canonical})
+        moved = self.store.reassign_speaker(alias, canonical, str(payload.get("label") or ""))
+        if moved == 0:
+            # 没有可迁移的数据时也把别名写上，供检索归组。
+            self.store.set_alias(alias, canonical, str(payload.get("label") or ""))
+        return json_response({"ok": True, "alias": alias, "canonical_id": canonical, "moved": moved})
 
     def _review_view(self, r) -> dict:
         return {
@@ -1120,8 +1317,8 @@ class SavageTypePlugin(Star):
         text = str(payload.get("text") or "").strip()
         if not text:
             return error_response("missing text", status_code=400)
-        users = [s.strip() for s in str(payload.get("user_names") or "").split(",") if s.strip()]
-        bots = [s.strip() for s in str(payload.get("bot_names") or "").split(",") if s.strip()]
+        users = parse_csv(str(payload.get("user_names") or ""))
+        bots = parse_csv(str(payload.get("bot_names") or ""))
         return json_response(self.service.preview_chat(text, user_names=users, bot_names=bots))
 
     async def page_chat_import(self):
@@ -1129,8 +1326,8 @@ class SavageTypePlugin(Star):
         text = str(payload.get("text") or "").strip()
         if not text:
             return error_response("missing text", status_code=400)
-        users = [s.strip() for s in str(payload.get("user_names") or "").split(",") if s.strip()]
-        bots = [s.strip() for s in str(payload.get("bot_names") or "").split(",") if s.strip()]
+        users = parse_csv(str(payload.get("user_names") or ""))
+        bots = parse_csv(str(payload.get("bot_names") or ""))
         return json_response(self.service.import_chat(text, user_names=users, bot_names=bots))
 
     def _schema(self) -> dict:
@@ -1186,6 +1383,10 @@ class SavageTypePlugin(Star):
             options = spec.get("options")
             if options and value not in options:
                 return error_response(f"{key} must be one of {options}", status_code=400)
+            if key in {"ui_theme_color", "ui_theme_color2", "ui_theme_color3"}:
+                if value and not re.match(r"^#[0-9a-fA-F]{6}$", str(value)):
+                    return error_response(f"{key} must be hex color", status_code=400)
+                value = str(value).lower()
             self.config[key] = value
             saved[key] = value
         if hasattr(self.config, "save_config"):
@@ -1217,7 +1418,11 @@ class SavageTypePlugin(Star):
         fact_id = int(payload.get("id") or 0)
         if not fact_id:
             return error_response("missing id", status_code=400)
-        pinned = bool(payload.get("pinned", True))
+        raw_pinned = payload.get("pinned", True)
+        if isinstance(raw_pinned, str):
+            pinned = raw_pinned.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            pinned = bool(raw_pinned)
         if not self.store.set_pinned(fact_id, pinned):
             return error_response("fact not found", status_code=404)
         return json_response({"ok": True, "id": fact_id, "pinned": int(pinned)})
@@ -1267,6 +1472,7 @@ class SavageTypePlugin(Star):
             "importance": round(float(getattr(f, "importance", 0) or 0), 3),
             "weight": self._fact_weight(f),
             "kind": getattr(f, "kind", ""),
+            "topic": getattr(f, "topic", ""),
             "pinned": int(getattr(f, "pinned", 0) or 0),
             "speaker_id": f.speaker_id,
             "speaker_name": f.speaker_name,

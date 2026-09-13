@@ -12,8 +12,13 @@ from .util import (
     FIRST_PERSON_RE,
     HEARSAY_RE,
     JOKE_RE,
+    MASTER_RE,
+    ORIGIN_MANUAL,
     RELATION_GUARD_RE,
+    REVIEW_MANUAL,
+    ROLE_BOT_ID,
     STATUS_PENDING,
+    detect_domain,
     fingerprint,
     make_slot_key,
     normalize_slot,
@@ -30,7 +35,7 @@ def looks_like_hearsay(text: str) -> bool:
 
 
 def looks_first_person(text: str) -> bool:
-    return bool(FIRST_PERSON_RE.search(text or ""))
+    return bool(FIRST_PERSON_RE.search(text or "") or MASTER_RE.search(text or ""))
 
 
 def looks_correction(text: str) -> bool:
@@ -62,6 +67,9 @@ class ContradictionEngine:
 
     def _relation_guard(self, payload: dict[str, Any]) -> bool:
         """Return True when the fact must be rejected as an unverifiable relation claim."""
+        if str(payload.get("speaker_id") or "") == ROLE_BOT_ID:
+            # Bot 自己的身份/称呼由主人定义，按定义记录，不走「外人攀关系」守卫。
+            return False
         attribute = str(payload.get("attribute") or "")
         if attribute not in {"identity", "name"}:
             return False
@@ -82,12 +90,16 @@ class ContradictionEngine:
         """Write a fact with guarded override. Conflicting live facts are deleted."""
         payload = apply_slot(dict(payload))
         payload.setdefault("status", "live")
+        if payload.get("speaker_id"):
+            # 身份合并后，旧 id 的写入统一归到规范 id，避免绕过合并又建一份。
+            payload["speaker_id"] = self.store.resolve_speaker(str(payload.get("speaker_id")))
         persona_id = str(payload.get("persona_id") or "")
         payload["slot_key"] = make_slot_key(
             persona_id,
             str(payload.get("speaker_id") or ""),
             str(payload.get("subject") or ""),
             str(payload.get("attribute") or ""),
+            str(payload.get("value") or ""),
         )
         payload.setdefault(
             "fingerprint",
@@ -121,7 +133,12 @@ class ContradictionEngine:
                 "speaker_id": payload.get("speaker_id"),
             }
 
-        if looks_like_joke(source_text) and not explicit:
+        manual = (
+            str(payload.get("origin") or "") == ORIGIN_MANUAL
+            or str(payload.get("review_status") or "") == REVIEW_MANUAL
+        )
+        if not manual and looks_like_joke(source_text) and not explicit:
+            # 玩笑守卫只拦自动链路；人工补记/审核通过表示人已确认，不应再进待审。
             payload["status"] = STATUS_PENDING
             payload["reason"] = "joke_or_banter"
             pending_id = self.store.add_pending(0, payload, "joke_or_banter")
@@ -140,12 +157,36 @@ class ContradictionEngine:
             payload["attribute"],
             persona_id=persona_id,
             speaker_ids=self.store.speaker_ids_for(str(payload.get("speaker_id") or "")),
+            value=str(payload.get("value") or ""),
         )
+        domain_new = str(payload.get("topic") or "")
+        prefer = payload["attribute"] in {"likes", "dislikes"}
+        if existing is None and prefer and domain_new:
+            # 基础槽没有，但可能已存在「同词不同义」的分槽事实。
+            sep_key = f"{payload['slot_key']}|{domain_new}"
+            separated = self.store.live_fact_by_slot_key(sep_key)
+            if separated is not None:
+                existing = separated
+                payload["slot_key"] = sep_key
+
         if existing is None:
             if op == "close":
                 return {"action": "ignored", "reason": "close_without_existing"}
             fact_id = self.store.add_fact(payload)
             return {"action": "insert", "fact_id": fact_id}
+
+        domain_old = str(getattr(existing, "topic", "") or "") or detect_domain(
+            existing.content or "", existing.value or ""
+        )
+        if prefer and domain_new and domain_old and domain_new != domain_old:
+            # 同一个词、不同领域（美式咖啡 vs 美式穿搭）：不合并，存成独立分槽。
+            sep_key = f"{existing.slot_key()}|{domain_new}"
+            same = self.store.live_fact_by_slot_key(sep_key)
+            if same is None:
+                payload["slot_key"] = sep_key
+                fact_id = self.store.add_fact(payload)
+                return {"action": "insert", "fact_id": fact_id, "reason": "domain_split"}
+            existing = same
 
         if op == "close":
             self.store.update_fact(
@@ -157,8 +198,31 @@ class ContradictionEngine:
             return {"action": "closed", "fact_id": existing.id}
 
         if not values_conflict(existing.value, payload["value"]):
+            if prefer and domain_new and not domain_old:
+                # 旧条目判不出领域、新条目判出了：拿不准是否同义，交人工确认（安全阀）。
+                pending_id = self.store.add_pending(
+                    existing.id,
+                    payload,
+                    "domain_needs_confirm",
+                )
+                return {
+                    "action": "pending",
+                    "pending_id": pending_id,
+                    "old_fact_id": existing.id,
+                    "reason": "domain_needs_confirm",
+                }
             merged = self._merge_same(existing, payload)
             return {"action": "refresh", "fact_id": existing.id, **merged}
+
+        if int(getattr(existing, "pinned", 0)):
+            # 置顶是明确的长期记忆，任何冲突都先人工确认，不自动删除。
+            pending_id = self.store.add_pending(existing.id, payload, "pinned_needs_confirm")
+            return {
+                "action": "pending",
+                "pending_id": pending_id,
+                "old_fact_id": existing.id,
+                "reason": "pinned_needs_confirm",
+            }
 
         allowed = first_person or explicit
         if not allowed:
@@ -196,6 +260,9 @@ class ContradictionEngine:
         if float(payload.get("importance") or 0) <= 0 and float(old.importance or 0) > 0:
             # 覆盖不降级：新事实至少继承旧事实的重要性。
             payload["importance"] = float(old.importance)
+        if not payload.get("topic") and getattr(old, "topic", ""):
+            # 领域信息随覆盖继承，避免新条丢失语境。
+            payload["topic"] = old.topic
         new_id = self.store.add_fact(payload, bump=False)
         self.store.delete_fact(old.id)
         return {
@@ -212,15 +279,37 @@ class ContradictionEngine:
         item = items[0]
         old = self.store.get_fact(item.old_fact_id) if item.old_fact_id else None
         payload = dict(item.new_payload)
-        if old and old.status == "live":
+        payload["status"] = "live"
+        if item.reason == "domain_needs_confirm":
+            # 通过 = 确认这是另一种含义：存成独立分槽，旧条保留。
+            domain = str(payload.get("topic") or "")
+            base = str(payload.get("slot_key") or "")
+            if base and domain:
+                payload["slot_key"] = f"{base}|{domain}"
+            result = {"action": "insert", "fact_id": self.store.add_fact(payload)}
+        elif old and old.status == "live":
             result = self.supersede(old, payload)
         else:
-            result = {"action": "insert", "fact_id": self.store.add_fact(payload)}
+            # 待审期间旧条目可能已消失或已被改写：按当前槽位重新找冲突，避免插入重复活条。
+            current = self.store.live_by_slot(
+                str(payload.get("speaker_id") or ""),
+                str(payload.get("subject") or ""),
+                str(payload.get("attribute") or ""),
+                persona_id=str(payload.get("persona_id") or ""),
+                speaker_ids=self.store.speaker_ids_for(str(payload.get("speaker_id") or "")),
+                value=str(payload.get("value") or ""),
+            )
+            if current is not None:
+                result = self.supersede(current, payload)
+            else:
+                result = {"action": "insert", "fact_id": self.store.add_fact(payload)}
         self.store.set_pending_status(pending_id, "applied")
         result["ok"] = True
         return result
 
     def reject_pending(self, pending_id: int) -> dict[str, Any]:
+        if not any(p.id == pending_id for p in self.store.pending_open(200)):
+            return {"ok": False, "error": "pending not found"}
         self.store.set_pending_status(pending_id, "rejected")
         return {"ok": True, "action": "rejected", "pending_id": pending_id}
 
@@ -240,14 +329,40 @@ class ContradictionEngine:
             float(existing.importance or 0),
             float(payload.get("importance") or 0),
         )
-        self.store.update_fact(
-            existing.id,
-            value=payload.get("value", existing.value),
-            content=payload.get("content", existing.content),
-            evidence=evidence,
-            confidence=confidence,
-            importance=importance,
-            last_accessed=now_ts(),
-            access_count=existing.access_count + 1,
-        )
+        subject = str(payload.get("subject", existing.subject) or "")
+        attribute = str(payload.get("attribute", existing.attribute) or "")
+        value = str(payload.get("value", existing.value) or "")
+        persona_id = existing.persona_id or ""
+        fields: dict[str, Any] = {
+            "value": value,
+            "content": payload.get("content", existing.content),
+            "evidence": evidence,
+            "confidence": confidence,
+            "importance": importance,
+            "last_accessed": now_ts(),
+            "access_count": existing.access_count + 1,
+        }
+        if payload.get("plain"):
+            # 用最新一次归一的直白写法刷新展示文本；拆出的分句不会再显示整句。
+            fields["plain"] = str(payload.get("plain"))
+        if payload.get("keywords"):
+            fields["keywords"] = list(payload.get("keywords") or [])
+        if payload.get("topic") and not getattr(existing, "topic", ""):
+            fields["topic"] = str(payload.get("topic"))
+        if value != existing.value:
+            # value 变了必须同步 slot_key / fingerprint，否则会出现同一槽位的重复活条。
+            old_base = make_slot_key(
+                persona_id, existing.speaker_id, subject, attribute, existing.value
+            )
+            new_key = make_slot_key(persona_id, existing.speaker_id, subject, attribute, value)
+            if existing.slot_key_value and existing.slot_key_value != old_base:
+                # 这条事实本来就在「同词不同义」的分槽里，保持分槽键。
+                topic = getattr(existing, "topic", "") or str(payload.get("topic") or "")
+                if topic:
+                    new_key = f"{new_key}|{topic}"
+            fields["slot_key"] = new_key
+            fields["fingerprint"] = fingerprint(
+                persona_id, existing.speaker_id, subject, attribute, value
+            )
+        self.store.update_fact(existing.id, **fields)
         return {"confidence": confidence}
