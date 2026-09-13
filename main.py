@@ -47,7 +47,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "3.4.20",
+    "4.0.0",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
