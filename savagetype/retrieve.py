@@ -6,6 +6,8 @@ import math
 import time
 from typing import Any, Awaitable, Callable
 
+from . import tokenize as tokenizer_mod
+from .bm25 import BM25Index
 from .models import Fact, RetrievalHit, RetrievalResult
 from .store import Store
 from .util import (
@@ -133,16 +135,35 @@ class Retriever:
         rerank: RerankFn | None = None,
         mode: str = "auto",
         cache_ttl: int = 20,
+        bm25: bool = True,
     ):
         self.store = store
         self.embed = embed
         self.rerank = rerank
         self.mode = mode
         self.cache_ttl = cache_ttl
+        self.bm25 = bm25
+        self._terms_revision = -1
         self._cache: dict[str, tuple[float, RetrievalResult]] = {}
 
     def cache_key(self, query: str, speaker_id: str, persona_id: str = "") -> str:
-        return f"{persona_id}|{speaker_id}|{self.store.revision()}|{self.mode}|{query.strip()}"
+        flag = "b" if self.bm25 else "k"
+        return f"{persona_id}|{speaker_id}|{self.store.revision()}|{self.mode}|{flag}|{query.strip()}"
+
+    def _register_custom_terms(self) -> None:
+        """Feed approved jargon into the jieba dict so niche terms tokenize whole."""
+        revision = self.store.revision()
+        if revision == self._terms_revision:
+            return
+        self._terms_revision = revision
+        try:
+            terms = [
+                str(item.payload.get("term") or "")
+                for item in self.store.approved_reviews("jargon", limit=60)
+            ]
+            tokenizer_mod.add_terms(terms)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def retrieve(
         self,
@@ -314,9 +335,22 @@ class Retriever:
             else:
                 visible.append(fact)
 
+        bm25_scores: dict[int, float] | None = None
+        if self.bm25:
+            try:
+                self._register_custom_terms()
+                index = BM25Index(visible)
+                index.prepare(query)
+                raw = {fact.id: index.score(fact) for fact in visible}
+                top = max(raw.values(), default=0.0)
+                # 归一化到 0-1，保持与既有先验权重（置信度/新旧/重要性）的平衡。
+                bm25_scores = {fid: value / top for fid, value in raw.items()} if top > 0 else {}
+            except Exception:  # noqa: BLE001
+                bm25_scores = None
+
         local_ranked = sorted(
             visible,
-            key=lambda f: self._local_score(query, f, speaker_id, route, ids, importance_cfg),
+            key=lambda f: self._local_score(query, f, speaker_id, route, ids, importance_cfg, bm25_scores),
             reverse=True,
         )
         local_ids = [f.id for f in local_ranked[: max(top_k * 2, 12)]]
@@ -345,7 +379,12 @@ class Retriever:
             fact = fused_facts.get(fid)
             if not fact:
                 continue
-            score = rrf + 0.15 * keyword_score(query, fact) + 0.1 * embed_map.get(fid, 0)
+            keyword_part = (
+                float(bm25_scores.get(fid, 0.0))
+                if bm25_scores is not None
+                else keyword_score(query, fact)
+            )
+            score = rrf + 0.15 * keyword_part + 0.1 * embed_map.get(fid, 0)
             if fact.speaker_id in ids:
                 score += 0.08
             hits.append(RetrievalHit(fact=fact, score=score, source="rrf"))
@@ -392,8 +431,12 @@ class Retriever:
         route: str,
         speaker_ids: list[str] | None = None,
         importance_cfg: dict[str, Any] | None = None,
+        bm25_scores: dict[int, float] | None = None,
     ) -> float:
-        score = keyword_score(query, fact)
+        if bm25_scores is None:
+            score = keyword_score(query, fact)
+        else:
+            score = float(bm25_scores.get(fact.id, 0.0))
         age_days = max(0, (now_ts() - (fact.updated_at or now_ts())) / 86400)
         recency = 1.0 / (1.0 + age_days / 14)
         score += 0.2 * recency

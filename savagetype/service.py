@@ -13,6 +13,7 @@ from .archive import (
     archive_low_value,
     backup_db,
     compact_summarized_timeline,
+    compact_superseded,
     expire_pending_overrides,
     expire_persona_drafts,
     expire_status_facts,
@@ -23,6 +24,7 @@ from .archive import (
     preview_jsonl,
     prune_jargon_stats,
 )
+from . import tokenize as tokenizer_mod
 from .coexistence import Coexistence
 from .contradiction import ContradictionEngine
 from .extract import Extractor
@@ -133,6 +135,7 @@ class SavageTypeService:
             rerank=self._rerank,
             mode=str(config.get("retrieval_mode") or "auto"),
             cache_ttl=max(0, int(20 if config.get("cache_ttl_seconds") is None else config.get("cache_ttl_seconds"))),
+            bm25=bool(True if config.get("retrieval_bm25") is None else config.get("retrieval_bm25")),
         )
         self._extract_lock = asyncio.Lock()
         self._embed_lock = asyncio.Lock()
@@ -226,10 +229,16 @@ class SavageTypeService:
         self.pipeline.config = self.config
         mode = str(self.config.get("retrieval_mode") or "auto")
         cache_ttl = max(0, int(self._cfg_value("cache_ttl_seconds", 20)))
-        if self.retriever.mode != mode or self.retriever.cache_ttl != cache_ttl:
+        bm25 = bool(self._cfg_value("retrieval_bm25", True))
+        if (
+            self.retriever.mode != mode
+            or self.retriever.cache_ttl != cache_ttl
+            or self.retriever.bm25 != bm25
+        ):
             self.retriever._cache.clear()
         self.retriever.mode = mode
         self.retriever.cache_ttl = cache_ttl
+        self.retriever.bm25 = bm25
         self._rebuild_owner_ids()
         was_active = self.retriever.embed is not None
         self._sync_embed_fn()
@@ -570,7 +579,7 @@ class SavageTypeService:
                 ident.get("platform", ""),
                 is_owner=False,
             )
-        if is_owner and not text.startswith("[图片]"):
+        if not text.startswith("[图片]") and self.learning.jargon_scope_ok(is_owner):
             self.learning.observe_message(text, persona_id=ident.get("persona_id") or "")
         ts = now_ts()
         event_id = self.store.add_timeline(
@@ -1125,6 +1134,10 @@ class SavageTypeService:
         expired_status = expire_status_facts(self.store)
         retain_days = int(self.config.get("sleep_timeline_retain_days") or 30)
         compacted = compact_summarized_timeline(self.store, retain_days=retain_days)
+        compacted_superseded = compact_superseded(
+            self.store,
+            retain_days=int(self.config.get("sleep_superseded_retain_days") or 90),
+        )
         archived = archive_low_value(
             self.store,
             min_age_days=int(self.config.get("sleep_low_value_days") or 30),
@@ -1153,6 +1166,7 @@ class SavageTypeService:
             "folded_preferences": folded,
             "expired_status": expired_status,
             "compacted_timeline": compacted,
+            "compacted_superseded": compacted_superseded,
             "archived_low_value": archived,
             "archived_decayed": decayed,
             "expired_persona_drafts": expired,
@@ -1263,6 +1277,8 @@ class SavageTypeService:
                 "capture": self.capture_ok(),
                 "inject": self.inject_ok(),
                 "retrieval_mode": self.config.get("retrieval_mode"),
+                "bm25": bool(self.retriever.bm25),
+                "tokenizer": tokenizer_mod.name(),
                 "embedding_enabled": bool(self.config.get("embedding_enabled")),
                 "pipeline_enabled": bool(self.config.get("pipeline_enabled", True)),
                 "platforms": self.allowed_platforms(),

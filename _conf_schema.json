@@ -102,6 +102,12 @@
     "hint": "basic=本地关键词；auto=有 Rerank 就用（推荐先配 Rerank），失败回退本地；rerank=强制尝试。Embedding 是另一路补充，默认关，live 到 2500 才自动用。",
     "default": "auto"
   },
+  "retrieval_bm25": {
+    "description": "BM25 关键词排序",
+    "type": "bool",
+    "hint": "用 BM25 替换原关键词打分（稀有词权重更高、长文本不过度占优）；装了 jieba 会自动分词并把已批准黑话加入词典，否则按字符切。关闭后回到旧打分。",
+    "default": true
+  },
   "embedding_enabled": {
     "description": "启用 Embedding",
     "type": "bool",
@@ -263,11 +269,36 @@
     "type": "int",
     "default": 120
   },
+  "jargon_scope": {
+    "description": "黑话统计范围",
+    "type": "string",
+    "options": ["all", "owner"],
+    "hint": "all=统计平台/白名单内所有人的消息（默认，能学到群黑话）；owner=只统计主人自己的消息。",
+    "default": "all"
+  },
   "fewshot_enabled": {
     "description": "真实对话 few-shot",
     "type": "bool",
     "hint": "从时间线里的 user→bot 邻接对生成表达样本，默认待审。",
     "default": true
+  },
+  "fewshot_cooldown_seconds": {
+    "description": "few-shot 排队冷却（秒）",
+    "type": "int",
+    "hint": "每隔这段时间最多扫一次时间线，避免每条消息都产生待审样本。0=不冷却。",
+    "default": 600
+  },
+  "fewshot_max_per_run": {
+    "description": "每轮 few-shot 最多排队条数",
+    "type": "int",
+    "hint": "按质量分从高到低选取，防止审查队列刷屏。0=不限。",
+    "default": 5
+  },
+  "fewshot_min_quality": {
+    "description": "few-shot 入队最低质量分",
+    "type": "int",
+    "hint": "0-100，默认 0 不过滤。调高只会留下更完整的对话样本。",
+    "default": 0
   },
   "persona_draft_enabled": {
     "description": "人格增量草稿",
@@ -318,6 +349,12 @@
     "description": "低价值归档置信度上限",
     "type": "float",
     "default": 0.45
+  },
+  "sleep_superseded_retain_days": {
+    "description": "被覆盖旧记忆保留天数",
+    "type": "int",
+    "hint": "改口覆盖后旧说法会作废保留，期间可以回滚；超过该天数后由维护清理。",
+    "default": 90
   },
   "importance_weight": {
     "description": "重要性在检索中的权重",

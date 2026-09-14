@@ -300,6 +300,23 @@ def compact_summarized_timeline(store: Store, retain_days: int = 30, limit: int 
     return len(ids)
 
 
+def compact_superseded(store: Store, retain_days: int = 90, limit: int = 500) -> int:
+    """Delete expired superseded facts; the rollback window is the retention period."""
+    cutoff = now_ts() - max(1, retain_days) * 86400
+    rows = store.query(
+        "SELECT id FROM facts WHERE status='superseded' AND updated_at<? "
+        "ORDER BY updated_at ASC LIMIT ?",
+        (cutoff, max(1, limit)),
+    )
+    ids = [int(r["id"]) for r in rows]
+    if not ids:
+        return 0
+    q = ",".join("?" * len(ids))
+    store.execute(f"DELETE FROM facts WHERE id IN ({q})", ids)
+    store.bump_revision()
+    return len(ids)
+
+
 def archive_low_value(store: Store, min_age_days: int = 30, max_confidence: float = 0.45, limit: int = 200) -> int:
     cutoff = now_ts() - max(1, min_age_days) * 86400
     rows = store.query(

@@ -257,6 +257,7 @@ class ContradictionEngine:
     def supersede(self, old: Fact, payload: dict[str, Any]) -> dict[str, Any]:
         payload = dict(payload)
         payload["status"] = "live"
+        payload["supersedes"] = old.id
         if float(payload.get("importance") or 0) <= 0 and float(old.importance or 0) > 0:
             # 覆盖不降级：新事实至少继承旧事实的重要性。
             payload["importance"] = float(old.importance)
@@ -264,12 +265,18 @@ class ContradictionEngine:
             # 领域信息随覆盖继承，避免新条丢失语境。
             payload["topic"] = old.topic
         new_id = self.store.add_fact(payload, bump=False)
-        self.store.delete_fact(old.id)
+        # 旧条不删除：标记作废保留，回滚和「改口摘要」都靠它。
+        self.store.update_fact(
+            old.id,
+            status="superseded",
+            superseded_by=new_id,
+            reason="superseded",
+        )
         return {
             "action": "supersede",
             "fact_id": new_id,
             "old_fact_id": old.id,
-            "deleted_old": True,
+            "invalidated_old": True,
         }
 
     def confirm_pending(self, pending_id: int) -> dict[str, Any]:
@@ -314,10 +321,33 @@ class ContradictionEngine:
         return {"ok": True, "action": "rejected", "pending_id": pending_id}
 
     def rollback(self, fact_id: int) -> dict[str, Any]:
-        return {
-            "ok": False,
-            "error": "冲突覆盖会删除旧条，无法回滚。请重新手动记住。",
-        }
+        """Undo one supersede: archive the new fact, restore the old one to live."""
+        fact = self.store.get_fact(fact_id)
+        if fact is None:
+            return {"ok": False, "error": "fact not found"}
+        if fact.status != "live":
+            return {"ok": False, "error": f"只能回滚 live 事实（当前 {fact.status}）"}
+        old_id = int(getattr(fact, "supersedes", 0) or 0)
+        if not old_id:
+            return {"ok": False, "error": "这条事实没有可回滚的覆盖记录"}
+        old = self.store.get_fact(old_id)
+        if old is None:
+            return {"ok": False, "error": f"旧事实 #{old_id} 已被维护清理，无法回滚"}
+        if old.status != "superseded":
+            return {"ok": False, "error": f"旧事实 #{old_id} 当前是 {old.status}，不是被覆盖状态"}
+        conflict = self.store.live_by_slot(
+            old.speaker_id,
+            old.subject,
+            old.attribute,
+            persona_id=old.persona_id,
+            speaker_ids=self.store.speaker_ids_for(old.speaker_id),
+            value=old.value,
+        )
+        if conflict is not None and conflict.id != fact.id:
+            return {"ok": False, "error": f"槽位已被 #{conflict.id} 占用，先处理它再回滚"}
+        self.store.update_fact(fact.id, status="archived", reason="rolled_back")
+        self.store.update_fact(old.id, status="live", reason="rollback", superseded_by=None)
+        return {"ok": True, "action": "rollback", "restored_id": old.id, "archived_id": fact.id}
 
     def _merge_same(self, existing: Fact, payload: dict[str, Any]) -> dict[str, Any]:
         evidence = list(existing.evidence)

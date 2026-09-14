@@ -10,6 +10,15 @@ let currentProfileId = "";
 let profilesCache = [];
 let memoryCache = [];
 let memoryMode = "owner";
+let reviewsStatus = "pending";
+let reviewsKind = "";
+let settingsGroup = (() => {
+  try {
+    return localStorage.getItem("stype.settings.group") || "";
+  } catch (err) {
+    return "";
+  }
+})();
 
 function unwrap(result) {
   if (result && typeof result === "object" && "status" in result && "data" in result) {
@@ -171,9 +180,6 @@ function updateDynamicButton() {
   btn.textContent = dynamicOn ? "动态颜色：开" : "动态颜色：关";
   btn.classList.toggle("on", dynamicOn);
   btn.classList.toggle("ghost", !dynamicOn);
-  // 设置表单里的同名复选框同步，否则点「保存设置」会用旧值把动态颜色关掉。
-  const box = document.querySelector('#settings-form [name="ui_dynamic_colors"]');
-  if (box) box.checked = dynamicOn;
 }
 
 function startDynamic() {
@@ -268,6 +274,7 @@ function factActions(f, where) {
   return `<div class="actions">
     <button type="button" class="ghost tiny" data-act="fact-pin" data-id="${esc(f.id)}" data-pinned="${f.pinned ? 1 : 0}" data-where="${esc(where)}">${pinLabel}</button>
     <button type="button" class="ghost tiny" data-act="fact-edit" data-id="${esc(f.id)}" data-where="${esc(where)}">编辑</button>
+    ${f.supersedes ? `<button type="button" class="ghost tiny" data-act="fact-rollback" data-id="${esc(f.id)}" data-where="${esc(where)}">回滚改口</button>` : ""}
     <button type="button" class="ghost tiny" data-act="fact-del" data-id="${esc(f.id)}" data-where="${esc(where)}">删除</button>
   </div>`;
 }
@@ -479,39 +486,89 @@ async function loadDiagnostics() {
 async function loadArchived() {
   const box = $("archive-list");
   if (!box) return;
-  const data = await apiGet("facts", { status: "archived" });
-  const items = data.items || [];
+  const [archived, superseded] = await Promise.all([
+    apiGet("facts", { status: "archived" }),
+    apiGet("facts", { status: "superseded" }),
+  ]);
+  const items = [...(archived.items || []), ...(superseded.items || [])]
+    .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
   box.innerHTML = items.length
-    ? items.slice(0, 80).map((f) => `<div class="item">
+    ? items.slice(0, 120).map((f) => {
+        const isSuperseded = f.status === "superseded";
+        const reason = isSuperseded ? "被新说法覆盖" : (f.reason || "");
+        return `<div class="item">
         <div class="item-head">
           <span class="chip gray">#${esc(f.id)}</span>
           <span class="chip gray">${esc(f.kind || f.attribute)}</span>
           <span class="chip gray">${esc(speakerLabel(f.speaker_name, f.speaker_id))}</span>
+          ${isSuperseded ? `<span class="chip warn">已覆盖</span>` : ""}
         </div>
         <div class="plain">${esc(f.plain || f.content || f.value)}</div>
-        <div class="meta">${esc(f.reason || "")} · ${esc(fmtTime(f.updated_at))}</div>
+        <div class="meta">${esc(reason)} · ${esc(fmtTime(f.updated_at))}</div>
         <div class="actions">
           <button type="button" class="ghost tiny" data-act="fact-restore" data-id="${esc(f.id)}">恢复</button>
         </div>
-      </div>`).join("")
+      </div>`;
+      }).join("")
     : `<p class="lede">回收站是空的。</p>`;
 }
 
+const REVIEW_KIND_LABELS = { jargon: "黑话", fewshot: "表达样本", persona: "人格草稿" };
+const REVIEW_STATUS_LABELS = { pending: "待审", approved: "已批准", rejected: "已驳回" };
+
+function reviewItemHtml(r) {
+  const payload = r.payload || {};
+  let detail = "";
+  if (r.kind === "jargon") {
+    detail = `<div class="plain">含义：${esc(payload.meaning || "")}</div>`;
+  } else if (r.kind === "fewshot") {
+    detail = `<div class="plain">用户：${esc(payload.user || "")}</div><div class="plain">Bot：${esc(payload.bot || "")}</div>`;
+  } else if (r.kind === "persona") {
+    detail = `<div class="plain">${esc(payload.draft || "")}</div>`;
+  }
+  const statusChip = r.status === "approved" ? "ok" : r.status === "rejected" ? "gray" : "warn";
+  const actions = reviewsStatus === "pending"
+    ? `<button type="button" class="tiny" data-act="approve" data-id="${esc(r.id)}">批准</button>
+       <button type="button" class="ghost tiny" data-act="reject-review" data-id="${esc(r.id)}">驳回</button>`
+    : `<button type="button" class="ghost tiny" data-act="review-reopen" data-id="${esc(r.id)}">改回待审</button>`;
+  return `<div class="item">
+    <div class="item-head">
+      ${reviewsStatus === "pending" ? `<input type="checkbox" data-role="review-check" value="${esc(r.id)}" />` : ""}
+      <span class="chip ${statusChip}">${esc(REVIEW_KIND_LABELS[r.kind] || r.kind)}</span>
+      <b>#${esc(r.id)}</b> <span>${esc(r.title)}</span>
+      ${r.quality ? `<span class="chip gray">Q${esc(r.quality)}</span>` : ""}
+    </div>
+    ${detail}
+    <div class="meta">QQ/id ${esc(r.speaker_id || "")} · ${esc(fmtTime(r.updated_at || r.created_at))}</div>
+    <div class="actions">${actions}</div>
+  </div>`;
+}
+
 async function loadReviews() {
-  const data = await apiGet("reviews", { status: "pending" });
+  const query = { status: reviewsStatus };
+  if (reviewsKind) query.kind = reviewsKind;
+  const data = await apiGet("reviews", query);
   const items = data.items || [];
   const box = $("reviews");
   if (!box) return;
-  box.innerHTML = items.length
-    ? items.map((r) => `<div class="item">
-        <div class="item-head"><span class="chip">${esc(r.kind)}</span><b>#${esc(r.id)}</b> ${esc(r.title)}</div>
-        <div class="meta">QQ/id ${esc(r.speaker_id || "")}</div>
-        <div class="actions">
-          <button type="button" class="tiny" data-act="approve" data-id="${esc(r.id)}">批准</button>
-          <button type="button" class="ghost tiny" data-act="reject-review" data-id="${esc(r.id)}">驳回</button>
-        </div>
-      </div>`).join("")
-    : `<p class="lede">没有待审学习项。</p>`;
+  const tabs = ["pending", "approved", "rejected"].map((s) =>
+    `<button type="button" class="${reviewsStatus === s ? "tiny" : "ghost tiny"}" data-act="reviews-status" data-status="${s}">${REVIEW_STATUS_LABELS[s]}</button>`
+  ).join("");
+  const kinds = [["", "全部"], ["fewshot", "表达样本"], ["jargon", "黑话"], ["persona", "人格草稿"]].map(([k, label]) =>
+    `<button type="button" class="${reviewsKind === k ? "tiny" : "ghost tiny"}" data-act="reviews-kind" data-kind="${k}">${label}</button>`
+  ).join("");
+  const batch = reviewsStatus === "pending"
+    ? `<button type="button" class="ghost tiny" data-act="reviews-select-all">全选/取消</button>
+       <button type="button" class="tiny" data-act="reviews-batch" data-status="approved">批准选中</button>
+       <button type="button" class="ghost tiny" data-act="reviews-batch" data-status="rejected">驳回选中</button>`
+    : "";
+  const empty = `<p class="lede">没有${REVIEW_STATUS_LABELS[reviewsStatus] || ""}学习项。</p>`;
+  box.innerHTML = `
+    <div class="row">${tabs}</div>
+    <div class="row">${kinds}</div>
+    ${batch ? `<div class="row">${batch}</div>` : ""}
+    ${items.length ? items.map(reviewItemHtml).join("") : empty}
+  `;
 }
 
 const PENDING_REASON_LABELS = {
@@ -522,19 +579,83 @@ const PENDING_REASON_LABELS = {
   domain_needs_confirm: "疑似同词不同义（通过=存成两条）",
 };
 
+const PENDING_REASON_HELP = {
+  joke_or_banter: "这句像玩笑或反话，系统不敢自动覆盖。通过＝写入新说法并覆盖旧条；驳回＝丢弃新说法。",
+  pinned_needs_confirm: "旧条是置顶记忆，任何冲突都不会自动删除。通过＝新说法生效并删除旧条；驳回＝保留旧条。",
+  not_first_person_or_correction: "新说法不是本人第一人称自述，也不是明确纠正。通过＝覆盖旧条；驳回＝保留旧条。",
+  high_evidence_needs_confirm: "旧条置信度高且被使用过，系统不敢自动覆盖。通过＝新说法生效并删除旧条；驳回＝保留旧条。",
+  domain_needs_confirm: "同一个词疑似不同含义（如美式咖啡 / 美式穿搭），拿不准要不要合并。通过＝两条并存；驳回＝丢弃新说法、保留旧条。",
+};
+
+function pendingFactText(v) {
+  return v.plain || v.content || v.value || "（无内容）";
+}
+
+function pendingFactMeta(f) {
+  if (!f) return "旧条已不存在（可能已被其他改动处理）";
+  return [
+    speakerLabel(f.speaker_name, f.speaker_id),
+    f.pinned ? "置顶" : "",
+    f.attribute ? `槽位 ${f.attribute}${f.topic ? "/" + f.topic : ""}` : "",
+    `置信度 ${f.confidence}`,
+    `访问 ${f.access_count ?? 0} 次`,
+    f.updated_at ? `更新于 ${fmtTime(f.updated_at)}` : "",
+  ].filter(Boolean).join(" · ");
+}
+
+function pendingNewMeta(n) {
+  const evidence = (n.evidence || []).map((x) => `#${x}`).join(" ");
+  return [
+    speakerLabel(n.speaker_name, n.speaker_id),
+    n.attribute ? `槽位 ${n.attribute}${n.topic ? "/" + n.topic : ""}` : "",
+    n.window_tag ? `来源 ${n.window_tag}` : "",
+    evidence ? `证据消息 ${evidence}` : "",
+    n.explicit_correction ? "明确纠正" : "",
+    n.first_person ? "第一人称" : "",
+  ].filter(Boolean).join(" · ");
+}
+
 async function loadPending() {
   const data = await apiGet("pending");
   const items = data.items || [];
   const box = $("pending");
   if (!box) return;
   box.innerHTML = items.length
-    ? items.map((p) => `<div class="item">
-        <div>#${esc(p.id)} ← old ${esc(p.old_fact_id)} · ${esc(PENDING_REASON_LABELS[p.reason] || p.reason)}</div>
-        <div class="actions">
-          <button type="button" class="tiny" data-act="pending-confirm" data-id="${esc(p.id)}">确认覆盖</button>
-          <button type="button" class="ghost tiny" data-act="pending-reject" data-id="${esc(p.id)}">驳回</button>
+    ? items.map((p) => {
+        const reasonLabel = PENDING_REASON_LABELS[p.reason] || p.reason || "待确认";
+        const help = PENDING_REASON_HELP[p.reason] || "通过＝新说法生效；驳回＝保留旧条。";
+        const old = p.old_fact;
+        const nw = p.new_fact || {};
+        const confirmLabel = p.reason === "domain_needs_confirm" ? "通过（存成两条）" : "通过（新覆盖旧）";
+        return `<div class="item">
+        <div class="item-head">
+          <span class="chip">#${esc(p.id)} 待确认覆盖</span>
+          <span class="chip warn">${esc(reasonLabel)}</span>
+          <span class="chip gray">${esc(fmtTime(p.created_at))}</span>
         </div>
-      </div>`).join("")
+        <div class="compare">
+          <div class="compare-row old">
+            <span class="compare-tag">旧</span>
+            <div class="compare-body">
+              <div class="plain">${old ? esc(pendingFactText(old)) : "<em>旧条已不存在</em>"}</div>
+              <div class="meta">${esc(pendingFactMeta(old))}</div>
+            </div>
+          </div>
+          <div class="compare-row new">
+            <span class="compare-tag">新</span>
+            <div class="compare-body">
+              <div class="plain">${esc(pendingFactText(nw))}</div>
+              <div class="meta">${esc(pendingNewMeta(nw))}</div>
+            </div>
+          </div>
+        </div>
+        <div class="meta">${esc(help)}</div>
+        <div class="actions">
+          <button type="button" class="tiny" data-act="pending-confirm" data-id="${esc(p.id)}">${confirmLabel}</button>
+          <button type="button" class="ghost tiny" data-act="pending-reject" data-id="${esc(p.id)}">驳回（保留旧条）</button>
+        </div>
+      </div>`;
+      }).join("")
     : `<p class="lede">没有待确认覆盖。</p>`;
 }
 
@@ -667,13 +788,20 @@ function fieldControl(key, spec, value, providers) {
 const SETTING_GROUPS = [
   { title: "总开关与采集", keys: ["enabled", "capture_enabled", "inject_enabled", "owner_qq", "notify_umo", "memory_source_platforms", "memory_whitelist"] },
   { title: "抽取与整理（AI 管线）", keys: ["extract_enabled", "pipeline_enabled", "summary_provider_id", "normalize_provider_id", "verify_provider_id", "extract_min_messages", "extract_cooldown_seconds", "extract_fail_cooldown_seconds", "extract_idle_seconds", "pipeline_max_revisions", "pipeline_batch_size", "pipeline_notify_cooldown_seconds"] },
-  { title: "检索与注入", keys: ["retrieval_mode", "provider_timeout_seconds", "inject_budget_chars", "inject_warm_triggered", "inject_novelty_filter", "top_k", "core_fact_limit", "related_fact_limit", "inject_dedup_window_seconds", "cache_ttl_seconds", "high_evidence_confidence", "debug_log_injection", "coexistence_degrade"] },
-  { title: "重要性与维护", keys: ["importance_weight", "importance_half_life_days", "importance_reinforce_factor", "importance_max_half_life_multiplier", "importance_prune_threshold", "sleep_timeline_retain_days", "sleep_low_value_days", "sleep_low_value_confidence", "empty_profile_ttl_days"] },
-  { title: "学习与人格草稿", keys: ["learning_enabled", "jargon_enabled", "jargon_min_count", "jargon_cooldown_seconds", "fewshot_enabled", "persona_draft_enabled", "persona_draft_min_fewshots", "persona_draft_cooldown_seconds", "persona_draft_ttl_seconds", "inject_jargon_limit", "inject_fewshot_limit"] },
+  { title: "检索与注入", keys: ["retrieval_mode", "retrieval_bm25", "provider_timeout_seconds", "inject_budget_chars", "inject_warm_triggered", "inject_novelty_filter", "top_k", "core_fact_limit", "related_fact_limit", "inject_dedup_window_seconds", "cache_ttl_seconds", "high_evidence_confidence", "debug_log_injection", "coexistence_degrade"] },
+  { title: "重要性与维护", keys: ["importance_weight", "importance_half_life_days", "importance_reinforce_factor", "importance_max_half_life_multiplier", "importance_prune_threshold", "sleep_timeline_retain_days", "sleep_low_value_days", "sleep_low_value_confidence", "sleep_superseded_retain_days", "empty_profile_ttl_days"] },
+  { title: "学习与人格草稿", keys: ["learning_enabled", "jargon_enabled", "jargon_scope", "jargon_min_count", "jargon_cooldown_seconds", "fewshot_enabled", "persona_draft_enabled", "persona_draft_min_fewshots", "persona_draft_cooldown_seconds", "persona_draft_ttl_seconds", "inject_jargon_limit", "inject_fewshot_limit"] },
   { title: "图片", keys: ["image_caption_provider_id", "image_caption_timeout_seconds"] },
   { title: "Embedding 与 Rerank", keys: ["embedding_enabled", "embedding_auto_threshold", "embedding_provider_id", "rerank_provider_id"] },
-  { title: "界面配色", keys: ["ui_dynamic_colors", "ui_theme_color", "ui_theme_color2", "ui_theme_color3"] },
 ];
+
+const SETTINGS_APPEARANCE = "外观";
+const SETTINGS_HANDLED_ELSEWHERE = new Set([
+  "ui_dynamic_colors",
+  "ui_theme_color",
+  "ui_theme_color2",
+  "ui_theme_color3",
+]);
 
 function groupSchema(schema) {
   const used = new Set();
@@ -682,9 +810,30 @@ function groupSchema(schema) {
     entries.forEach(([k]) => used.add(k));
     return { title: g.title, entries };
   }).filter((g) => g.entries.length);
-  const rest = Object.entries(schema).filter(([k]) => !used.has(k));
+  const rest = Object.entries(schema).filter(
+    ([k]) => !used.has(k) && !SETTINGS_HANDLED_ELSEWHERE.has(k)
+  );
   if (rest.length) groups.push({ title: "其他", entries: rest });
   return groups;
+}
+
+function applySettingsGroup(key, persist = true) {
+  settingsGroup = key;
+  if (persist) {
+    try {
+      localStorage.setItem("stype.settings.group", key);
+    } catch (err) {
+      /* ignore storage errors */
+    }
+  }
+  document.querySelectorAll("#page-settings .settings-panel").forEach((el) => {
+    el.classList.toggle("on", el.dataset.group === key);
+  });
+  document.querySelectorAll('#settings-nav [data-act="settings-group"]').forEach((el) => {
+    const on = el.dataset.group === key;
+    el.classList.toggle("on", on);
+    el.classList.toggle("ghost", !on);
+  });
 }
 
 async function loadSettings() {
@@ -692,11 +841,29 @@ async function loadSettings() {
   const schema = data.schema || {};
   const values = data.values || {};
   renderThemeControls(values.ui_theme_color, values.ui_theme_color2, values.ui_theme_color3);
-  $("settings-form").innerHTML = groupSchema(schema).map((g) => `
-    <details class="setting-group">
-      <summary>${esc(g.title)}<span class="chip gray">${g.entries.length}</span></summary>
-      <div class="settings">${g.entries.map(([key, spec]) => fieldControl(key, spec, values[key], providers)).join("")}</div>
-    </details>`).join("");
+  const groups = groupSchema(schema);
+  const items = groups.map((g) => ({ key: g.title, title: g.title, count: g.entries.length }));
+  items.push({ key: SETTINGS_APPEARANCE, title: SETTINGS_APPEARANCE, count: 0 });
+  if (!items.some((item) => item.key === settingsGroup)) {
+    settingsGroup = items[0].key;
+  }
+  $("settings-nav").innerHTML = items
+    .map(
+      (item) => `<button type="button" class="settings-nav-item" data-act="settings-group" data-group="${esc(item.key)}">
+        <span class="settings-nav-title">${esc(item.title)}</span>
+        ${item.count ? `<span class="chip gray">${item.count}</span>` : ""}
+      </button>`
+    )
+    .join("");
+  $("settings-form").innerHTML = groups
+    .map(
+      (g) => `<section class="card settings-panel" data-group="${esc(g.title)}">
+        <h2>${esc(g.title)}</h2>
+        <div class="settings">${g.entries.map(([key, spec]) => fieldControl(key, spec, values[key], providers)).join("")}</div>
+      </section>`
+    )
+    .join("");
+  applySettingsGroup(settingsGroup, false);
 }
 
 async function saveTheme(color, color2, color3) {
@@ -882,6 +1049,14 @@ async function onAct(act, el) {
     await loadOverview();
     await loadArchived();
   });
+  if (act === "fact-rollback") return run("已回滚改口", async () => {
+    const r = await apiPost("rollback", { id: Number(el.dataset.id) });
+    if (el.dataset.where === "profile") await loadProfile(currentProfileId);
+    else await loadMemory();
+    await loadOverview();
+    await loadArchived();
+    return r;
+  });
   if (act === "remember-bot") return run("已写入", async () => {
     const content = $("remember-bot-text").value.trim();
     if (!content) return { ok: false, error: "empty" };
@@ -933,6 +1108,21 @@ async function onAct(act, el) {
   if (act === "pending-reject") return run("已驳回", async () => { await apiPost("pending/reject", { id: Number(el.dataset.id) }); await reload(); });
   if (act === "approve") return run("已批准", async () => { await apiPost("reviews/set", { id: Number(el.dataset.id), status: "approved" }); await loadReviews(); });
   if (act === "reject-review") return run("已驳回", async () => { await apiPost("reviews/set", { id: Number(el.dataset.id), status: "rejected" }); await loadReviews(); });
+  if (act === "reviews-status") return safe(async () => { reviewsStatus = el.dataset.status || "pending"; await loadReviews(); });
+  if (act === "reviews-kind") return safe(async () => { reviewsKind = el.dataset.kind || ""; await loadReviews(); });
+  if (act === "reviews-select-all") return safe(async () => {
+    const boxes = Array.from(document.querySelectorAll('#reviews [data-role="review-check"]'));
+    const allOn = boxes.length > 0 && boxes.every((b) => b.checked);
+    boxes.forEach((b) => { b.checked = !allOn; });
+  });
+  if (act === "reviews-batch") return run("已处理", async () => {
+    const ids = Array.from(document.querySelectorAll('#reviews [data-role="review-check"]:checked')).map((b) => Number(b.value));
+    if (!ids.length) return { ok: false, error: "none_selected", message: "没有勾选条目" };
+    const r = await apiPost("reviews/set", { ids, status: el.dataset.status });
+    await loadReviews();
+    return r;
+  });
+  if (act === "review-reopen") return run("已恢复待审", async () => { await apiPost("reviews/set", { id: Number(el.dataset.id), status: "pending" }); await loadReviews(); });
   if (act === "archive-preview") return run("已预览", () => apiPost("archive/preview", { path: $("archive-path").value.trim() }));
   if (act === "archive-import") return run("已导入档案", async () => { const r = await apiPost("archive/import", { path: $("archive-path").value.trim() }); await reload(); return r; });
   if (act === "chat-preview") return run("已预览聊天", () => apiPost("chat/preview", { text: $("chat-text").value, user_names: $("chat-users").value, bot_names: $("chat-bots").value }));
@@ -962,6 +1152,7 @@ async function onAct(act, el) {
     else stopDynamic(false);
     return apiPost("ui/dynamic", { enabled: next });
   });
+  if (act === "settings-group") return safe(() => applySettingsGroup(el.dataset.group || ""));
   if (act === "settings-save") return run("已保存设置", async () => { const r = await apiPost("config/save", { values: readSettings() }); await loadSettings(); await loadOverview(); return r; });
 }
 

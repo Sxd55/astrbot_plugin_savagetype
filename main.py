@@ -313,7 +313,7 @@ class SavageTypePlugin(Star):
             f"本会话平台 {self.service.event_platform(event) or '未知'}\n"
             f"允许平台 {', '.join(ov['config'].get('platforms') or []) or '不限'}\n"
             f"上次采集跳过 {skip_line}\n"
-            f"检索 {ov['config']['retrieval_mode']} embedding {ov['config']['embedding_enabled']}\n"
+            f"检索 {ov['config']['retrieval_mode']} bm25 {'开' if ov['config'].get('bm25') else '关'}({ov['config'].get('tokenizer') or 'builtin'}) embedding {ov['config']['embedding_enabled']}\n"
             f"降级 {', '.join(co['reasons']) or '无'}"
         )
 
@@ -1172,22 +1172,58 @@ class SavageTypePlugin(Star):
         self.service.apply_config()
         return json_response({"ok": True, "enabled": enabled})
 
+    @staticmethod
+    def _pending_new_view(payload: dict) -> dict:
+        def as_int(value, default: int = 0) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def as_float(value, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        evidence = []
+        for item in payload.get("evidence") or []:
+            text = str(item)
+            if text.lstrip("-").isdigit():
+                evidence.append(int(text))
+        return {
+            "subject": str(payload.get("subject") or ""),
+            "attribute": str(payload.get("attribute") or ""),
+            "value": str(payload.get("value") or ""),
+            "plain": str(payload.get("plain") or ""),
+            "content": str(payload.get("content") or ""),
+            "topic": str(payload.get("topic") or ""),
+            "speaker_id": str(payload.get("speaker_id") or ""),
+            "speaker_name": str(payload.get("speaker_name") or ""),
+            "window_tag": str(payload.get("window_tag") or ""),
+            "confidence": as_float(payload.get("confidence")),
+            "evidence": evidence[:8],
+            "source_event_id": as_int(payload.get("source_event_id")),
+            "first_person": as_int(payload.get("first_person")),
+            "explicit_correction": as_int(payload.get("explicit_correction")),
+        }
+
     async def page_pending(self):
         items = self.store.pending_open(80)
-        return json_response(
-            {
-                "items": [
-                    {
-                        "id": p.id,
-                        "old_fact_id": p.old_fact_id,
-                        "reason": p.reason,
-                        "created_at": p.created_at,
-                        "new_payload": p.new_payload,
-                    }
-                    for p in items
-                ]
-            }
-        )
+        out = []
+        for p in items:
+            old = self.store.get_fact(p.old_fact_id) if p.old_fact_id else None
+            out.append(
+                {
+                    "id": p.id,
+                    "old_fact_id": p.old_fact_id,
+                    "reason": p.reason,
+                    "created_at": p.created_at,
+                    "old_fact": self._fact_view(old) if old else None,
+                    "new_fact": self._pending_new_view(dict(p.new_payload or {})),
+                }
+            )
+        return json_response({"items": out})
 
     async def page_pending_confirm(self):
         payload = await request.json(default={})
@@ -1267,8 +1303,19 @@ class SavageTypePlugin(Star):
 
     async def page_review_set(self):
         payload = await request.json(default={})
-        review_id = int(payload.get("id") or 0)
         status = str(payload.get("status") or "").strip()
+        raw_ids = payload.get("ids")
+        if isinstance(raw_ids, list) and raw_ids:
+            results = []
+            for raw in raw_ids[:200]:
+                try:
+                    review_id = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if review_id:
+                    results.append(self.service.learning.set_status(review_id, status))
+            return json_response({"ok": True, "count": len(results), "results": results})
+        review_id = int(payload.get("id") or 0)
         if not review_id:
             return error_response("missing id", status_code=400)
         return json_response(self.service.learning.set_status(review_id, status))
@@ -1478,9 +1525,11 @@ class SavageTypePlugin(Star):
             "speaker_name": f.speaker_name,
             "status": f.status,
             "confidence": f.confidence,
+            "access_count": int(getattr(f, "access_count", 0) or 0),
             "mention_policy": f.mention_policy,
             "superseded_by": f.superseded_by,
             "supersedes": f.supersedes,
+            "created_at": int(getattr(f, "created_at", 0) or 0),
             "updated_at": f.updated_at,
             "reason": f.reason,
             "persona_id": getattr(f, "persona_id", ""),

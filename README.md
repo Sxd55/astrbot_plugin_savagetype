@@ -3,7 +3,7 @@
 **Savage Type** 是面向 AstrBot 的全局人格记忆中枢。Savage 只是插件名：身份和语气永远读 AstrBot 当前人格，本插件只负责**记住事实、处理改口、在需要时把少量相关记忆注入本轮对话**。不改写人格文件，不做日程和主动陪伴。
 
 当前版本 `v4.0.0`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
-要求 AstrBot `>= 4.22.0`；离线测试只需 Python 3.11+ 标准库。
+要求 AstrBot `>= 4.22.0`；运行依赖只有 `jieba`（可选，BM25 分词用，装不上自动回退）；离线测试只需 Python 3.11+ 标准库。
 
 ---
 
@@ -12,7 +12,7 @@
 | 问题 | 本插件的做法 |
 | --- | --- |
 | 对话记录不等于记忆，全塞回上下文又贵又乱 | 消息先落时间线，后台 AI 缩写成「直白事实」并对照原文审核，只把与本轮相关的一小包注入 |
-| 改口/纠正会并存矛盾记忆 | 槽位冲突引擎：同槽新说法覆盖旧条，高证据旧条先人工确认；玩笑、转述、不确定不覆盖 |
+| 改口/纠正会并存矛盾记忆 | 槽位冲突引擎：同槽新说法覆盖旧条（旧条作废保留可回滚），高证据旧条先人工确认；玩笑、转述、不确定不覆盖 |
 | 「喜欢猫 / 喜欢狗 / 喜欢咖啡」互相覆盖 | 偏好按**主题分槽**，不同主题并存；同一个词不同含义（美式咖啡 / 美式穿搭）按**领域**分槽 |
 | 同一个人有多个 id（QQ + ChatUI） | 身份归一：ChatUI 主人自动并入主人 QQ，别名映射 + 历史迁移 |
 | 记忆越积越多、旧的永远占上下文 | 重要性 + 半衰期衰减 + 召回强化；低价值进回收站；置顶永不归档 |
@@ -48,7 +48,7 @@
 ### 3. 写入护栏（contradiction）
 
 - **槽位**：`人格 | 说话人 | 主体 | 属性 | 主题`；偏好（likes/dislikes）带主题，同一主题只有一条 live。
-- **改口覆盖**：新的第一人称说法/显式纠正覆盖旧条；旧条删除前会保护置顶条。
+- **改口覆盖**：新的第一人称说法/显式纠正覆盖旧条；旧条标记「作废保留」不删除，默认保留 90 天可回滚，超期由维护清理；置顶条任何冲突都需人工确认。
 - **高证据待确认**：旧条置信度高且被访问过，新的单次非纠正说法先进入「待确认覆盖」队列，主人确认才覆盖。
 - **玩笑 / 反话 / 转述守卫**：命中玩笑词进入待确认；转述（听说/别人说）标「不确定」；人工补记与审核通过不受此限。
 - **关系词守卫**：主人 / owner / 老公老婆 / 爸妈 / 老板 等关系或权限自称，非主人一律拒绝；主人自己的降级为备注。
@@ -61,12 +61,13 @@
 - 基础重要性：主人手动写入 1.0 / AI 审核通过 0.8 / 未审核 0.5，显式纠正和第一人称再加权。
 - 衰减：按半衰期指数衰减；被召回会缩短密度、拉长半衰期（访问强化）。
 - 归档：权重低于阈值且超期的记忆在维护时进回收站；状态类记忆按 TTL 过期归档。
+- 作废：改口覆盖的旧说法转 `superseded` 保留（参与「改口摘要」注入、支持回滚），超过 `sleep_superseded_retain_days`（默认 90 天）由维护清理。
 - 回收站可恢复；若槽位已被新记忆占用会阻止恢复，避免出现两条冲突事实。
 - 面板事实卡显示**当前权重**，可编辑基础重要度；置顶/取消置顶。
 
 ### 5. 检索（retrieval）
 
-- 本地关键词打分：recency + confidence + importance 衰减权重 + 说话人匹配 + 置顶加权。
+- 本地关键词打分：BM25（稀有词权重 + 词频饱和 + 长度归一化）叠加 recency + confidence + importance 衰减权重 + 说话人匹配 + 置顶加权；装了 jieba 自动分词并把已批准黑话加入自定义词典，jieba 缺失时回退字符切分，检索照常工作。
 - 可选 Embedding：默认关；live 事实达到 `embedding_auto_threshold`（默认 2500，0=从不自动）时自动补一路向量召回（不改配置开关）。
 - 可选 Rerank：默认 `auto`（有 Rerank Provider 就用）；Embedding + Rerank 双路结果用 **RRF** 融合，**MMR** 做多样性去重。
 - 主人条目与第三人点名（「查一下小明的资料」）单独并入。
@@ -96,8 +97,10 @@
 
 ### 8. 学习审查（learning，管「怎么说」）
 
-- 黑话统计：词频预筛 + LLM 注释，批准后才参与注入；拒绝的词条会从统计里清除。
+- 黑话统计：词频预筛 + LLM 注释，批准后才参与注入；拒绝的词条会从统计里清除。统计范围默认覆盖平台/白名单内所有人的可见消息（`jargon_scope=all`），可切回只统计主人（`owner`）。
 - Few-shot 表达样本：真实「用户→bot」回合对，批准后按相关性注入。
+- 排队节流：默认 10 分钟最多扫一次时间线、每轮最多排队 5 条（按质量分择优），避免每条消息都产生待审样本；管理命令 `/stype learn` 会绕过节流立刻扫描。
+- 面板审查：按状态（待审/已批准/已驳回）和类型（表达样本/黑话/人格草稿）筛选，支持勾选批量批准、驳回，已审条目可改回待审。
 - 人格补丁草稿：参考已批准样本写 80 字内草稿，**不写回人格文件**，批准后约 14 天有效。
 - 与「待审记忆」分开：事实自动写，重点审查的是表达方式。
 
@@ -105,7 +108,7 @@
 
 - 同槽冲突消解；偏好折叠（同主题 note/dislikes → likes，正反矛盾不折叠、跨领域不折叠）。
 - 时间线压缩：超保留期且不被任何事实引用的原文清理。
-- 低价值归档、衰减归档、状态 TTL 过期、人格草稿过期。
+- 低价值归档、衰减归档、状态 TTL 过期、作废记录过期清理、人格草稿过期。
 - 黑话词条清理、过期待确认清理、空档案清理。
 - 每 6 小时自动跑轻量清理（空档案 + 偏好折叠），手动「维护」跑全量。
 
@@ -130,10 +133,10 @@
 
 ### 13. 面板（AstrBot WebUI → 插件 → Savage Type → 拓展页）
 
-- **记忆库**：主人记忆 / Savage 记忆（Bot 自己的定义，可手动写入）切换；待审记忆（可直接编辑后过审）；手动补记（自动识别偏好句，一次可写多条）；学习审查；待确认覆盖（原因中文化）；说话人归并建议。
+- **记忆库**：主人记忆 / Savage 记忆（Bot 自己的定义，可手动写入）切换；待审记忆（可直接编辑后过审）；手动补记（自动识别偏好句，一次可写多条）；学习审查（状态/类型筛选、批量批准驳回、改回待审）；待确认覆盖（旧→新对比、来源与通过含义说明）；说话人归并建议。
 - **人物档案**：搜索、点选查看，改昵称/备注，条目增删改、置顶。
-- **诊断**：注入显微镜（路由、命中、过滤原因、`chars≈tokens`）、聊天导入、回收站（归档恢复，槽位冲突阻止）、原始 JSON 诊断、清空并重建（先自动备份）。
-- **设置**：62 项配置按 8 组分类（默认收起）：总开关与采集 / 抽取与整理 / 检索与注入 / 重要性与维护 / 学习与人格草稿 / 图片 / Embedding 与 Rerank / 界面配色。
+- **诊断**：注入显微镜（路由、命中、过滤原因、`chars≈tokens`）、聊天导入、回收站（归档+被覆盖恢复，槽位冲突阻止）、原始 JSON 诊断、清空并重建（先自动备份）。
+- **设置**：68 项配置按左右分栏展示（左侧导航、右侧只显示选中的一组，未保存的输入切组不丢；保存按钮固定在右下；窄屏导航变为顶部横向条）——总开关与采集 / 抽取与整理 / 检索与注入 / 重要性与维护 / 学习与人格草稿 / 图片 / Embedding 与 Rerank / 外观。
 - **外观**：Shader Gradient 风格——近黑底上跑真实 WebGL 片元着色器流动渐变（fbm 域扭曲），内容在磨砂玻璃面板上；5 组主题预设（极光 / 碧金 / 暮霞 / 午夜 / 森林）+ 三色取色器；**动态颜色**开关按固定顺序循环渐变（停 1 秒 / 过渡 5 秒），手动点预设自动关闭。
 - 动效降级：devicePixelRatio 封顶 2、离屏暂停、`prefers-reduced-motion` 单帧、WebGL 不可用或上下文丢失时回退静态 CSS 渐变。
 
@@ -153,6 +156,7 @@
 | `/stype pending` | 待审记忆列表（管理员） |
 | `/stype pass <id>` / `/stype drop <id>` | 通过 / 删除待审记忆（管理员） |
 | `/stype supersede <id>` | 确认一条待覆盖（管理员） |
+| `/stype rollback <id>` | 回滚一条覆盖：新条归档、旧条恢复（管理员） |
 | `/stype learn` | 跑一轮黑话/few-shot/人格草稿学习（管理员） |
 | `/stype reviews [kind]` | 待审学习项（管理员） |
 | `/stype approve <id>` / `/stype reject <id>` | 批准 / 驳回学习草稿（管理员） |
@@ -210,7 +214,7 @@ pages/console/           面板：index.html / app.js / style.css / shader.js(We
 - **领域消歧**：内置领域词典（饮品/食物/穿搭/娱乐/运动），从分句上下文判域，解决「美式」这类同词不同义。
 - **槽位 + 冲突决策树**：同槽 → 同值刷新 / 冲突覆盖 / 高证据待确认 / 领域分槽 / 玩笑待审，分支明确可审计。
 - **重要性建模**：基础分 × 半衰期指数衰减，访问强化拉长半衰期；维护时按阈值归档。
-- **检索融合**：本地关键词 + 可选向量余弦，RRF 融合排名，可选 cross-encoder 重排，MMR 去冗余。
+- **检索融合**：BM25 关键词 + 可选向量余弦，RRF 融合排名，可选 cross-encoder 重排，MMR 去冗余。
 - **检索缓存与降级**：昂贵路径缓存 + Provider 超时降级 + 会话锁期间预热。
 - **注入工程**：预算逐行装载、hot/warm/cold 分层、新颖度过滤、跨轮去重落库、稳定块优先排序、UNTRUSTED 包裹、临时附加块（不动 system_prompt）。
 - **学习审查**：统计预筛 + LLM 注释 + 人工批准后才生效，「先审后用」。
@@ -239,14 +243,14 @@ pages/console/           面板：index.html / app.js / style.css / shader.js(We
 | `pipeline_enabled` / `normalize_provider_id` / `verify_provider_id` | AI 整理与审核（面板只列对话模型） |
 | `extract_min_messages` / `extract_cooldown_seconds` / `extract_idle_seconds` | 抽取阈值、冷却、空闲触发 |
 | `pipeline_batch_size` / `pipeline_max_revisions` / `pipeline_notify_cooldown_seconds` | 批量、最大修订轮数、通知冷却 |
-| `retrieval_mode` / `top_k` / `core_fact_limit` / `related_fact_limit` | 检索模式与条数 |
+| `retrieval_mode` / `retrieval_bm25` / `top_k` / `core_fact_limit` / `related_fact_limit` | 检索模式与条数 |
 | `embedding_enabled` / `embedding_auto_threshold` / `embedding_provider_id` / `rerank_provider_id` | 向量与重排（AstrBot 原生页不支持选择器，需手填 ID） |
 | `provider_timeout_seconds` | Embedding/Rerank 超时（默认 5 秒，0=不限） |
 | `inject_budget_chars` / `inject_warm_triggered` / `inject_novelty_filter` / `inject_dedup_window_seconds` | 注入预算、按需注入、新颖度过滤、跨轮去重 |
 | `importance_weight` / `importance_half_life_days` / `importance_reinforce_factor` / `importance_max_half_life_multiplier` / `importance_prune_threshold` | 重要性、半衰期、强化、归档阈值 |
-| `sleep_timeline_retain_days` / `sleep_low_value_days` / `sleep_low_value_confidence` | 维护保留期与归档条件 |
+| `sleep_timeline_retain_days` / `sleep_low_value_days` / `sleep_low_value_confidence` / `sleep_superseded_retain_days` | 维护保留期与归档条件 |
 | `image_caption_provider_id` / `image_caption_timeout_seconds` | 图片转述模型与超时 |
-| `jargon_enabled` / `fewshot_enabled` / `persona_draft_enabled` 等 | 学习开关与限额 |
+| `jargon_enabled` / `jargon_scope` / `fewshot_enabled` / `fewshot_cooldown_seconds` / `fewshot_max_per_run` / `fewshot_min_quality` / `persona_draft_enabled` 等 | 学习开关与限额 |
 | `empty_profile_ttl_days` / `notify_umo` / `coexistence_degrade` | 空档案清理、通知会话、共存降级 |
 | `ui_theme_color` / `ui_theme_color2` / `ui_theme_color3` / `ui_dynamic_colors` | 面板三色主题与动态颜色 |
 
@@ -268,7 +272,7 @@ pages/console/           面板：index.html / app.js / style.css / shader.js(We
 python tests/test_core.py -v
 ```
 
-93 个测试，只用 Python 3.11+ 标准库，不联网。前端可做静态检查：把 `pages/console/app.js` / `shader.js` 复制为 `.mjs` 后 `node --check`。
+104 个测试，只用 Python 3.11+ 标准库，不联网。前端可做静态检查：把 `pages/console/app.js` / `shader.js` 复制为 `.mjs` 后 `node --check`。
 
 ---
 

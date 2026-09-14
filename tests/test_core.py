@@ -73,9 +73,81 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(r2["action"], "supersede")
         live = self.store.live_by_slot("u1", "self", "likes", value="不茶")
         self.assertEqual(live.value, "不茶")
-        self.assertIsNone(self.store.get_fact(r1["fact_id"]))
+        old = self.store.get_fact(r1["fact_id"])
+        self.assertIsNotNone(old)
+        self.assertEqual(old.status, "superseded")
+        self.assertEqual(old.superseded_by, live.id)
+        self.assertEqual(live.supersedes, r1["fact_id"])
         rb = self.engine.rollback(live.id)
-        self.assertFalse(rb["ok"])
+        self.assertTrue(rb["ok"])
+        self.assertEqual(self.store.get_fact(r1["fact_id"]).status, "live")
+        rolled = self.store.get_fact(live.id)
+        self.assertEqual(rolled.status, "archived")
+        self.assertEqual(rolled.reason, "rolled_back")
+
+    def test_superseded_chain_survives_for_recall_and_rollback(self):
+        r1 = self.engine.ingest(_payload(value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        r2 = self.engine.ingest(
+            _payload(value="不茶", content="我改口了，不喜欢茶了", explicit_correction=1),
+            "我改口了，不喜欢茶了",
+        )
+        r3 = self.engine.ingest(
+            _payload(value="茶", content="我又喜欢茶了", explicit_correction=1),
+            "我又喜欢茶了",
+        )
+        self.assertEqual(r3["action"], "supersede")
+        self.assertEqual(self.store.get_fact(r1["fact_id"]).status, "superseded")
+        self.assertEqual(self.store.get_fact(r2["fact_id"]).status, "superseded")
+        self.assertEqual(self.store.get_fact(r3["fact_id"]).status, "live")
+        recalls = {f.id for f in self.store.recent_superseded(["u1"])}
+        self.assertIn(r1["fact_id"], recalls)
+        self.assertIn(r2["fact_id"], recalls)
+
+        self.assertTrue(self.engine.rollback(r3["fact_id"])["ok"])
+        self.assertEqual(self.store.get_fact(r2["fact_id"]).status, "live")
+        self.assertEqual(self.store.get_fact(r3["fact_id"]).status, "archived")
+        self.assertTrue(self.engine.rollback(r2["fact_id"])["ok"])
+        self.assertEqual(self.store.get_fact(r1["fact_id"]).status, "live")
+
+    def test_rollback_blocks_when_slot_taken_by_third(self):
+        r1 = self.engine.ingest(_payload(value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        r2 = self.engine.ingest(
+            _payload(value="不茶", content="我改口了，不喜欢茶了", explicit_correction=1),
+            "我改口了，不喜欢茶了",
+        )
+        slot_key = self.store.get_fact(r2["fact_id"]).slot_key()
+        self.store.add_fact(
+            {
+                "subject": "self",
+                "attribute": "likes",
+                "value": "重新喝茶",
+                "content": "旁路写入",
+                "speaker_id": "u1",
+                "speaker_name": "u1",
+                "status": "live",
+                "confidence": 0.99,
+                "slot_key": slot_key,
+            }
+        )
+        res = self.engine.rollback(r2["fact_id"])
+        self.assertFalse(res["ok"])
+        self.assertEqual(self.store.get_fact(r1["fact_id"]).status, "superseded")
+        self.assertEqual(self.store.get_fact(r2["fact_id"]).status, "live")
+
+    def test_compact_superseded_expires_rollback_window(self):
+        from savagetype.archive import compact_superseded
+
+        r1 = self.engine.ingest(_payload(value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        r2 = self.engine.ingest(
+            _payload(value="不茶", content="我改口了，不喜欢茶了", explicit_correction=1),
+            "我改口了，不喜欢茶了",
+        )
+        self.store.execute("UPDATE facts SET updated_at=1 WHERE id=?", (r1["fact_id"],))
+        self.assertEqual(compact_superseded(self.store, retain_days=30), 1)
+        self.assertIsNone(self.store.get_fact(r1["fact_id"]))
+        res = self.engine.rollback(r2["fact_id"])
+        self.assertFalse(res["ok"])
+        self.assertIn("清理", res["error"])
 
     def test_multiple_preferences_coexist(self):
         r1 = self.engine.ingest(_payload(value="猫", content="我喜欢猫"), "我喜欢猫")
@@ -129,7 +201,9 @@ class CoreTest(unittest.TestCase):
         self.assertIsNotNone(live)
         self.assertTrue(live.value.startswith("不") or "不喜欢" in live.content)
         if r2["action"] == "supersede":
-            self.assertIsNone(self.store.get_fact(r1["fact_id"]))
+            old = self.store.get_fact(r1["fact_id"])
+            self.assertIsNotNone(old)
+            self.assertEqual(old.status, "superseded")
 
     def test_llm_dislike_alias_collides_likes(self):
         r1 = self.engine.ingest(_payload(attribute="likes", value="hiphop", content="我喜欢hiphop"), "我喜欢hiphop")
@@ -140,7 +214,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(r2["action"], "supersede")
         live = self.store.live_by_slot("u1", "self", "likes", value="不hiphop")
         self.assertTrue(live.value.startswith("不") or "不喜欢" in live.content)
-        self.assertIsNone(self.store.get_fact(r1["fact_id"]))
+        old = self.store.get_fact(r1["fact_id"])
+        self.assertIsNotNone(old)
+        self.assertEqual(old.status, "superseded")
         self.assertIsNone(self.store.live_by_slot("u1", "self", "dislikes", value="hiphop"))
 
     def test_sleep_folds_old_dislike_note(self):
@@ -306,7 +382,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(r2["action"], "supersede")
         live = self.store.live_by_slot("u1", "self", "likes", value="不茶")
         self.assertEqual(live.value, "不茶")
-        self.assertIsNone(self.store.get_fact(r1["fact_id"]))
+        old = self.store.get_fact(r1["fact_id"])
+        self.assertIsNotNone(old)
+        self.assertEqual(old.status, "superseded")
 
     def test_persona_isolation(self):
         self.engine.ingest(_payload(value="茶", content="我喜欢喝茶", persona_id="p1"), "我喜欢喝茶")
@@ -383,6 +461,55 @@ class CoreTest(unittest.TestCase):
         self.assertTrue(is_junk_term("确实"))
         self.assertTrue(is_junk_term("1"))
         self.assertFalse(is_junk_term("yyds"))
+
+    def test_bm25_prefers_rare_term_matches(self):
+        from savagetype.bm25 import BM25Index
+        from savagetype.tokenize import builtin_tokens
+
+        latte = Fact(id=2, subject="self", attribute="likes", value="拿铁", content="我喜欢拿铁", speaker_id="u1", speaker_name="阿U", bot_id="", window_tag="", status="live", confidence=0.9)
+        coffee = Fact(id=1, subject="self", attribute="likes", value="咖啡", content="我喜欢咖啡", speaker_id="u1", speaker_name="阿U", bot_id="", window_tag="", status="live", confidence=0.9)
+        extra = [
+            Fact(id=3, subject="self", attribute="likes", value="咖啡", content="喜欢喝咖啡", speaker_id="u2", speaker_name="阿V", bot_id="", window_tag="", status="live", confidence=0.9),
+            Fact(id=4, subject="self", attribute="likes", value="咖啡", content="每天咖啡", speaker_id="u3", speaker_name="阿W", bot_id="", window_tag="", status="live", confidence=0.9),
+        ]
+        index = BM25Index([coffee, latte, *extra], tokenize_fn=builtin_tokens)
+        index.prepare("拿铁咖啡")
+        self.assertGreater(index.score(latte), index.score(coffee))
+        index.prepare("完全不相干")
+        self.assertEqual(index.score(latte), 0.0)
+
+    def test_bm25_length_normalization(self):
+        from savagetype.bm25 import BM25Index
+        from savagetype.tokenize import builtin_tokens
+
+        short = Fact(id=1, subject="self", attribute="likes", value="abc", content="abc", speaker_id="u1", speaker_name="阿U", bot_id="", window_tag="", status="live", confidence=0.9)
+        long_ = Fact(id=2, subject="self", attribute="likes", value="abc", content="abc " + "item " * 30, speaker_id="u1", speaker_name="阿U", bot_id="", window_tag="", status="live", confidence=0.9)
+        index = BM25Index([short, long_], tokenize_fn=builtin_tokens)
+        index.prepare("abc")
+        self.assertGreater(index.score(short), index.score(long_))
+
+    def test_tokenizer_fallback_and_custom_terms(self):
+        from savagetype import tokenize as tokenize_mod
+
+        builtin = tokenize_mod.builtin_tokens("我喜欢 OpenAI 的 GPT-4")
+        self.assertIn("我", builtin)
+        self.assertIn("openai", builtin)
+        self.assertIn("gpt", builtin)
+        self.assertIn("4", builtin)
+        self.assertIn(tokenize_mod.name(), {"jieba", "builtin"})
+        tokenize_mod.add_terms(["测试专用词条xqz"])
+        self.assertEqual(tokenize_mod.add_terms(["测试专用词条xqz"]), 0)
+
+    def test_retriever_bm25_flag_and_scoring(self):
+        from savagetype.retrieve import Retriever
+
+        fact = Fact(id=1, subject="self", attribute="likes", value="咖啡", content="我喜欢咖啡", speaker_id="u1", speaker_name="阿U", bot_id="", window_tag="", status="live", confidence=0.9)
+        on = Retriever(self.store, bm25=True)
+        off = Retriever(self.store, bm25=False)
+        self.assertNotEqual(on.cache_key("拿铁咖啡", "u1"), off.cache_key("拿铁咖啡", "u1"))
+        with_bm25 = on._local_score("拿铁咖啡", fact, "u1", "long_term", bm25_scores={fact.id: 1.0})
+        with_keyword = on._local_score("拿铁咖啡", fact, "u1", "long_term", bm25_scores=None)
+        self.assertGreater(with_bm25, with_keyword)
 
     def test_fewshot_skips_commands(self):
         events = [
@@ -505,8 +632,79 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(len(pending), 1)
         self.assertIn("quality", pending[0].payload)
         engine.set_status(pending[0].id, "rejected")
-        n = engine._queue_fewshots(events)
+        n = engine._queue_fewshots(events, force=True)
         self.assertEqual(n, 0)
+
+    def test_fewshot_cooldown_blocks_then_force_queues(self):
+        engine = LearningEngine(
+            self.store,
+            llm=None,
+            config={
+                "learning_enabled": True,
+                "fewshot_enabled": True,
+                "jargon_enabled": False,
+                "persona_draft_enabled": False,
+                "fewshot_cooldown_seconds": 600,
+                "fewshot_max_per_run": 0,
+            },
+        )
+        events = [
+            TimelineEvent(1, 1, "u1", "阿U", "b", "w", "user", "今天那个yyds局好顶啊啊", persona_id="p1"),
+            TimelineEvent(2, 2, "u1", "阿U", "b", "w", "assistant", "那把确实离谱到家了", persona_id="p1"),
+        ]
+        self.assertEqual(engine._queue_fewshots(events), 1)
+        more = events + [
+            TimelineEvent(3, 3, "u1", "阿U", "b", "w", "user", "这家店的环境也不错", persona_id="p1"),
+            TimelineEvent(4, 4, "u1", "阿U", "b", "w", "assistant", "记下了，下次一起去", persona_id="p1"),
+        ]
+        self.assertEqual(engine._queue_fewshots(more), 0)
+        self.assertEqual(len(self.store.list_reviews("pending", kind="fewshot")), 1)
+        self.assertEqual(engine._queue_fewshots(more, force=True), 2)
+        self.assertEqual(len(self.store.list_reviews("pending", kind="fewshot")), 2)
+
+    def test_fewshot_max_per_run_prefers_quality(self):
+        engine = LearningEngine(
+            self.store,
+            llm=None,
+            config={
+                "learning_enabled": True,
+                "fewshot_enabled": True,
+                "jargon_enabled": False,
+                "persona_draft_enabled": False,
+                "fewshot_cooldown_seconds": 0,
+                "fewshot_max_per_run": 1,
+            },
+        )
+        events = [
+            TimelineEvent(1, 1, "u1", "阿U", "b", "w", "user", "我觉得还行", persona_id="p1"),
+            TimelineEvent(2, 2, "u1", "阿U", "b", "w", "assistant", "还行吧嗯嗯", persona_id="p1"),
+            TimelineEvent(3, 3, "u1", "阿U", "b", "w", "user", "今天那个yyds局真的好顶啊", persona_id="p1"),
+            TimelineEvent(4, 4, "u1", "阿U", "b", "w", "assistant", "那把确实离谱，我们都笑死了哈哈", persona_id="p1"),
+        ]
+        self.assertEqual(engine._queue_fewshots(events), 1)
+        pending = self.store.list_reviews("pending", kind="fewshot")
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].payload["user"], "今天那个yyds局真的好顶啊")
+
+    def test_fewshot_min_quality_filters(self):
+        engine = LearningEngine(
+            self.store,
+            llm=None,
+            config={
+                "learning_enabled": True,
+                "fewshot_enabled": True,
+                "jargon_enabled": False,
+                "persona_draft_enabled": False,
+                "fewshot_cooldown_seconds": 0,
+                "fewshot_min_quality": 100,
+            },
+        )
+        events = [
+            TimelineEvent(1, 1, "u1", "阿U", "b", "w", "user", "今天那个yyds局好顶啊啊", persona_id="p1"),
+            TimelineEvent(2, 2, "u1", "阿U", "b", "w", "assistant", "那把确实离谱到家了", persona_id="p1"),
+        ]
+        self.assertEqual(engine._queue_fewshots(events), 0)
+        self.assertEqual(self.store.list_reviews("pending", kind="fewshot"), [])
 
     def test_unpack_llm_tokens_and_navigate(self):
         text, tin, tout = _unpack_llm_result(("hello", 12, 4))
@@ -785,6 +983,26 @@ class V280Test(unittest.TestCase):
         self.store.execute("UPDATE profiles SET last_seen=1 WHERE speaker_id='newbie'")
         self.assertEqual(self.store.delete_empty_profiles(ttl_days=7), 1)
         self.assertIsNone(self.store.get_profile("newbie"))
+
+    def test_jargon_scope_default_all_and_owner_switch(self):
+        service = self._service()
+        ev = FakeEvent(sender="u9", name="路人")
+        ev.get_platform_name = lambda: "aiocqhttp"
+        self.assertIsNotNone(service.capture_user(ev, "这波操作太yyds了吧"))
+        self.assertIn("yyds", {h["term"] for h in self.store.hot_jargon(min_count=1)})
+
+        service2 = self._service(jargon_scope="owner")
+        ev2 = FakeEvent(sender="u10", name="另一个路人")
+        ev2.get_platform_name = lambda: "aiocqhttp"
+        self.assertIsNotNone(service2.capture_user(ev2, "这也太awsl了吧"))
+        terms = {h["term"] for h in self.store.hot_jargon(min_count=1)}
+        self.assertIn("yyds", terms)
+        self.assertNotIn("awsl", terms)
+
+        owner_ev = FakeEvent(window="webchat:FriendMessage:web", sender="admin-web", name="主人")
+        owner_ev.get_platform_name = lambda: "webchat"
+        self.assertIsNotNone(service2.capture_user(owner_ev, "这也太tql了吧"))
+        self.assertIn("tql", {h["term"] for h in self.store.hot_jargon(min_count=1)})
 
     def test_platform_type_and_alias(self):
         service = self._service(memory_source_platforms="aiocqhttp,qq_official")
@@ -1263,7 +1481,9 @@ class V330Test(unittest.TestCase):
             "我不喜欢喝美式了",
         )
         self.assertEqual(r2["action"], "supersede")
-        self.assertIsNone(self.store.get_fact(r1["fact_id"]))
+        old = self.store.get_fact(r1["fact_id"])
+        self.assertIsNotNone(old)
+        self.assertEqual(old.status, "superseded")
 
     def test_heuristic_extracts_repeated_likes(self):
         from savagetype.extract import Extractor
@@ -1283,7 +1503,9 @@ class V330Test(unittest.TestCase):
         r1 = self.engine.ingest(_payload(value="美式", content="我喜欢喝美式"), "我喜欢喝美式")
         r2 = self.engine.ingest(_payload(value="不美式了", content="我不喜欢喝美式了"), "我不喜欢喝美式了")
         self.assertEqual(r2["action"], "supersede")
-        self.assertIsNone(self.store.get_fact(r1["fact_id"]))
+        old = self.store.get_fact(r1["fact_id"])
+        self.assertIsNotNone(old)
+        self.assertEqual(old.status, "superseded")
         live = self.store.live_by_slot("u1", "self", "likes", value="不美式了")
         self.assertIsNotNone(live)
         self.assertEqual(live.value, "不美式了")

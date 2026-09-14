@@ -79,7 +79,7 @@
         <div class="grid three">
           <section class="card glass">
             <h2>学习审查</h2>
-            <p class="lede">黑话、few-shot、人格草稿。批准后才注入。</p>
+            <p class="lede">黑话、few-shot、人格草稿。批准后才注入；支持按状态/类型筛选和批量批准、驳回。</p>
             <div class="scroll short" id="reviews"></div>
           </section>
 
@@ -163,27 +163,29 @@
 
       <!-- 设置 -->
       <section id="page-settings" hidden>
-        <section class="card glass">
-          <h2>外观</h2>
-          <p class="lede">着色器渐变：主色 = UI 强调色，其余两色与主色一起驱动背景的实时流动渐变场。点预设直接切换，或用取色器完全自定义。</p>
-          <div class="row" id="theme-presets"></div>
-          <div class="row">
-            <label class="color-field">主色 <input type="color" id="theme-color" value="#7c5cff" /></label>
-            <label class="color-field">副色 1 <input type="color" id="theme-color2" value="#22d3ee" /></label>
-            <label class="color-field">副色 2 <input type="color" id="theme-color3" value="#f472b6" /></label>
-            <button type="button" data-act="theme-apply">应用主题</button>
-            <button type="button" class="ghost" data-act="dynamic-toggle" id="dynamic-toggle">动态颜色：关</button>
+        <div class="settings-layout">
+          <nav class="settings-nav" id="settings-nav" aria-label="设置导航"></nav>
+          <div class="settings-main">
+            <p class="lede settings-hint">保存后立刻生效。模型下拉按类型分开：抽取/整理/审核只列对话模型，Embedding 与 Rerank 各自只列对应类型（AstrBot 原生配置页目前不支持这两类的选择器，需要手填 ID）。</p>
+            <section class="card settings-panel" id="settings-panel-appearance" data-group="外观">
+              <h2>外观</h2>
+              <p class="lede">着色器渐变：主色 = UI 强调色，其余两色与主色一起驱动背景的实时流动渐变场。点预设直接切换，或用取色器完全自定义。</p>
+              <div class="row" id="theme-presets"></div>
+              <div class="row">
+                <label class="color-field">主色 <input type="color" id="theme-color" value="#7c5cff" /></label>
+                <label class="color-field">副色 1 <input type="color" id="theme-color2" value="#22d3ee" /></label>
+                <label class="color-field">副色 2 <input type="color" id="theme-color3" value="#f472b6" /></label>
+                <button type="button" data-act="theme-apply">应用主题</button>
+                <button type="button" class="ghost" data-act="dynamic-toggle" id="dynamic-toggle">动态颜色：关</button>
+              </div>
+              <p class="lede">动态颜色开启后，按「极光 → 碧金 → 暮霞 → 午夜 → 森林」顺序循环，每 1 秒停留、5 秒平滑过渡；手动点预设会关闭动态。系统开启「减少动态效果」时不播放。</p>
+            </section>
+            <form id="settings-form" class="settings-container" onsubmit="event.preventDefault()"></form>
+            <div class="settings-savebar">
+              <button type="button" data-act="settings-save">保存设置</button>
+            </div>
           </div>
-          <p class="lede">动态颜色开启后，按「极光 → 碧金 → 暮霞 → 午夜 → 森林」顺序循环，每 1 秒停留、5 秒平滑过渡；手动点预设会关闭动态。系统开启「减少动态效果」时不播放。</p>
-        </section>
-        <section class="card glass">
-          <h2>插件设置</h2>
-          <p class="lede">保存后立刻生效。模型下拉按类型分开：抽取/整理/审核只列对话模型，Embedding 与 Rerank 各自只列对应类型（AstrBot 原生配置页目前不支持这两类的选择器，需要手填 ID）。</p>
-          <form id="settings-form" class="settings" onsubmit="event.preventDefault()"></form>
-          <div class="row">
-            <button type="button" data-act="settings-save">保存设置</button>
-          </div>
-        </section>
+        </div>
       </section>
     </div>
     <script type="module" src="./app.js"></script>

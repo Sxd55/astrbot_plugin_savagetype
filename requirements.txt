@@ -1,1 +1,2 @@
-# v1 只用 Python 标准库（sqlite3）。Embedding / Rerank / 总结走 AstrBot Provider。
+# 仅 BM25 检索需要 jieba（纯 Python）。装不上时会自动回退到内置字符分词，插件照常可用。
+jieba>=0.42.1

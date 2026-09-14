@@ -306,6 +306,38 @@ textarea { width: 100%; min-height: 76px; resize: vertical; }
 .item .meta { color: var(--sg-weak); font-size: 12.5px; display: flex; gap: 10px; flex-wrap: wrap; }
 .item .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
 
+/* ---------- Pending override compare ---------- */
+
+.compare { display: grid; gap: 8px; margin: 8px 0; }
+.compare-row {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 8px 10px;
+  border-radius: var(--sg-radius-sm);
+  border: 1px solid var(--sg-border);
+  background: rgba(255, 255, 255, 0.04);
+}
+.compare-row.old { opacity: 0.82; }
+.compare-row.new {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: var(--accent-soft);
+}
+.compare-tag {
+  font-size: 11px;
+  font-weight: 700;
+  text-align: center;
+  padding: 2px 0;
+  border-radius: 6px;
+  color: var(--sg-muted);
+  background: var(--sg-fill);
+}
+.compare-row.new .compare-tag { color: var(--on-accent); background: var(--accent); }
+.compare-body { min-width: 0; }
+.compare-body .plain { margin: 0 0 4px; }
+.compare-body .meta { display: flex; gap: 10px; flex-wrap: wrap; }
+
 /* ---------- Chips ---------- */
 
 .chip {
@@ -389,23 +421,77 @@ textarea { width: 100%; min-height: 76px; resize: vertical; }
 
 /* ---------- Settings ---------- */
 
-.setting-group {
-  border: 1px solid var(--sg-border);
-  border-radius: var(--sg-radius-sm);
-  padding: 12px 16px;
-  margin-bottom: 14px;
-  background: rgba(255, 255, 255, 0.02);
+.settings-layout {
+  display: grid;
+  grid-template-columns: 224px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
 }
-.setting-group > summary {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--sg-text);
+.settings-nav {
+  position: sticky;
+  top: 96px;
   display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px;
+  background:
+    linear-gradient(var(--sg-fill), var(--sg-fill)),
+    var(--sg-scrim);
+  -webkit-backdrop-filter: blur(40px) saturate(1.3);
+  backdrop-filter: blur(40px) saturate(1.3);
+  border: 1px solid var(--sg-border);
+  border-radius: var(--sg-radius);
+  box-shadow: var(--sg-shadow-md);
+}
+.settings-nav-item {
+  display: flex;
+  justify-content: space-between;
   align-items: center;
   gap: 8px;
+  width: 100%;
+  min-height: 38px;
+  padding: 9px 12px;
+  font-size: 13.5px;
+  text-align: left;
+  box-shadow: none;
 }
-.setting-group[open] > summary { margin-bottom: 12px; }
-.settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px 24px; }
+.settings-nav-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.settings-nav-item .chip {
+  flex: none;
+  background: color-mix(in srgb, currentColor 14%, transparent);
+  border-color: color-mix(in srgb, currentColor 22%, transparent);
+  color: inherit;
+  opacity: 0.85;
+}
+.settings-main { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.settings-hint { margin: 0; }
+.settings-container { display: flex; flex-direction: column; gap: 14px; margin: 0; }
+.settings-panel { display: none; }
+.settings-panel.on {
+  display: flex;
+  flex-direction: column;
+  animation: settingsPanelIn 0.18s var(--ease) both;
+}
+@keyframes settingsPanelIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+.settings-savebar {
+  position: sticky;
+  bottom: 12px;
+  display: flex;
+  justify-content: flex-end;
+  pointer-events: none;
+}
+.settings-savebar button {
+  pointer-events: auto;
+  box-shadow: var(--sg-shadow-md);
+}
+.settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); gap: 16px 24px; }
 .setting { display: flex; flex-direction: column; gap: 6px; }
 .setting > label { font-weight: 600; color: var(--sg-text); }
 .setting .toggle { display: flex; gap: 8px; align-items: center; color: var(--sg-muted); }
@@ -447,6 +533,15 @@ pre.trace {
   .tabs { align-self: flex-start; flex-wrap: wrap; border-radius: var(--sg-radius); }
   .scroll { max-height: 300px; }
   #sg-canvas, .sg-fallback { position: fixed; }
+  .settings-layout { grid-template-columns: 1fr; }
+  .settings-nav {
+    position: static;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding: 8px;
+  }
+  .settings-nav-item { width: auto; flex: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -140,6 +140,16 @@ class LearningEngine:
     def skip_style(self) -> bool:
         return bool(self.config.get("_skip_style_learning"))
 
+    def jargon_scope_ok(self, is_owner: bool) -> bool:
+        """Whether this speaker's messages feed jargon stats.
+
+        all=平台/白名单内所有可见消息（默认，能学到群黑话）；owner=只统计主人。
+        """
+        scope = str(self.config.get("jargon_scope") or "all").strip().lower()
+        if scope in {"owner", "owner_only", "master"}:
+            return bool(is_owner)
+        return True
+
     def observe_message(self, text: str, persona_id: str = "") -> None:
         if not self.learning_ok() or self.skip_style():
             return
@@ -157,7 +167,7 @@ class LearningEngine:
         events = list(reversed(events))
         out: dict[str, Any] = {"ok": True, "jargon": 0, "fewshot": 0, "persona": 0}
         if bool(self.config.get("fewshot_enabled", True)):
-            out["fewshot"] = self._queue_fewshots(events)
+            out["fewshot"] = self._queue_fewshots(events, force=force)
         if bool(self.config.get("jargon_enabled", True)):
             out["jargon"] = await self._queue_jargon(events, force=force)
         if bool(self.config.get("persona_draft_enabled", True)):
@@ -199,11 +209,26 @@ class LearningEngine:
             return max(0, min(100, score))
         return 50
 
-    def _queue_fewshots(self, events: list[TimelineEvent]) -> int:
-        n = 0
-        min_user = int(self.config.get("fewshot_min_user_chars") or 4)
-        min_bot = int(self.config.get("fewshot_min_bot_chars") or 4)
+    def _cfg_int(self, key: str, default: int) -> int:
+        raw = self.config.get(key)
+        try:
+            return default if raw is None else int(raw)
+        except (TypeError, ValueError):
+            return default
+
+    def _queue_fewshots(self, events: list[TimelineEvent], force: bool = False) -> int:
+        now = now_ts()
+        cooldown = max(0, self._cfg_int("fewshot_cooldown_seconds", 600))
+        last = int(self.store.get_meta("fewshot_last_at") or "0")
+        if not force and cooldown and last and now - last < cooldown:
+            # 每条消息都扫一遍会让审查队列刷屏：默认 10 分钟最多扫一次。
+            return 0
+        min_user = self._cfg_int("fewshot_min_user_chars", 4)
+        min_bot = self._cfg_int("fewshot_min_bot_chars", 4)
+        min_quality = max(0, self._cfg_int("fewshot_min_quality", 0))
+        max_per_run = max(0, self._cfg_int("fewshot_max_per_run", 5))
         rejected = self._rejected_fewshot_keys()
+        candidates: list[dict[str, Any]] = []
         for user, bot in pair_user_bot(events):
             u = clip(user.content, 120)
             b = clip(bot.content, 160)
@@ -222,17 +247,34 @@ class LearningEngine:
                 "mention_policy": "tone",
             }
             payload["quality"] = self.score_review("fewshot", payload)
-            fp = fingerprint("fewshot", user.persona_id, normalize_slot(u), normalize_slot(b))
+            if min_quality and payload["quality"] < min_quality:
+                continue
+            candidates.append(
+                {
+                    "payload": payload,
+                    "fingerprint": fingerprint(
+                        "fewshot", user.persona_id, normalize_slot(u), normalize_slot(b)
+                    ),
+                    "speaker_id": user.speaker_id,
+                    "persona_id": user.persona_id or bot.persona_id,
+                }
+            )
+        candidates.sort(key=lambda item: int(item["payload"].get("quality") or 0), reverse=True)
+        if max_per_run:
+            candidates = candidates[:max_per_run]
+        n = 0
+        for item in candidates:
             self.store.upsert_review(
                 kind="fewshot",
-                fingerprint=fp,
-                title=clip(u, 24),
-                payload=payload,
+                fingerprint=item["fingerprint"],
+                title=clip(item["payload"]["user"], 24),
+                payload=item["payload"],
                 reason="real_user_bot_pair",
-                speaker_id=user.speaker_id,
-                persona_id=user.persona_id or bot.persona_id,
+                speaker_id=item["speaker_id"],
+                persona_id=item["persona_id"],
             )
             n += 1
+        self.store.set_meta("fewshot_last_at", str(now))
         return n
 
     def _blocked_jargon(self) -> set[str]:
