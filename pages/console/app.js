@@ -12,6 +12,8 @@ let memoryCache = [];
 let memoryMode = "owner";
 let reviewsStatus = "pending";
 let reviewsKind = "";
+let eventsStatus = "live";
+let editingEventId = 0;
 let settingsGroup = (() => {
   try {
     return localStorage.getItem("stype.settings.group") || "";
@@ -104,9 +106,24 @@ const PROVIDER_KEYS = {
   summary_provider_id: "chat",
   normalize_provider_id: "chat",
   verify_provider_id: "chat",
+  event_provider_id: "chat",
+  quality_provider_id: "chat",
+  fast_provider_id: "chat",
+  fallback_provider_id: "chat",
   image_caption_provider_id: "chat",
   embedding_provider_id: "embedding",
   rerank_provider_id: "rerank",
+};
+
+const TASK_LABELS = {
+  normalize: "缩写",
+  verify: "审核",
+  event: "事件",
+  learn: "学习",
+  image: "图片",
+  embed: "向量",
+  rerank: "重排",
+  default: "其他",
 };
 
 function normalizeHex(value) {
@@ -275,8 +292,10 @@ function factActions(f, where) {
     <button type="button" class="ghost tiny" data-act="fact-pin" data-id="${esc(f.id)}" data-pinned="${f.pinned ? 1 : 0}" data-where="${esc(where)}">${pinLabel}</button>
     <button type="button" class="ghost tiny" data-act="fact-edit" data-id="${esc(f.id)}" data-where="${esc(where)}">编辑</button>
     ${f.supersedes ? `<button type="button" class="ghost tiny" data-act="fact-rollback" data-id="${esc(f.id)}" data-where="${esc(where)}">回滚改口</button>` : ""}
+    <button type="button" class="ghost tiny" data-act="fact-entities" data-id="${esc(f.id)}">相关</button>
     <button type="button" class="ghost tiny" data-act="fact-del" data-id="${esc(f.id)}" data-where="${esc(where)}">删除</button>
-  </div>`;
+  </div>
+  <div class="meta" id="fact-entities-${esc(f.id)}" hidden></div>`;
 }
 
 function factEditor(f, where, quitAct) {
@@ -313,7 +332,7 @@ function factCard(f, where) {
       ${f.edited_at ? `<span class="chip gray">已编辑</span>` : ""}
     </div>
     <div class="plain">${esc(text)}</div>
-    <div class="meta">QQ/id ${esc(f.speaker_id || "")} · #${esc(f.id)} · 更新 ${esc(fmtTime(f.updated_at))}${keywordsHtml(f.keywords)}</div>
+    <div class="meta">QQ/id ${esc(f.speaker_id || "")} · #${esc(f.id)} · 更新 ${esc(fmtTime(f.updated_at))}${f.valid_to ? ` · 有效期 ${esc(fmtTime(f.created_at))} ~ ${esc(fmtTime(f.valid_to))}` : ""}${keywordsHtml(f.keywords)}</div>
     ${f.content && f.content !== text ? `<details><summary>原文</summary><div class="raw">${esc(f.content)}</div></details>` : ""}
     ${factActions(f, where)}
   </div>`;
@@ -325,8 +344,10 @@ async function loadOverview() {
   const kpiHtml = [
     ["时间线", c.timeline],
     ["主人记忆", c.owner_facts],
+    ["事件", c.events],
     ["人物档案", c.profiles],
     ["待审记忆", c.memory_pending],
+    ["事件待审", c.events_needs_review],
   ].map(([k, v]) => `<div class="kpi"><b>${esc(v ?? 0)}</b><span>${esc(k)}</span></div>`).join("");
   ["kpis", "kpis-diag"].forEach((id) => { if ($(id)) $(id).innerHTML = kpiHtml; });
   const reasons = (ov.coexistence && ov.coexistence.reasons) || [];
@@ -346,6 +367,20 @@ async function loadOverview() {
     const skip = cfg.capture_skip;
     const skipText = skip ? `上次采集跳过：${skip.reason}（${skip.platform || "?"}）。` : "";
     $("owner-line").textContent = `${ownerText} 允许平台：${platforms}。${skipText}`;
+  }
+  if ($("usage-line")) {
+    const tk = ov.tokens || {};
+    const hard = tk.hard_limit ? String(tk.hard_limit) : "不限";
+    const soft = tk.soft_limit ? String(tk.soft_limit) : "不限";
+    const rows = (tk.by_task || []).filter((r) => (r.tokens || 0) > 0 || (r.skipped || 0) > 0);
+    const skipped = rows.reduce((n, r) => n + (r.skipped || 0), 0);
+    const top = rows
+      .slice(0, 4)
+      .map((r) => `${TASK_LABELS[r.task] || r.task} ${r.tokens}${r.skipped ? `(跳过${r.skipped})` : ""}`)
+      .join(" / ");
+    $("usage-line").textContent =
+      `今日模型用量 ${tk.used || 0} tokens（硬限 ${hard} / 软限 ${soft}${skipped ? ` / 预算跳过 ${skipped} 次` : ""}）` +
+      (top ? ` · ${top}` : "");
   }
   if (!dynamicOn) applyTheme(cfg.theme_color, cfg.theme_color2, cfg.theme_color3);
   if (cfg.dynamic_colors && !dynamicOn) startDynamic();
@@ -513,6 +548,96 @@ async function loadArchived() {
     : `<p class="lede">回收站是空的。</p>`;
 }
 
+function eventStatusChip(e) {
+  if (e.review_status === "needs_review") return `<span class="chip warn">待审</span>`;
+  if (e.review_status === "manual") return `<span class="chip ok">手动</span>`;
+  if (e.status === "archived") return `<span class="chip gray">已归档</span>`;
+  return "";
+}
+
+function eventParticipants(e) {
+  const names = (e.participants || []).map((p) => p.name || p.id).filter(Boolean);
+  return names.join("、") || e.speaker_name || e.speaker_id || "";
+}
+
+function eventActions(e) {
+  const pinLabel = e.pinned ? "取消置顶" : "置顶";
+  const approve = e.review_status === "needs_review"
+    ? `<button type="button" class="tiny" data-act="event-approve" data-id="${esc(e.id)}">确认写入</button>`
+    : "";
+  const del = e.status === "archived"
+    ? `<button type="button" class="ghost tiny" data-act="event-restore" data-id="${esc(e.id)}">恢复</button>`
+    : `<button type="button" class="ghost tiny" data-act="event-del" data-id="${esc(e.id)}">删除</button>`;
+  return `<div class="actions">
+    ${approve}
+    <button type="button" class="ghost tiny" data-act="event-pin" data-id="${esc(e.id)}" data-pinned="${e.pinned ? 1 : 0}">${pinLabel}</button>
+    <button type="button" class="ghost tiny" data-act="event-edit" data-id="${esc(e.id)}">编辑</button>
+    <button type="button" class="ghost tiny" data-act="event-evidence" data-id="${esc(e.id)}">看原文</button>
+    ${del}
+  </div>
+  <div class="raw" id="event-raw-${esc(e.id)}" hidden></div>`;
+}
+
+function eventEditor(e) {
+  const highlights = (e.highlights || []).join("\n");
+  return `<div class="item on">
+    <div class="item-head"><span class="chip">#${esc(e.id)} ${esc(e.kind)}</span><span class="chip gray">${esc(fmtTime(e.start_ts))}</span></div>
+    <input data-edit-event-title="${esc(e.id)}" value="${esc(e.title)}" placeholder="标题" />
+    <textarea data-edit-event-summary="${esc(e.id)}" placeholder="摘要">${esc(e.summary)}</textarea>
+    <textarea data-edit-event-highlights="${esc(e.id)}" placeholder="要点（每行一条）">${esc(highlights)}</textarea>
+    <div class="row">
+      <label class="lede">重要度
+        <input type="number" min="0" max="1" step="0.05" style="width:110px"
+          data-edit-event-importance="${esc(e.id)}" value="${esc(e.importance ?? 0)}" />
+      </label>
+      <span class="lede">当前权重 ${esc(e.weight ?? "-")}；参与人 ${esc(eventParticipants(e))}</span>
+    </div>
+    <div class="actions">
+      <button type="button" data-act="event-save" data-id="${esc(e.id)}">保存</button>
+      <button type="button" class="ghost tiny" data-act="event-edit-cancel">取消</button>
+    </div>
+  </div>`;
+}
+
+function eventCard(e) {
+  const highlights = (e.highlights || []).map((h) => `<div class="meta">· ${esc(h)}</div>`).join("");
+  return `<div class="item">
+    <div class="item-head">
+      <span class="chip">#${esc(e.id)}</span>
+      <span class="chip gray">${esc(e.kind === "talk" ? "聊过" : "经历")}</span>
+      ${e.pinned ? `<span class="chip">置顶</span>` : ""}
+      ${eventStatusChip(e)}
+      <span class="chip gray">${esc(e.scope === "owner" ? "主人" : "档案")}</span>
+      ${typeof e.weight === "number" ? `<span class="chip gray">权重 ${esc(e.weight)}</span>` : ""}
+    </div>
+    <div class="plain">【${esc(e.title)}】${esc(e.summary)}</div>
+    ${highlights}
+    <div class="meta">${esc(fmtTime(e.start_ts))} · ${esc(eventParticipants(e))} · 来源 ${esc(e.window_tag || "")}</div>
+    ${e.keywords && e.keywords.length ? `<div class="meta">${keywordsHtml(e.keywords)}</div>` : ""}
+    ${eventActions(e)}
+  </div>`;
+}
+
+async function loadEvents() {
+  const box = $("events-list");
+  if (!box) return;
+  const q = $("events-q") ? $("events-q").value.trim() : "";
+  const data = await apiGet("events", { status: eventsStatus, ...(q ? { q } : {}) });
+  const items = data.items || [];
+  document.querySelectorAll('[data-act="events-status"]').forEach((b) => {
+    const on = b.dataset.status === eventsStatus;
+    b.classList.toggle("on", on);
+    b.classList.toggle("ghost", !on);
+  });
+  if (!items.length) {
+    box.innerHTML = `<p class="lede">没有事件。聊一段后会自动整理成「一件事」；已经有一段对话时可以点上方「抽取/整理」立即生成。</p>`;
+    return;
+  }
+  box.innerHTML = items.map((e) => (
+    editingEventId === e.id ? eventEditor(e) : eventCard(e)
+  )).join("");
+}
+
 const REVIEW_KIND_LABELS = { jargon: "黑话", fewshot: "表达样本", persona: "人格草稿" };
 const REVIEW_STATUS_LABELS = { pending: "待审", approved: "已批准", rejected: "已驳回" };
 
@@ -550,6 +675,7 @@ async function loadReviews() {
   const data = await apiGet("reviews", query);
   const items = data.items || [];
   const box = $("reviews");
+  const toolbar = $("reviews-toolbar");
   if (!box) return;
   const tabs = ["pending", "approved", "rejected"].map((s) =>
     `<button type="button" class="${reviewsStatus === s ? "tiny" : "ghost tiny"}" data-act="reviews-status" data-status="${s}">${REVIEW_STATUS_LABELS[s]}</button>`
@@ -560,15 +686,20 @@ async function loadReviews() {
   const batch = reviewsStatus === "pending"
     ? `<button type="button" class="ghost tiny" data-act="reviews-select-all">全选/取消</button>
        <button type="button" class="tiny" data-act="reviews-batch" data-status="approved">批准选中</button>
-       <button type="button" class="ghost tiny" data-act="reviews-batch" data-status="rejected">驳回选中</button>`
+       <button type="button" class="ghost tiny" data-act="reviews-batch" data-status="rejected">驳回选中</button>
+       <button type="button" class="ghost tiny" data-act="reviews-all" data-status="approved">一键批准全部</button>
+       <button type="button" class="ghost tiny" data-act="reviews-all" data-status="rejected">一键驳回全部</button>`
     : "";
+  if (toolbar) {
+    // 筛选与批量按钮固定在列表上方，滚列表时不会跟着滚走。
+    toolbar.innerHTML = `
+      <div class="row">${tabs}</div>
+      <div class="row">${kinds}</div>
+      ${batch ? `<div class="row">${batch}</div>` : ""}
+    `;
+  }
   const empty = `<p class="lede">没有${REVIEW_STATUS_LABELS[reviewsStatus] || ""}学习项。</p>`;
-  box.innerHTML = `
-    <div class="row">${tabs}</div>
-    <div class="row">${kinds}</div>
-    ${batch ? `<div class="row">${batch}</div>` : ""}
-    ${items.length ? items.map(reviewItemHtml).join("") : empty}
-  `;
+  box.innerHTML = items.length ? items.map(reviewItemHtml).join("") : empty;
 }
 
 const PENDING_REASON_LABELS = {
@@ -788,9 +919,11 @@ function fieldControl(key, spec, value, providers) {
 const SETTING_GROUPS = [
   { title: "总开关与采集", keys: ["enabled", "capture_enabled", "inject_enabled", "owner_qq", "notify_umo", "memory_source_platforms", "memory_whitelist"] },
   { title: "抽取与整理（AI 管线）", keys: ["extract_enabled", "pipeline_enabled", "summary_provider_id", "normalize_provider_id", "verify_provider_id", "extract_min_messages", "extract_cooldown_seconds", "extract_fail_cooldown_seconds", "extract_idle_seconds", "pipeline_max_revisions", "pipeline_batch_size", "pipeline_notify_cooldown_seconds"] },
+  { title: "模型档位与 Token 预算", keys: ["quality_provider_id", "fast_provider_id", "fallback_provider_id", "daily_token_limit", "soft_token_limit", "single_call_token_cap"] },
   { title: "检索与注入", keys: ["retrieval_mode", "retrieval_bm25", "provider_timeout_seconds", "inject_budget_chars", "inject_warm_triggered", "inject_novelty_filter", "top_k", "core_fact_limit", "related_fact_limit", "inject_dedup_window_seconds", "cache_ttl_seconds", "high_evidence_confidence", "debug_log_injection", "coexistence_degrade"] },
   { title: "重要性与维护", keys: ["importance_weight", "importance_half_life_days", "importance_reinforce_factor", "importance_max_half_life_multiplier", "importance_prune_threshold", "sleep_timeline_retain_days", "sleep_low_value_days", "sleep_low_value_confidence", "sleep_superseded_retain_days", "empty_profile_ttl_days"] },
   { title: "学习与人格草稿", keys: ["learning_enabled", "jargon_enabled", "jargon_scope", "jargon_min_count", "jargon_cooldown_seconds", "fewshot_enabled", "persona_draft_enabled", "persona_draft_min_fewshots", "persona_draft_cooldown_seconds", "persona_draft_ttl_seconds", "inject_jargon_limit", "inject_fewshot_limit"] },
+  { title: "事件记忆与隐私", keys: ["event_enabled", "event_gap_minutes", "event_max_hours", "event_min_messages", "event_merge_minutes", "event_max_per_run", "event_provider_id", "event_budget_chars", "event_max_inject", "event_archive_days", "memory_session_isolation", "entity_linking_enabled", "entity_boost_weight", "history_enabled", "history_max_facts"] },
   { title: "图片", keys: ["image_caption_provider_id", "image_caption_timeout_seconds"] },
   { title: "Embedding 与 Rerank", keys: ["embedding_enabled", "embedding_auto_threshold", "embedding_provider_id", "rerank_provider_id"] },
 ];
@@ -887,6 +1020,7 @@ async function reload() {
   await loadOverview();
   await loadMemory();
   await loadMemoryPending();
+  await loadEvents();
   await loadProfiles();
   await loadReviews();
   await loadPending();
@@ -900,7 +1034,7 @@ async function reload() {
 }
 
 function showTab(name) {
-  ["memory", "profiles", "diag", "settings"].forEach((key) => {
+  ["memory", "events", "profiles", "diag", "settings"].forEach((key) => {
     const page = $(`page-${key}`);
     if (!page) return;
     page.hidden = key !== name;
@@ -913,6 +1047,7 @@ function showTab(name) {
   document.querySelectorAll(".tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === name));
   if (name === "settings") run("加载设置", loadSettings);
   if (name === "profiles") run("已刷新档案", loadProfiles);
+  if (name === "events") run("已刷新事件", loadEvents);
 }
 
 function attachRipple(ev) {
@@ -958,8 +1093,76 @@ async function saveFactEdit(el) {
   return r;
 }
 
+async function saveEventEdit(el) {
+  const id = Number(el.dataset.id);
+  const titleEl = document.querySelector(`input[data-edit-event-title="${id}"]`);
+  const summaryEl = document.querySelector(`textarea[data-edit-event-summary="${id}"]`);
+  const highlightsEl = document.querySelector(`textarea[data-edit-event-highlights="${id}"]`);
+  const importanceEl = document.querySelector(`input[data-edit-event-importance="${id}"]`);
+  const body = { id, title: titleEl ? titleEl.value.trim() : "" };
+  if (!body.title) return { ok: false, error: "empty" };
+  if (summaryEl) body.summary = summaryEl.value.trim();
+  if (highlightsEl) body.highlights = highlightsEl.value;
+  if (importanceEl && importanceEl.value !== "") body.importance = Number(importanceEl.value);
+  const r = await apiPost("events/update", body);
+  editingEventId = 0;
+  await loadEvents();
+  return r;
+}
+
 async function onAct(act, el) {
   if (act === "tab") return showTab(el.dataset.tab);
+  if (act === "events-refresh" || act === "events-search") return run("已刷新事件", loadEvents);
+  if (act === "events-status") return safe(async () => {
+    eventsStatus = el.dataset.status || "live";
+    await loadEvents();
+  });
+  if (act === "event-pin") return run("已更新", async () => {
+    const r = await apiPost("events/pin", {
+      id: Number(el.dataset.id),
+      pinned: el.dataset.pinned !== "1",
+    });
+    await loadEvents();
+    return r;
+  });
+  if (act === "event-approve") return run("已确认写入", async () => {
+    const r = await apiPost("events/update", { id: Number(el.dataset.id), approve: true });
+    await loadEvents(); await loadOverview();
+    return r;
+  });
+  if (act === "event-edit") {
+    return safe(async () => {
+      editingEventId = Number(el.dataset.id);
+      await loadEvents();
+    });
+  }
+  if (act === "event-edit-cancel") {
+    return safe(async () => {
+      editingEventId = 0;
+      await loadEvents();
+    });
+  }
+  if (act === "event-save") return run("已保存", () => saveEventEdit(el));
+  if (act === "event-del") return run("已删除", async () => {
+    await apiPost("events/archive", { ids: [Number(el.dataset.id)] });
+    await loadEvents(); await loadOverview();
+  });
+  if (act === "event-restore") return run("已恢复", async () => {
+    await apiPost("events/restore", { ids: [Number(el.dataset.id)] });
+    await loadEvents(); await loadOverview();
+  });
+  if (act === "event-evidence") return safe(async () => {
+    const id = Number(el.dataset.id);
+    const box = $(`event-raw-${id}`);
+    const data = await apiGet("events/evidence", { id });
+    const items = data.items || [];
+    if (box) {
+      box.hidden = false;
+      box.innerHTML = items.length
+        ? items.map((m) => `[${esc(fmtTime(m.ts))}] ${esc(m.speaker)}(${esc(m.role)}): ${esc(m.content)}`).join("\n")
+        : "原文已被时间线清理。";
+    }
+  });
   if (act === "refresh") return run("已刷新", reload);
   if (act === "extract") return run("已整理", async () => { const r = await apiPost("extract", {}); await reload(); return r; });
   if (act === "sleep") return run("已维护", async () => { const r = await apiPost("sleep", {}); await reload(); return r; });
@@ -1042,6 +1245,18 @@ async function onAct(act, el) {
     });
   }
   if (act === "fact-edit-save") return run("已保存", () => saveFactEdit(el));
+  if (act === "fact-entities") return safe(async () => {
+    const id = Number(el.dataset.id);
+    const box = $(`fact-entities-${id}`);
+    const data = await apiGet("entities", { ref: "fact", id });
+    const items = data.items || [];
+    if (box) {
+      box.hidden = false;
+      box.innerHTML = items.length
+        ? items.map((x) => `<span class="chip gray">${esc(x.kind)} ${esc(x.name)}</span>`).join(" ")
+        : "没有登记到实体（关键词为空时不会登记）。";
+    }
+  });
   if (act === "fact-del") return run("已删除", async () => {
     await apiPost("facts/archive", { ids: [Number(el.dataset.id)] });
     if (el.dataset.where === "profile") await loadProfile(currentProfileId);
@@ -1118,6 +1333,13 @@ async function onAct(act, el) {
   if (act === "reviews-batch") return run("已处理", async () => {
     const ids = Array.from(document.querySelectorAll('#reviews [data-role="review-check"]:checked')).map((b) => Number(b.value));
     if (!ids.length) return { ok: false, error: "none_selected", message: "没有勾选条目" };
+    const r = await apiPost("reviews/set", { ids, status: el.dataset.status });
+    await loadReviews();
+    return r;
+  });
+  if (act === "reviews-all") return run("已处理", async () => {
+    const ids = Array.from(document.querySelectorAll('#reviews [data-role="review-check"]')).map((b) => Number(b.value)).filter(Boolean);
+    if (!ids.length) return { ok: false, error: "none", message: "当前没有待审条目" };
     const r = await apiPost("reviews/set", { ids, status: el.dataset.status });
     await loadReviews();
     return r;

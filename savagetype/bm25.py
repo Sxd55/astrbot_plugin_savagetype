@@ -15,6 +15,13 @@ def fact_text(fact: Fact) -> str:
     return f"{fact.subject} {fact.attribute} {fact.value} {fact.content} {keywords}"
 
 
+def event_text(event: Any) -> str:
+    highlights = " ".join(str(h) for h in (getattr(event, "highlights", None) or []))
+    keywords = " ".join(str(k) for k in (getattr(event, "keywords", None) or []))
+    summary = getattr(event, "summary", "") or ""
+    return f"{getattr(event, 'title', '')} {summary} {highlights} {keywords}"
+
+
 class BM25Index:
     """Small in-memory index rebuilt per retrieval query (corpus is per-speaker)."""
 
@@ -23,15 +30,17 @@ class BM25Index:
 
     def __init__(
         self,
-        facts: Iterable[Fact],
+        facts: Iterable[Any],
         tokenize_fn: Callable[[str], list[str]] | None = None,
+        text_fn: Callable[[Any], str] | None = None,
     ):
         self._tokenize = tokenize_fn or tokenizer_mod.tokens
+        self._text = text_fn or fact_text
         self._docs: dict[int, list[str]] = {}
         df: Counter[str] = Counter()
         total = 0
         for fact in facts:
-            toks = self._tokenize(fact_text(fact))
+            toks = self._tokenize(self._text(fact))
             self._docs[fact.id] = toks
             total += len(toks)
             for term in set(toks):

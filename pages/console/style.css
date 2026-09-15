@@ -131,6 +131,11 @@ h2 { font-size: 17px; margin: 0 0 6px; font-weight: 600; color: var(--sg-text); 
 .grid.three { grid-template-columns: repeat(3, 1fr); margin-top: 16px; }
 .grid.archive { grid-template-columns: 0.8fr 1.2fr; }
 
+/* 同排卡片等高对齐（底部齐平），内容区自适应吃掉多余高度，不留大片空白。 */
+.grid.two > .card,
+.grid.three > .card { max-height: 720px; }
+.grid.three > .card { min-height: 280px; }
+
 .card {
   padding: 22px;
   min-width: 0;
@@ -261,6 +266,23 @@ textarea { width: 100%; min-height: 76px; resize: vertical; }
 }
 .scroll.short { max-height: 240px; }
 .scroll.tall { max-height: 620px; }
+
+/* 等高排卡片里的列表区：撑满剩余高度（不留空档），超出仍内部滚动。
+   只作用于带卡片高度上限的 .grid 排，其它页面的列表保留自己的 max-height。 */
+.grid.two > .card > .scroll,
+.grid.three > .card > .scroll {
+  flex: 1 1 auto;
+  min-height: 140px;
+  max-height: none;
+}
+/* 空列表的提示语在列表区居中，避免看起来像坏掉的空白。 */
+.scroll > .lede:only-child {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 120px;
+  text-align: center;
+}
 .scroll.diag {
   max-height: 460px;
   min-height: 200px;

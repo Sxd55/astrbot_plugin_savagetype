@@ -21,6 +21,7 @@
         </div>
         <nav class="tabs">
           <button type="button" data-act="tab" data-tab="memory" class="on">记忆库</button>
+          <button type="button" data-act="tab" data-tab="events">事件</button>
           <button type="button" data-act="tab" data-tab="profiles">人物档案</button>
           <button type="button" data-act="tab" data-tab="diag">诊断</button>
           <button type="button" data-act="tab" data-tab="settings">设置</button>
@@ -39,6 +40,7 @@
         <div class="kpis" id="kpis"></div>
         <p id="coexist" class="lede"></p>
         <p id="owner-line" class="lede"></p>
+        <p id="usage-line" class="lede"></p>
 
         <div class="grid two">
           <section class="card glass">
@@ -70,17 +72,18 @@
           </section>
 
           <section class="card glass">
-            <h2>待审记忆</h2>
-            <p class="lede">审核不通过的条目。通过才写入；删除即丢弃。主人会收到 QQ 通知，回复「是/否 + 编号」也可以。</p>
-            <div class="scroll" id="memory-pending"></div>
+            <h2>学习审查</h2>
+            <p class="lede">黑话、few-shot、人格草稿。批准后才注入；支持按状态/类型筛选、全选和一键批准、驳回。</p>
+            <div id="reviews-toolbar"></div>
+            <div class="scroll tall" id="reviews"></div>
           </section>
         </div>
 
         <div class="grid three">
           <section class="card glass">
-            <h2>学习审查</h2>
-            <p class="lede">黑话、few-shot、人格草稿。批准后才注入；支持按状态/类型筛选和批量批准、驳回。</p>
-            <div class="scroll short" id="reviews"></div>
+            <h2>待审记忆</h2>
+            <p class="lede">审核不通过的条目。通过才写入；删除即丢弃。主人会收到 QQ 通知，回复「是/否 + 编号」也可以。</p>
+            <div class="scroll short" id="memory-pending"></div>
           </section>
 
           <section class="card glass">
@@ -95,6 +98,26 @@
             <div class="scroll short" id="alias-suggestions"></div>
           </section>
         </div>
+      </section>
+
+      <!-- 事件 -->
+      <section id="page-events" hidden>
+        <div class="row toolbar">
+          <button type="button" data-act="events-refresh">刷新</button>
+          <button type="button" data-act="events-status" data-status="live" class="on">当前事件</button>
+          <button type="button" class="ghost" data-act="events-status" data-status="needs_review">待审事件</button>
+          <button type="button" class="ghost" data-act="events-status" data-status="archived">已归档</button>
+          <button type="button" class="ghost" data-act="events-status" data-status="pinned">置顶</button>
+        </div>
+        <section class="card glass">
+          <h2>事件记忆</h2>
+          <p class="lede">一段连续聊天整理成「一件事」：经历、决定、聊过的话题。追加式，同一话题不同时期也各存一条；待审事件确认后才参与注入。</p>
+          <div class="row">
+            <input id="events-q" placeholder="搜索标题 / 摘要 / 关键词" />
+            <button type="button" data-act="events-search">搜索</button>
+          </div>
+          <div class="scroll" id="events-list"></div>
+        </section>
       </section>
 
       <!-- 人物档案 -->

@@ -10,6 +10,7 @@ from typing import Any
 
 from .archive import (
     archive_decayed,
+    archive_decayed_events,
     archive_low_value,
     backup_db,
     compact_summarized_timeline,
@@ -27,9 +28,17 @@ from .archive import (
 from . import tokenize as tokenizer_mod
 from .coexistence import Coexistence
 from .contradiction import ContradictionEngine
+from .events import EventPipeline
 from .extract import Extractor
 from .inject import build_pack
 from .learn import LearningEngine
+from .llm import (
+    BudgetGuard,
+    LLMBudgetExceeded,
+    estimate_tokens,
+    looks_refusal,
+    resolve_provider,
+)
 from .pipeline import MemoryPipeline
 from .profiles import build_profile
 from .retrieve import Retriever
@@ -128,7 +137,15 @@ class SavageTypeService:
             verify_llm=self._llm_for("verify"),
             is_owner_speaker=self.is_owner_speaker,
         )
-        self.learning = LearningEngine(store, llm=self._llm, config=self.config)
+        self.learning = LearningEngine(store, llm=self._llm_for("learn"), config=self.config)
+        self.events = EventPipeline(
+            store,
+            self.config,
+            logger,
+            llm=self._llm_for("event"),
+            verify_llm=self._llm_for("verify"),
+            is_owner_speaker=self.is_owner_speaker,
+        )
         self.retriever = Retriever(
             store,
             embed=None,
@@ -141,6 +158,8 @@ class SavageTypeService:
         self._embed_lock = asyncio.Lock()
         self._last_extract_at = 0
         self._extract_fail_until = 0
+        self._events_fail_until = 0
+        self._llm_guard: BudgetGuard | None = None
         self._learn_task: asyncio.Task | None = None
         self._sync_embed_fn()
 
@@ -227,6 +246,7 @@ class SavageTypeService:
         self.config["_skip_style_learning"] = bool(self.coexistence.skip_style)
         self.learning.config = self.config
         self.pipeline.config = self.config
+        self.events.config = self.config
         mode = str(self.config.get("retrieval_mode") or "auto")
         cache_ttl = max(0, int(self._cfg_value("cache_ttl_seconds", 20)))
         bm25 = bool(self._cfg_value("retrieval_bm25", True))
@@ -642,7 +662,11 @@ class SavageTypeService:
         return bool(newest) and now_ts() - newest >= idle
 
     async def maybe_extract(self, force: bool = False) -> dict[str, Any]:
-        if not self.enabled() or not self.config.get("extract_enabled", True):
+        if not self.enabled():
+            return {"ok": True, "skipped": True, "reason": "disabled"}
+        extract_enabled = bool(self.config.get("extract_enabled", True))
+        event_enabled = self.events.enabled()
+        if not extract_enabled and not event_enabled:
             return {"ok": True, "skipped": True, "reason": "extract disabled"}
         now = now_ts()
         cooldown = max(0, int(self._cfg_value("extract_cooldown_seconds", 45)))
@@ -653,23 +677,44 @@ class SavageTypeService:
         if self._extract_lock.locked():
             return {"ok": True, "skipped": True, "reason": "busy"}
         idle = not force and self.idle_pending()
+        fail_cd = max(0, int(self._cfg_value("extract_fail_cooldown_seconds", 180)))
         async with self._extract_lock:
-            try:
-                result = await self.pipeline.run(force=force or idle)
-                if idle:
-                    result["idle"] = True
-                self._last_extract_at = now_ts()
-                if not result.get("skipped"):
-                    self.store.add_usage("extract", ok=True, detail=str(result.get("events") or 0))
-                    if result.get("pending"):
-                        await self.notify_pending()
-                return result
-            except Exception as exc:  # noqa: BLE001
-                fail_cd = max(0, int(self._cfg_value("extract_fail_cooldown_seconds", 180)))
-                self._extract_fail_until = now_ts() + fail_cd
-                self.store.add_usage("extract", ok=False, detail=str(exc)[:200])
-                self.store.add_diag("extract_fail", {"error": str(exc)})
-                return {"ok": False, "skipped": True, "reason": "extract_fail", "error": str(exc)}
+            if extract_enabled:
+                try:
+                    result = await self.pipeline.run(force=force or idle)
+                except LLMBudgetExceeded as exc:
+                    # 预算闸：不算失败、不冷却，等额度恢复后重跑同一批。
+                    self.store.add_diag("llm_budget", {"task": "normalize", "reason": exc.reason})
+                    result = {"ok": True, "skipped": True, "reason": "budget"}
+                except Exception as exc:  # noqa: BLE001
+                    self._extract_fail_until = now_ts() + fail_cd
+                    self.store.add_usage("extract", ok=False, detail=str(exc)[:200])
+                    self.store.add_diag("extract_fail", {"error": str(exc)})
+                    result = {"ok": False, "skipped": True, "reason": "extract_fail", "error": str(exc)}
+            else:
+                result = {"ok": True, "skipped": True, "reason": "extract disabled"}
+            if idle:
+                result["idle"] = True
+            if not result.get("skipped"):
+                self.store.add_usage("extract", ok=True, detail=str(result.get("events") or 0))
+                if result.get("pending"):
+                    await self.notify_pending()
+            # 事件层独立失败冷却：事实管线挂了不拖累事件（事件有确定性兜底）。
+            if event_enabled and (force or now_ts() >= self._events_fail_until):
+                try:
+                    events_result = await self.events.run(force=force or idle)
+                    result["events_layer"] = events_result
+                except LLMBudgetExceeded as exc:
+                    self.store.add_diag("llm_budget", {"task": "event", "reason": exc.reason})
+                    result["events_layer"] = {"ok": True, "skipped": True, "reason": "budget"}
+                except Exception as exc:  # noqa: BLE001
+                    self._events_fail_until = now_ts() + fail_cd
+                    self.store.add_diag("events_fail", {"error": str(exc)[:200]})
+                    result["events_layer"] = {
+                        "ok": False, "skipped": True, "reason": "events_fail", "error": str(exc),
+                    }
+            self._last_extract_at = now_ts()
+            return result
 
     async def notify_pending(self) -> bool:
         items = self.store.pending_memory_unqueued(limit=10)
@@ -865,6 +910,40 @@ class SavageTypeService:
             return
         self.store.add_recall(window_tag, [int(fid) for fid in fact_ids], now_ts())
 
+    def _recent_event_ids(self, window_tag: str) -> set[int]:
+        if not window_tag:
+            return set()
+        window = max(0, int(self._cfg_value("inject_dedup_window_seconds", 600)))
+        if window <= 0:
+            return set()
+        return self.store.recent_event_recall_ids(window_tag, now_ts() - window)
+
+    def _remember_injected_events(self, window_tag: str, event_ids: list[int]) -> None:
+        if not window_tag or not event_ids:
+            return
+        self.store.add_event_recall(window_tag, [int(eid) for eid in event_ids], now_ts())
+
+    def session_isolation_mode(self) -> str:
+        from .util import session_isolation
+
+        return session_isolation(str(self._cfg_value("memory_session_isolation", "strict")))
+
+    def entity_boost_weight(self) -> float:
+        if not bool(self._cfg_value("entity_linking_enabled", True)):
+            return 0.0
+        try:
+            return max(0.0, min(1.0, float(self._cfg_value("entity_boost_weight", 0.2))))
+        except (TypeError, ValueError):
+            return 0.2
+
+    def history_limit(self) -> int:
+        if not bool(self._cfg_value("history_enabled", True)):
+            return 0
+        try:
+            return max(0, int(self._cfg_value("history_max_facts", 6)))
+        except (TypeError, ValueError):
+            return 6
+
     def _retrieval_ctx(self, query: str, speaker_id: str, persona_id: str = "") -> tuple[str, list[str], str | None]:
         canonical = self.store.resolve_speaker(speaker_id)
         ids = self.store.speaker_ids_for(canonical)
@@ -887,6 +966,9 @@ class SavageTypeService:
         persona_id: str = "",
         skip_ids: set[int] | None = None,
         skip_query_mentions: bool = False,
+        window_tag: str = "",
+        event_skip_ids: set[int] | None = None,
+        event_limit: int = 0,
     ) -> Any:
         self._sync_embed_fn()
         canonical, ids, ask_other = self._retrieval_ctx(query, speaker_id, persona_id)
@@ -902,9 +984,22 @@ class SavageTypeService:
             skip_ids=skip_ids,
             importance_cfg=self.importance_cfg(),
             skip_query_mentions=skip_query_mentions,
+            window_tag=window_tag,
+            isolation=self.session_isolation_mode(),
+            owner_ids=set(self._owner_ids),
+            event_skip_ids=event_skip_ids,
+            event_limit=max(1, int(event_limit or self.config.get("event_max_inject") or 2)),
+            entity_weight=self.entity_boost_weight(),
+            history_limit=self.history_limit(),
         )
 
-    async def warm_retrieval(self, query: str, speaker_id: str, persona_id: str = "") -> None:
+    async def warm_retrieval(
+        self,
+        query: str,
+        speaker_id: str,
+        persona_id: str = "",
+        window_tag: str = "",
+    ) -> None:
         """会话锁等待期间预热检索缓存，让检索和排队时间重叠。"""
         if self.retriever.cache_ttl <= 0:
             return
@@ -920,12 +1015,36 @@ class SavageTypeService:
             persona_id=persona_id,
             speaker_ids=ids,
             importance_cfg=self.importance_cfg(),
+            window_tag=window_tag,
+            isolation=self.session_isolation_mode(),
+            owner_ids=set(self._owner_ids),
+            entity_weight=self.entity_boost_weight(),
+            history_limit=self.history_limit(),
+            event_limit=max(1, int(self.config.get("event_max_inject") or 2)),
         )
 
-    def dossier_for(self, speaker_id: str, persona_id: str = "") -> dict[str, Any]:
+    def dossier_for(
+        self,
+        speaker_id: str,
+        persona_id: str = "",
+        window_tag: str = "",
+        query: str = "",
+        isolation: str = "off",
+    ) -> dict[str, Any]:
         canonical = self.store.resolve_speaker(speaker_id)
         ids = self.store.speaker_ids_for(canonical)
         facts = self.store.live_by_speaker(canonical, persona_id=persona_id, speaker_ids=ids, limit=40)
+        if isolation != "off" and window_tag:
+            # 档案卡也要过隐私：私聊来源的条目不能借档案卡漏进群聊。
+            kept = []
+            for fact in facts:
+                reason = self.retriever._visibility(  # noqa: SLF001
+                    fact, canonical, query, None, "long_term", ids, persona_id,
+                    window_tag, isolation, set(self._owner_ids),
+                )
+                if not reason:
+                    kept.append(fact)
+            facts = kept
         name = ""
         if facts:
             name = facts[0].speaker_name or ""
@@ -947,15 +1066,24 @@ class SavageTypeService:
         window_tag: str = "",
     ) -> tuple[str, Any, dict[str, Any]]:
         skip_ids = self._recent_ids(window_tag)
+        event_skip_ids = self._recent_event_ids(window_tag)
         result = await self.retrieve_for(
             query,
             speaker_id,
             persona_id=persona_id,
             skip_ids=skip_ids,
             skip_query_mentions=bool(self._cfg_value("inject_novelty_filter", True)),
+            window_tag=window_tag,
+            event_skip_ids=event_skip_ids,
         )
         learning = self.learning.pack_for(query, persona_id=persona_id, route=result.route)
-        dossier = self.dossier_for(speaker_id, persona_id=persona_id)
+        dossier = self.dossier_for(
+            speaker_id,
+            persona_id=persona_id,
+            window_tag=window_tag,
+            query=query,
+            isolation=self.session_isolation_mode(),
+        )
         card = dossier.get("card") or ""
         shown_ids = (
             {f.id for f in result.core}
@@ -978,6 +1106,7 @@ class SavageTypeService:
             if not f.persona_id or f.persona_id == persona_id
         ][:6]
         injected_ids: list[int] = []
+        injected_event_ids: list[int] = []
         pack = build_pack(
             result,
             # 0 表示不限（见 inject._fits 的预算语义），显式 0 不能被 or 默认值吞掉。
@@ -988,10 +1117,21 @@ class SavageTypeService:
             warm_triggered=bool(self._cfg_value("inject_warm_triggered", True)),
             bot_facts=bot_facts,
             out_ids=injected_ids,
+            events=list(getattr(result, "events", None) or []),
+            event_budget=int(self._cfg_value("event_budget_chars", 300)),
+            event_limit=max(1, int(self._cfg_value("event_max_inject", 2))),
+            out_event_ids=injected_event_ids,
+            history=list(getattr(result, "history", None) or []),
+            history_current=dict(getattr(result, "history_current", None) or {}),
+            history_label=str(getattr(result, "history_label", "") or ""),
+            history_limit=max(1, int(self._cfg_value("history_max_facts", 6))),
         )
         if pack:
-            # 只有真的进了包的事实才算「最近注入过」；被预算裁掉/未触发的都不占名额。
+            # 只有真的进了包的事实/事件才算「最近注入过」；被预算裁掉/未触发的都不占名额。
             self._remember_injected(window_tag, injected_ids)
+            self._remember_injected_events(window_tag, injected_event_ids)
+            for event_id in injected_event_ids:
+                self.store.bump_event_access(event_id)
         snapshot = {
             "query": clip(query, 80),
             "speaker_id": speaker_id,
@@ -1003,14 +1143,24 @@ class SavageTypeService:
             "pack_chars": len(pack),
             "pack_tokens": estimate_tokens(pack),
             "injected_ids": injected_ids,
+            "injected_event_ids": injected_event_ids,
+            "isolation": self.session_isolation_mode(),
             "bot_facts": [f.id for f in bot_facts],
             "core": [f.id for f in result.core],
             "related": [f.id for f in result.related],
             "uncertain": [f.id for f in result.uncertain],
             "superseded": [f.id for f in result.superseded],
+            "events": [e.id for e in (getattr(result, "events", None) or [])],
+            "history": [f.id for f in (getattr(result, "history", None) or [])],
+            "history_label": str(getattr(result, "history_label", "") or ""),
+            "entity_weight": self.entity_boost_weight(),
             "blocked": [
                 {"id": h.fact.id, "reason": h.filter_reason}
                 for h in result.blocked[:8]
+            ],
+            "event_blocked": [
+                {"id": e.id, "reason": "filter"}
+                for e in (getattr(result, "event_blocked", None) or [])[:8]
             ],
             "jargon": [j.get("term") for j in (learning.jargon or [])],
             "fewshots": len(learning.fewshots or []),
@@ -1119,14 +1269,17 @@ class SavageTypeService:
         facts = self.store.missing_embeddings(limit=limit)
         if not facts:
             return 0
-        async with self._embed_lock:
-            vectors = await self._embed([f.content for f in facts])
-            n = 0
-            for fact, vec in zip(facts, vectors):
-                if vec:
-                    self.store.update_fact(fact.id, embedding=vec)
-                    n += 1
-            return n
+        try:
+            async with self._embed_lock:
+                vectors = await self._embed([f.content for f in facts])
+        except LLMBudgetExceeded:
+            return 0
+        n = 0
+        for fact, vec in zip(facts, vectors):
+            if vec:
+                self.store.update_fact(fact.id, embedding=vec)
+                n += 1
+        return n
 
     def sleep_maintenance(self) -> dict[str, Any]:
         merged = self.store.resolve_all_slot_conflicts()
@@ -1151,6 +1304,14 @@ class SavageTypeService:
             reinforce_factor=float(self._cfg_value("importance_reinforce_factor", 0.5)),
             max_multiplier=float(self._cfg_value("importance_max_half_life_multiplier", 3)),
         )
+        decayed_events = archive_decayed_events(
+            self.store,
+            min_age_days=int(self._cfg_value("event_archive_days", 90)),
+            threshold=float(self._cfg_value("importance_prune_threshold", 0.12)),
+            half_life_days=float(self._cfg_value("importance_half_life_days", 30)),
+            reinforce_factor=float(self._cfg_value("importance_reinforce_factor", 0.5)),
+            max_multiplier=float(self._cfg_value("importance_max_half_life_multiplier", 3)),
+        )
         expired = expire_persona_drafts(
             self.store,
             ttl_seconds=int(self.config.get("persona_draft_ttl_seconds") or 14 * 86400),
@@ -1169,6 +1330,7 @@ class SavageTypeService:
             "compacted_superseded": compacted_superseded,
             "archived_low_value": archived,
             "archived_decayed": decayed,
+            "archived_events": decayed_events,
             "expired_persona_drafts": expired,
             "deleted_empty_profiles": empty_profiles,
             "pruned_jargon": pruned_jargon,
@@ -1267,6 +1429,13 @@ class SavageTypeService:
             "speakers": self.speaker_options(),
             "data_dir": str(self.store.db_path.parent),
             "embedding": self.embedding_status(),
+            "tokens": self.tokens_status(),
+            "providers": {
+                "normalize": self._provider_for("normalize"),
+                "verify": self._provider_for("verify"),
+                "event": self._provider_for("event"),
+                "learn": self._provider_for("learn"),
+            },
             "owner": {
                 "qq": self.owner_qq(),
                 "ids": sorted(self._owner_ids),
@@ -1281,6 +1450,8 @@ class SavageTypeService:
                 "tokenizer": tokenizer_mod.name(),
                 "embedding_enabled": bool(self.config.get("embedding_enabled")),
                 "pipeline_enabled": bool(self.config.get("pipeline_enabled", True)),
+                "event_enabled": self.events.enabled(),
+                "session_isolation": self.session_isolation_mode(),
                 "platforms": self.allowed_platforms(),
                 "theme_color": str(self.config.get("ui_theme_color") or "#7c5cff"),
                 "theme_color2": str(self.config.get("ui_theme_color2") or "#22d3ee"),
@@ -1304,45 +1475,96 @@ class SavageTypeService:
         return dest
 
     def _provider_for(self, kind: str) -> str:
-        if kind == "verify":
-            return str(
-                self.config.get("verify_provider_id")
-                or self.config.get("normalize_provider_id")
-                or self.config.get("summary_provider_id")
-                or ""
-            ).strip()
-        if kind == "normalize":
-            return str(
-                self.config.get("normalize_provider_id")
-                or self.config.get("summary_provider_id")
-                or ""
-            ).strip()
-        return str(self.config.get("summary_provider_id") or "").strip()
+        """显式配置 > 档位 > 旧回退链 > 当前会话模型（空串表示跟随会话）。"""
+        return resolve_provider(kind, self.config)[0]
 
-    async def _llm_with_provider(self, prompt: str, provider_id: str) -> str:
+    def _provider_source(self, kind: str) -> str:
+        return resolve_provider(kind, self.config)[1]
+
+    def llm_guard(self) -> BudgetGuard:
+        if self._llm_guard is None:
+            self._llm_guard = BudgetGuard(self.config, lambda: self.store.tokens_today())
+        return self._llm_guard
+
+    def tokens_status(self) -> dict[str, Any]:
+        status = self.llm_guard().status()
+        status["by_task"] = self.store.usage_by_task_today()
+        return status
+
+    async def _llm_with_provider(self, prompt: str, provider_id: str, task: str = "default") -> str:
+        guard = self.llm_guard()
+        source = self._provider_source(task)
+        decision = guard.check(task, prompt)
+        if not decision.allowed:
+            self.store.add_usage(
+                "llm", provider_id, ok=False, chars_in=len(prompt or ""),
+                task=task, source=source, reason=decision.reason,
+            )
+            if self.logger:
+                self.logger.info(
+                    "Savage Type llm budget blocked task=%s reason=%s used=%s",
+                    task, decision.reason, guard.status()["used"],
+                )
+            raise LLMBudgetExceeded(decision.reason)
+        if decision.provider_override:
+            provider_id = decision.provider_override
+            source = "single_call_cap"
+        return await self._chat(prompt, provider_id, task=task, source=source, allow_refusal_retry=True)
+
+    async def _chat(
+        self,
+        prompt: str,
+        provider_id: str,
+        task: str = "default",
+        source: str = "",
+        allow_refusal_retry: bool = False,
+    ) -> str:
         try:
             result = await self.llm_generate(prompt, provider_id)
-            text, tokens_in, tokens_out = _unpack_llm_result(result)
-            self.store.add_usage(
-                "llm",
-                provider_id,
-                True,
-                len(prompt),
-                len(text or ""),
-                tokens_in=tokens_in,
-                tokens_out=tokens_out,
-            )
-            return text
         except Exception:
-            self.store.add_usage("llm", provider_id, False, len(prompt), 0)
+            self.store.add_usage("llm", provider_id, False, len(prompt or ""), 0, task=task, source=source, reason="error")
             raise
+        text, tokens_in, tokens_out = _unpack_llm_result(result)
+        if tokens_in <= 0:
+            tokens_in = estimate_tokens(prompt or "")
+        if tokens_out <= 0:
+            tokens_out = estimate_tokens(text or "")
+        self.store.add_usage(
+            "llm",
+            provider_id,
+            True,
+            len(prompt or ""),
+            len(text or ""),
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            task=task,
+            source=source,
+        )
+        if allow_refusal_retry and looks_refusal(text):
+            fallback = self.llm_guard().fallback_provider()
+            if fallback and fallback != provider_id:
+                # 拒答按「被子弹拦截」记账，然后用备用模型重试一次。
+                self.store.add_usage(
+                    "llm", provider_id, ok=False, task=task, source=source, reason="refusal"
+                )
+                if self.logger:
+                    self.logger.info(
+                        "Savage Type llm refusal task=%s, retrying with fallback %s", task, fallback
+                    )
+                return await self._chat(
+                    prompt, fallback, task=task, source="fallback", allow_refusal_retry=False
+                )
+            self.store.add_diag("llm_refusal", {"task": task, "provider": provider_id})
+        return text
 
     async def _llm(self, prompt: str) -> str:
-        return await self._llm_with_provider(prompt, self._provider_for("default"))
+        return await self._llm_with_provider(prompt, self._provider_for("default"), task="default")
 
     def _llm_for(self, kind: str):
+        kind = kind or "default"
+
         async def call(prompt: str) -> str:
-            return await self._llm_with_provider(prompt, self._provider_for(kind))
+            return await self._llm_with_provider(prompt, self._provider_for(kind), task=kind)
 
         return call
 
@@ -1353,6 +1575,7 @@ class SavageTypeService:
         persona_id: str = "",
         fact_id: int = 0,
         max_steps: int = 3,
+        window_tag: str = "",
     ) -> dict[str, Any]:
         steps = []
         seen: set[int] = set()
@@ -1364,7 +1587,9 @@ class SavageTypeService:
                 seen.add(seed.id)
                 current = seed.content or query
         for i in range(hops):
-            result = await self.retrieve_for(current, speaker_id, persona_id=persona_id)
+            result = await self.retrieve_for(
+                current, speaker_id, persona_id=persona_id, window_tag=window_tag
+            )
             batch = []
             for fact in result.core + result.related + result.uncertain:
                 if fact.id in seen:
@@ -1403,6 +1628,14 @@ class SavageTypeService:
         except Exception:
             pid = ""
         timeout = self._provider_timeout()
+        prompt_text = " ".join(texts)
+        decision = self.llm_guard().check("embed", prompt_text[:4000])
+        if not decision.allowed:
+            self.store.add_usage(
+                "embed", pid, ok=False, chars_in=sum(len(t) for t in texts),
+                task="embed", source="explicit:embedding_provider_id", reason=decision.reason,
+            )
+            raise LLMBudgetExceeded(decision.reason)
         try:
             if hasattr(provider, "get_embeddings"):
                 vectors = await self._wait_provider(provider.get_embeddings(texts), timeout)
@@ -1410,7 +1643,11 @@ class SavageTypeService:
                 vectors = []
                 for text in texts:
                     vectors.append(await self._wait_provider(provider.get_embedding(text), timeout))
-            self.store.add_usage("embed", pid, True, sum(len(t) for t in texts), 0)
+            self.store.add_usage(
+                "embed", pid, True, sum(len(t) for t in texts), 0,
+                tokens_in=estimate_tokens(prompt_text), task="embed",
+                source="explicit:embedding_provider_id",
+            )
             return vectors
         except Exception as exc:
             self.store.add_usage(
@@ -1430,6 +1667,14 @@ class SavageTypeService:
         except Exception:
             pid = ""
         timeout = self._provider_timeout()
+        prompt_text = f"{query} " + " ".join(documents)
+        decision = self.llm_guard().check("rerank", prompt_text[:4000])
+        if not decision.allowed:
+            self.store.add_usage(
+                "rerank", pid, ok=False, chars_in=len(query), task="rerank",
+                source="explicit:rerank_provider_id", reason=decision.reason,
+            )
+            raise LLMBudgetExceeded(decision.reason)
         try:
             results = await self._wait_provider(provider.rerank(query, documents, top_n=top_n), timeout)
             out: list[tuple[int, float]] = []
@@ -1442,7 +1687,11 @@ class SavageTypeService:
                 if idx is None:
                     continue
                 out.append((int(idx), float(score or 0)))
-            self.store.add_usage("rerank", pid, True, len(query) + sum(len(d) for d in documents), 0)
+            self.store.add_usage(
+                "rerank", pid, True, len(query) + sum(len(d) for d in documents), 0,
+                tokens_in=estimate_tokens(prompt_text), task="rerank",
+                source="explicit:rerank_provider_id",
+            )
             return out
         except Exception as exc:
             self.store.add_usage("rerank", pid, False, len(query), 0, detail=f"{type(exc).__name__}")

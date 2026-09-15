@@ -23,6 +23,7 @@ from .util import (
     make_slot_key,
     normalize_slot,
     now_ts,
+    topic_key,
 )
 
 
@@ -168,6 +169,17 @@ class ContradictionEngine:
             if separated is not None:
                 existing = separated
                 payload["slot_key"] = sep_key
+
+        if existing is None and op == "close" and payload.get("attribute") in {"promise", "habit"}:
+            # 约定/习惯按主题分槽后，close 可能带的是整句而不是原值：回退到该属性最近一条。
+            existing = self.store.live_latest_by_attr(
+                str(payload.get("speaker_id") or ""),
+                str(payload.get("subject") or ""),
+                str(payload.get("attribute") or ""),
+                persona_id=persona_id,
+                speaker_ids=self.store.speaker_ids_for(str(payload.get("speaker_id") or "")),
+                topic=topic_key(str(payload.get("value") or "")),
+            )
 
         if existing is None:
             if op == "close":

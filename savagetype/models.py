@@ -79,6 +79,54 @@ class Fact:
 
 
 @dataclass
+class Event:
+    """Episodic memory: one whole thing that happened (life event or conversation)."""
+
+    id: int
+    kind: str = "life"
+    title: str = ""
+    summary: str = ""
+    speaker_id: str = ""
+    speaker_name: str = ""
+    bot_id: str = ""
+    window_tag: str = ""
+    persona_id: str = ""
+    scope: str = ""
+    participants: list[dict[str, Any]] = field(default_factory=list)
+    speaker_ids: list[str] = field(default_factory=list)
+    highlights: list[str] = field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
+    evidence: list[int] = field(default_factory=list)
+    start_ts: int = 0
+    end_ts: int = 0
+    importance: float = 0.0
+    confidence: float = 0.6
+    status: str = "live"
+    pinned: int = 0
+    access_count: int = 0
+    last_accessed: int = 0
+    source: str = "pipeline"
+    review_status: str = ""
+    origin: str = ""
+    fingerprint: str = ""
+    reason: str = ""
+    edited_at: int = 0
+    edited_by: str = ""
+    created_at: int = 0
+    updated_at: int = 0
+
+    def text_blob(self) -> str:
+        parts = [
+            self.title or "",
+            self.summary or "",
+            " ".join(str(h) for h in (self.highlights or [])),
+            " ".join(str(k) for k in (self.keywords or [])),
+            " ".join(str(p.get("name") or "") for p in (self.participants or [])),
+        ]
+        return " ".join(p for p in parts if p)
+
+
+@dataclass
 class PendingOverride:
     id: int
     old_fact_id: int
@@ -108,6 +156,11 @@ class RetrievalResult:
     related: list[Fact]
     uncertain: list[Fact]
     superseded: list[Fact]
+    events: list[Event] = field(default_factory=list)
+    event_blocked: list[Event] = field(default_factory=list)
+    history: list[Fact] = field(default_factory=list)
+    history_current: dict[int, str] = field(default_factory=dict)
+    history_label: str = ""
 
 
 @dataclass

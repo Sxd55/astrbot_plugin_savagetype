@@ -54,6 +54,96 @@
     "hint": "会话静默这么久后，即使未到阈值也会整理一次未总结消息。0=关闭。",
     "default": 300
   },
+  "event_enabled": {
+    "description": "事件记忆（整件事）",
+    "type": "bool",
+    "hint": "把一段连续聊天整理成「一件事」的摘要（经历/决定/聊过的话题），与事实层并行，追加式不互相覆盖。关闭后回到纯事实模式。",
+    "default": true
+  },
+  "event_gap_minutes": {
+    "description": "事件切段静默（分钟）",
+    "type": "int",
+    "hint": "同一会话静默超过该时长就算一段结束，封段后整理成事件。太短会把一件事切碎，太长会拖很久才记录。",
+    "default": 45
+  },
+  "event_max_hours": {
+    "description": "单段最长时长（小时）",
+    "type": "int",
+    "hint": "一段连续对话超过该时长会强制切段，避免聊一整天只成一件。",
+    "default": 6
+  },
+  "event_min_messages": {
+    "description": "成段最少用户消息数",
+    "type": "int",
+    "hint": "一段对话里用户消息少于该条数且没有叙事线索（去了/决定/参加…）时不成事件，避免把灌水记成事件。",
+    "default": 4
+  },
+  "event_merge_minutes": {
+    "description": "续聊合并窗口（分钟）",
+    "type": "int",
+    "hint": "封段后这个时间内又接着聊，会并入原事件重新摘要，不产生碎片事件。应大于「事件切段静默」，否则永远触发不了。0=不合并。",
+    "default": 120
+  },
+  "event_max_per_run": {
+    "description": "每轮最多整理事件数",
+    "type": "int",
+    "hint": "控制后台单次触发的事件摘要次数，避免一次打太多模型调用。",
+    "default": 2
+  },
+  "event_provider_id": {
+    "description": "事件摘要模型",
+    "type": "string",
+    "hint": "留空使用「记忆整理模型」，再留空使用当前会话模型。事件摘要比事实缩写长，建议用便宜快的小模型。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "event_budget_chars": {
+    "description": "事件注入字数预算",
+    "type": "int",
+    "hint": "事件块在注入包里的最大字符数。0=不限。",
+    "default": 300
+  },
+  "event_max_inject": {
+    "description": "每轮最多注入事件数",
+    "type": "int",
+    "default": 2
+  },
+  "event_archive_days": {
+    "description": "事件归档最短天数",
+    "type": "int",
+    "hint": "低权重的旧事件超过该天数后由维护归档，不硬删除。",
+    "default": 90
+  },
+  "memory_session_isolation": {
+    "description": "会话隐私隔离",
+    "type": "string",
+    "options": ["off", "owner", "strict"],
+    "hint": "off=不隔离；owner=主人记忆只在主人自己的会话注入；strict=在 owner 基础上，私聊来源的记忆不再注入到群聊。推荐 strict。",
+    "default": "strict"
+  },
+  "entity_linking_enabled": {
+    "description": "实体链接加权",
+    "type": "bool",
+    "hint": "把人名、关键词、领域登记成实体；提问里出现某个实体时，相关的事实和事件会被加权召回（不需要额外模型调用）。",
+    "default": true
+  },
+  "entity_boost_weight": {
+    "description": "实体命中加成分",
+    "type": "float",
+    "hint": "候选与提问共享实体时叠加的分数，0=不加成，0.2 是稳妥默认。太高会让提谁就只想起谁。",
+    "default": 0.2
+  },
+  "history_enabled": {
+    "description": "时序查询（当时的状态）",
+    "type": "bool",
+    "hint": "问「以前/去年/上个月是什么样」时，检索那段时间为真的旧记忆（含被覆盖的旧说法），并和现状对照注入。",
+    "default": true
+  },
+  "history_max_facts": {
+    "description": "历史块最多条数",
+    "type": "int",
+    "default": 6
+  },
   "inject_dedup_window_seconds": {
     "description": "跨轮注入去重窗口（秒）",
     "type": "int",
@@ -198,6 +288,45 @@
     "hint": "负责对照原文审核整理结果。留空与整理模型相同。",
     "default": "",
     "_special": "select_provider"
+  },
+  "quality_provider_id": {
+    "description": "精准档模型（缩写/事件）",
+    "type": "string",
+    "hint": "推理任务档位：事实缩写、事件摘要。单任务显式配置优先于本档；留空跟随当前会话模型。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "fast_provider_id": {
+    "description": "快速档模型（审核/学习）",
+    "type": "string",
+    "hint": "低延迟任务档位：对照审核、黑话/few-shot/人格草稿。建议配便宜模型；留空跟随更上面的配置或会话模型。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "fallback_provider_id": {
+    "description": "备用模型",
+    "type": "string",
+    "hint": "单次请求超过「单次 Token 上限」或模型明确拒答时，改用它重试一次；留空则不切换。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "daily_token_limit": {
+    "description": "每日 Token 硬限额",
+    "type": "int",
+    "hint": "本插件当天消耗达到该值后停止一切模型调用（后台任务顺延到明天，不丢数据）。0=不限。",
+    "default": 0
+  },
+  "soft_token_limit": {
+    "description": "每日 Token 软限额",
+    "type": "int",
+    "hint": "达到后只停低优先级任务（表达学习、向量回填、重排），缩写/审核/事件继续。0=不限。",
+    "default": 0
+  },
+  "single_call_token_cap": {
+    "description": "单次请求 Token 上限（预估）",
+    "type": "int",
+    "hint": "按提示词估算输入，超过该值时优先改用「备用模型」，未配备用模型则照发并记诊断。0=不限。",
+    "default": 0
   },
   "pipeline_max_revisions": {
     "description": "审核不通过后的最大修改轮数",

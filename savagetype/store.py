@@ -7,17 +7,21 @@ import threading
 from pathlib import Path
 from typing import Any, Iterable
 
-from .models import Fact, MemoryReview, PendingOverride, Profile, ReviewItem, TimelineEvent
+from .models import Event, Fact, MemoryReview, PendingOverride, Profile, ReviewItem, TimelineEvent
 from .slots import apply_slot, fact_kind
 from .util import (
     MEMORY_STATUS_PENDING,
+    ROLE_BOT_ID,
     SCOPE_OWNER,
+    clip,
     default_importance,
     detect_domain,
     dumps,
     loads,
     make_slot_key,
     now_ts,
+    normalize_slot,
+    today_str,
 )
 
 SCHEMA = """
@@ -141,6 +145,65 @@ CREATE TABLE IF NOT EXISTS recall_log (
     PRIMARY KEY (window_tag, fact_id)
 );
 CREATE INDEX IF NOT EXISTS idx_recall_log_ts ON recall_log(ts);
+
+CREATE TABLE IF NOT EXISTS event_recall_log (
+    window_tag TEXT NOT NULL,
+    event_id INTEGER NOT NULL,
+    ts INTEGER NOT NULL,
+    PRIMARY KEY (window_tag, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_event_recall_log_ts ON event_recall_log(ts);
+
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL DEFAULT 'life',
+    title TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    speaker_id TEXT NOT NULL DEFAULT '',
+    speaker_name TEXT NOT NULL DEFAULT '',
+    bot_id TEXT NOT NULL DEFAULT '',
+    window_tag TEXT NOT NULL DEFAULT '',
+    persona_id TEXT NOT NULL DEFAULT '',
+    scope TEXT NOT NULL DEFAULT 'person',
+    participants TEXT NOT NULL DEFAULT '[]',
+    speaker_ids TEXT NOT NULL DEFAULT '[]',
+    highlights TEXT NOT NULL DEFAULT '[]',
+    keywords TEXT NOT NULL DEFAULT '[]',
+    evidence TEXT NOT NULL DEFAULT '[]',
+    start_ts INTEGER NOT NULL DEFAULT 0,
+    end_ts INTEGER NOT NULL DEFAULT 0,
+    importance REAL NOT NULL DEFAULT 0,
+    confidence REAL NOT NULL DEFAULT 0.6,
+    status TEXT NOT NULL DEFAULT 'live',
+    pinned INTEGER NOT NULL DEFAULT 0,
+    access_count INTEGER NOT NULL DEFAULT 0,
+    last_accessed INTEGER NOT NULL DEFAULT 0,
+    source TEXT NOT NULL DEFAULT 'pipeline',
+    review_status TEXT NOT NULL DEFAULT '',
+    origin TEXT NOT NULL DEFAULT '',
+    fingerprint TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    edited_at INTEGER NOT NULL DEFAULT 0,
+    edited_by TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_events_start ON events(status, start_ts);
+CREATE INDEX IF NOT EXISTS idx_events_window ON events(status, window_tag, start_ts);
+CREATE INDEX IF NOT EXISTS idx_events_speaker ON events(speaker_id, status, start_ts);
+CREATE INDEX IF NOT EXISTS idx_events_fp ON events(fingerprint);
+
+CREATE TABLE IF NOT EXISTS entities (
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'person',
+    ref TEXT NOT NULL DEFAULT 'fact',
+    ref_id INTEGER NOT NULL,
+    persona_id TEXT NOT NULL DEFAULT '',
+    ts INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (name, ref, ref_id)
+);
+CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
+CREATE INDEX IF NOT EXISTS idx_entities_ref ON entities(ref, ref_id);
 """
 
 
@@ -238,6 +301,20 @@ class Store:
             self.execute("ALTER TABLE usage_ledger ADD COLUMN tokens_in INTEGER NOT NULL DEFAULT 0")
         if "tokens_out" not in usage_cols:
             self.execute("ALTER TABLE usage_ledger ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0")
+        self.execute(
+            "CREATE TABLE IF NOT EXISTS usage_daily ("
+            "day TEXT NOT NULL, "
+            "task TEXT NOT NULL DEFAULT '', "
+            "provider_id TEXT NOT NULL DEFAULT '', "
+            "calls INTEGER NOT NULL DEFAULT 0, "
+            "skipped INTEGER NOT NULL DEFAULT 0, "
+            "tokens_in INTEGER NOT NULL DEFAULT 0, "
+            "tokens_out INTEGER NOT NULL DEFAULT 0, "
+            "source TEXT NOT NULL DEFAULT '', "
+            "skip_reason TEXT NOT NULL DEFAULT '', "
+            "updated_at INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY(day, task, provider_id))"
+        )
         self.execute("CREATE INDEX IF NOT EXISTS idx_facts_slotkey ON facts(slot_key, status)")
         if self.get_meta("importance_backfill_v343") != "1":
             # 一次性回填老数据的 importance；之后用户手动设为 0 的值不能再被覆盖。
@@ -295,6 +372,78 @@ class Store:
             "last_seen INTEGER NOT NULL, "
             "PRIMARY KEY(term, persona_id))"
         )
+        if self.get_meta("events_v420") != "1":
+            self.set_meta("events_v420", "1")
+        if self.get_meta("slot_topic_v420") != "1":
+            # v4.2.0：约定/习惯改为按主题分槽，回填 slot_key 后消解可能出现的重复。
+            rows = self.query(
+                "SELECT id, persona_id, speaker_id, subject, attribute, value FROM facts "
+                "WHERE attribute IN ('promise', 'habit')"
+            )
+            for row in rows:
+                key = make_slot_key(
+                    row["persona_id"] or "",
+                    row["speaker_id"],
+                    row["subject"],
+                    row["attribute"],
+                    row["value"] or "",
+                )
+                self.execute("UPDATE facts SET slot_key=? WHERE id=?", (key, int(row["id"])))
+            self.resolve_all_slot_conflicts()
+            self.set_meta("slot_topic_v420", "1")
+        if self.get_meta("entity_links_v430") != "1":
+            # v4.3.0：实体链接，老库一次性回填 live 事实与事件（单事务批量写）。
+            bulk = self._entity_backfill_rows()
+            if bulk:
+                with self._lock:
+                    self._ensure_conn()
+                    self._conn.executemany(
+                        "INSERT INTO entities(name, kind, ref, ref_id, persona_id, ts) VALUES(?,?,?,?,?,?) "
+                        "ON CONFLICT(name, ref, ref_id) DO UPDATE SET kind=excluded.kind, ts=excluded.ts",
+                        bulk,
+                    )
+                    self._conn.commit()
+            self.bump_revision()
+            self.set_meta("entity_links_v430", "1")
+
+    def _entity_backfill_rows(self) -> list[tuple[str, str, str, int, str, int]]:
+        """One-shot entity registration for existing live facts/events."""
+        bulk: list[tuple[str, str, str, int, str, int]] = []
+        seen: set[tuple[str, str, int]] = set()
+
+        def push(raw: str, kind: str, ref: str, ref_id: int, persona: str) -> None:
+            name = self._clean_entity(raw)
+            key = (name, ref, ref_id)
+            if not name or key in seen:
+                return
+            seen.add(key)
+            bulk.append((name, kind, ref, int(ref_id), persona or "", now_ts()))
+
+        for row in self.query(
+            "SELECT id, speaker_name, keywords, topic, persona_id FROM facts WHERE status='live'"
+        ):
+            persona = str(row["persona_id"] or "")
+            fid = int(row["id"])
+            push(str(row["speaker_name"] or ""), "person", "fact", fid, persona)
+            for key in self._keyword_list(str(row["keywords"] or "[]")):
+                push(key, "keyword", "fact", fid, persona)
+            if row["topic"]:
+                push(str(row["topic"]), "topic", "fact", fid, persona)
+        for row in self.query(
+            "SELECT id, participants, keywords, persona_id FROM events WHERE status='live'"
+        ):
+            persona = str(row["persona_id"] or "")
+            eid = int(row["id"])
+            for part in loads(row["participants"], []) or []:
+                if str(part.get("id") or "") != ROLE_BOT_ID:
+                    push(str(part.get("name") or ""), "person", "event", eid, persona)
+            for key in self._keyword_list(str(row["keywords"] or "[]")):
+                push(key, "keyword", "event", eid, persona)
+        return bulk
+
+    def _keyword_list(self, keywords_json: str) -> list[str]:
+        items = loads(keywords_json, [])
+        return [str(k) for k in (items or []) if k]
         rows = self.query("SELECT id, subject, attribute, speaker_id, speaker_name, persona_id FROM facts WHERE slot_key='' OR slot_key IS NULL")
         for row in rows:
             payload = apply_slot(
@@ -405,6 +554,21 @@ class Store:
         q = ",".join("?" * len(ids))
         self.execute(f"UPDATE timeline SET summarized=1 WHERE id IN ({q})", ids)
 
+    def timeline_after(self, after_id: int, until_ts: int, limit: int = 400) -> list[TimelineEvent]:
+        """Timeline rows newer than a cursor whose episode can no longer grow."""
+        rows = self.query(
+            "SELECT * FROM timeline WHERE id>? AND ts<=? ORDER BY ts ASC, id ASC LIMIT ?",
+            (int(after_id), int(until_ts), int(limit)),
+        )
+        return [self._timeline(r) for r in rows]
+
+    def timeline_by_ids(self, ids: list[int]) -> list[TimelineEvent]:
+        if not ids:
+            return []
+        q = ",".join("?" * len(ids))
+        rows = self.query(f"SELECT * FROM timeline WHERE id IN ({q}) ORDER BY ts ASC, id ASC", ids)
+        return [self._timeline(r) for r in rows]
+
     def timeline_recent(self, limit: int = 20, speaker_id: str | None = None) -> list[TimelineEvent]:
         if speaker_id:
             rows = self.query(
@@ -438,6 +602,10 @@ class Store:
             "memory_pending": n("SELECT COUNT(*) FROM memory_reviews WHERE status='pending'"),
             "profiles": n("SELECT COUNT(*) FROM profiles"),
             "facts_pinned": n("SELECT COUNT(*) FROM facts WHERE status='live' AND pinned=1"),
+            "events": n("SELECT COUNT(*) FROM events WHERE status='live'"),
+            "events_archived": n("SELECT COUNT(*) FROM events WHERE status='archived'"),
+            "events_needs_review": n("SELECT COUNT(*) FROM events WHERE review_status='needs_review'"),
+            "events_pinned": n("SELECT COUNT(*) FROM events WHERE status='live' AND pinned=1"),
         }
 
     def add_fact(self, payload: dict[str, Any], bump: bool = True) -> int:
@@ -507,6 +675,15 @@ class Store:
         )
         if bump:
             self.bump_revision()
+        fact_id = int(cur.lastrowid)
+        keywords = payload.get("keywords") or []
+        if isinstance(keywords, str):
+            keywords = [keywords]
+        names = [(str(payload.get("speaker_name") or ""), "person")]
+        names.extend((str(k), "keyword") for k in keywords)
+        if payload.get("topic"):
+            names.append((str(payload.get("topic")), "topic"))
+        self.link_entities(names, "fact", fact_id, persona_id)
         return int(cur.lastrowid)
 
     def update_fact(self, fact_id: int, bump: bool = True, **fields: Any) -> None:
@@ -524,6 +701,8 @@ class Store:
         self.execute(f"UPDATE facts SET {assignments} WHERE id=?", (*fields.values(), fact_id))
         if bump:
             self.bump_revision()
+        if {"keywords", "speaker_name", "topic", "status"} & set(fields):
+            self._relink_fact(int(fact_id))
 
     def get_fact(self, fact_id: int) -> Fact | None:
         rows = self.query("SELECT * FROM facts WHERE id=?", (fact_id,))
@@ -636,6 +815,7 @@ class Store:
 
     def delete_fact(self, fact_id: int) -> bool:
         cur = self.execute("DELETE FROM facts WHERE id=?", (fact_id,))
+        self.execute("DELETE FROM entities WHERE ref='fact' AND ref_id=?", (int(fact_id),))
         self.bump_revision()
         return cur.rowcount > 0
 
@@ -762,6 +942,42 @@ class Store:
         )
         return self._fact(rows[0]) if rows else None
 
+    def live_latest_by_attr(
+        self,
+        speaker_id: str,
+        subject: str,
+        attribute: str,
+        persona_id: str = "",
+        speaker_ids: list[str] | None = None,
+        topic: str = "",
+    ) -> Fact | None:
+        """Most recent live fact of one attribute (used by write_op=close on promise/habit)."""
+        from .util import topic_key
+
+        payload = apply_slot(
+            {
+                "subject": subject,
+                "attribute": attribute,
+                "speaker_id": speaker_id,
+            }
+        )
+        ids = list(speaker_ids or [speaker_id])
+        placeholders = ",".join("?" * len(ids))
+        rows = self.query(
+            f"""SELECT * FROM facts WHERE status='live' AND speaker_id IN ({placeholders})
+                AND subject=? AND attribute=? AND (persona_id=? OR persona_id='')
+                ORDER BY updated_at DESC LIMIT 50""",
+            (*ids, payload["subject"], payload["attribute"], persona_id),
+        )
+        facts = [self._fact(r) for r in rows]
+        if not facts:
+            return None
+        if topic:
+            for fact in facts:
+                if topic_key(fact.value or "") == topic:
+                    return fact
+        return facts[0]
+
     def fact_by_fingerprint(self, fingerprint: str) -> Fact | None:
         if not fingerprint:
             return None
@@ -845,6 +1061,7 @@ class Store:
             dict(r)
             for r in self.query("SELECT alias, canonical_id, label FROM speaker_aliases")
         ]
+        events = [dict(r) for r in self.query("SELECT * FROM events")]
         return {
             "facts": facts,
             "timeline": timeline,
@@ -853,6 +1070,7 @@ class Store:
             "profiles": profiles,
             "memory_reviews": memory_reviews,
             "aliases": aliases,
+            "events": events,
         }
 
     def import_profile(self, row: dict[str, Any]) -> bool:
@@ -924,6 +1142,18 @@ class Store:
         status = str(row.get("status") or "pending")
         if status in {"approved", "rejected"} and review_id:
             self.update_memory_review(review_id, status=status)
+        return True
+
+    def import_event(self, row: dict[str, Any]) -> bool:
+        fingerprint = str(row.get("fingerprint") or "")
+        if fingerprint and self.event_by_fingerprint(fingerprint):
+            return False
+        payload = {k: row[k] for k in row if k not in {"table", "id"}}
+        for key in ("participants", "highlights", "keywords", "evidence"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                payload[key] = loads(value, [])
+        self.add_event(payload)
         return True
 
     def upsert_review(self, kind: str, fingerprint: str, title: str, payload: dict[str, Any], reason: str = "", speaker_id: str = "", persona_id: str = "") -> int:
@@ -1123,6 +1353,9 @@ class Store:
         self.set_alias(old_id, new_id, new_name)
         self.resolve_slot_conflicts(new_id)
         self.bump_revision()
+        if new_name:
+            self.sync_event_participant(new_id, new_name)
+        self.relink_speaker(new_id)
         return len(rows)
 
     def _keep_and_archive_duplicate(self, keeper: Fact, dup: Fact, reason: str) -> tuple[Fact, bool]:
@@ -1222,6 +1455,9 @@ class Store:
         detail: str = "",
         tokens_in: int = 0,
         tokens_out: int = 0,
+        task: str = "",
+        source: str = "",
+        reason: str = "",
     ) -> None:
         self.execute(
             "INSERT INTO usage_ledger(ts, kind, provider_id, ok, chars_in, chars_out, tokens_in, tokens_out, detail) "
@@ -1231,6 +1467,81 @@ class Store:
         self.execute(
             "DELETE FROM usage_ledger WHERE id NOT IN (SELECT id FROM usage_ledger ORDER BY id DESC LIMIT 400)"
         )
+        self._bump_usage_daily(
+            task=task or kind,
+            provider_id=provider_id,
+            ok=bool(ok),
+            tokens_in=int(tokens_in or 0),
+            tokens_out=int(tokens_out or 0),
+            source=source,
+            reason=reason,
+        )
+
+    def _bump_usage_daily(
+        self,
+        task: str,
+        provider_id: str = "",
+        ok: bool = True,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+        source: str = "",
+        reason: str = "",
+    ) -> None:
+        """按天聚合的用量账：Token 预算和面板按任务统计都用它，不受流水保留期影响。"""
+        self.execute(
+            """INSERT INTO usage_daily(day, task, provider_id, calls, skipped, tokens_in, tokens_out, source, skip_reason, updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(day, task, provider_id) DO UPDATE SET
+                 calls=usage_daily.calls+excluded.calls,
+                 skipped=usage_daily.skipped+excluded.skipped,
+                 tokens_in=usage_daily.tokens_in+excluded.tokens_in,
+                 tokens_out=usage_daily.tokens_out+excluded.tokens_out,
+                 source=CASE WHEN excluded.source!='' THEN excluded.source ELSE usage_daily.source END,
+                 skip_reason=CASE WHEN excluded.skip_reason!='' THEN excluded.skip_reason ELSE usage_daily.skip_reason END,
+                 updated_at=excluded.updated_at""",
+            (
+                today_str(),
+                str(task or "")[:40],
+                str(provider_id or "")[:80],
+                1 if ok else 0,
+                0 if ok else 1,
+                max(0, int(tokens_in or 0)),
+                max(0, int(tokens_out or 0)),
+                str(source or "")[:60],
+                str(reason or "")[:60] if not ok else "",
+                now_ts(),
+            ),
+        )
+
+    def tokens_today(self, day: str = "") -> int:
+        rows = self.query(
+            "SELECT COALESCE(SUM(tokens_in + tokens_out), 0) FROM usage_daily WHERE day=?",
+            (day or today_str(),),
+        )
+        return int(rows[0][0] or 0)
+
+    def usage_by_task_today(self, day: str = "") -> list[dict[str, Any]]:
+        rows = self.query(
+            """SELECT task, provider_id, source, SUM(calls) AS calls, SUM(skipped) AS skipped,
+                      SUM(tokens_in) AS tin, SUM(tokens_out) AS tout, MAX(skip_reason) AS skip_reason
+               FROM usage_daily WHERE day=? GROUP BY task, provider_id, source
+               ORDER BY (SUM(tokens_in) + SUM(tokens_out)) DESC""",
+            (day or today_str(),),
+        )
+        return [
+            {
+                "task": str(r["task"]),
+                "provider_id": str(r["provider_id"]),
+                "source": str(r["source"]),
+                "calls": int(r["calls"] or 0),
+                "skipped": int(r["skipped"] or 0),
+                "tokens_in": int(r["tin"] or 0),
+                "tokens_out": int(r["tout"] or 0),
+                "tokens": int(r["tin"] or 0) + int(r["tout"] or 0),
+                "skip_reason": str(r["skip_reason"] or ""),
+            }
+            for r in rows
+        ]
 
     def usage_summary(self) -> dict[str, Any]:
         rows = self.query(
@@ -1300,6 +1611,25 @@ class Store:
 
     def _fact(self, row: sqlite3.Row) -> Fact:
         keys = row.keys()
+
+        def _str_list(raw: Any) -> list[str]:
+            items = loads(raw, [])
+            if isinstance(items, str):
+                items = [items]
+            return [str(x) for x in (items or []) if x]
+
+        def _int_list(raw: Any) -> list[int]:
+            items = loads(raw, [])
+            if isinstance(items, (int, str)):
+                items = [items]
+            out: list[int] = []
+            for x in items or []:
+                try:
+                    out.append(int(x))
+                except (TypeError, ValueError):
+                    continue
+            return out
+
         return Fact(
             id=row["id"],
             subject=row["subject"],
@@ -1312,7 +1642,7 @@ class Store:
             window_tag=row["window_tag"],
             status=row["status"],
             confidence=float(row["confidence"] or 0),
-            evidence=loads(row["evidence"], []),
+            evidence=_int_list(row["evidence"]),
             mention_policy=row["mention_policy"],
             first_person=int(row["first_person"] or 0),
             explicit_correction=int(row["explicit_correction"] or 0),
@@ -1332,7 +1662,7 @@ class Store:
             write_op=row["write_op"] if "write_op" in keys else "",
             scope=row["scope"] if "scope" in keys else "",
             plain=row["plain"] if "plain" in keys else "",
-            keywords=loads(row["keywords"], []) if "keywords" in keys else [],
+            keywords=_str_list(row["keywords"]) if "keywords" in keys else [],
             source_event_id=int(row["source_event_id"] or 0) if "source_event_id" in keys else 0,
             review_status=row["review_status"] if "review_status" in keys else "",
             origin=row["origin"] if "origin" in keys else "",
@@ -1363,6 +1693,8 @@ class Store:
             updated += int(cur.rowcount or 0)
         if updated:
             self.bump_revision()
+            self.relink_speaker(sid)
+            self.sync_event_participant(sid, name)
         return updated
 
     def upsert_profile(
@@ -1627,6 +1959,529 @@ class Store:
         )
         return [self._fact(r) for r in rows]
 
+    # ------------------------------------------------------------------
+    # Events (episodic memory: one whole thing that happened)
+    # ------------------------------------------------------------------
+
+    def add_event(self, payload: dict[str, Any], bump: bool = True) -> int:
+        now = now_ts()
+        cur = self.execute(
+            """INSERT INTO events(
+                kind, title, summary, speaker_id, speaker_name, bot_id, window_tag, persona_id,
+                scope, participants, speaker_ids, highlights, keywords, evidence, start_ts, end_ts,
+                importance, confidence, status, pinned, access_count, last_accessed,
+                source, review_status, origin, fingerprint, reason, edited_at, edited_by,
+                created_at, updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                str(payload.get("kind") or "life"),
+                clip(str(payload.get("title") or ""), 60),
+                clip(str(payload.get("summary") or ""), 400),
+                str(payload.get("speaker_id") or ""),
+                str(payload.get("speaker_name") or ""),
+                str(payload.get("bot_id") or ""),
+                str(payload.get("window_tag") or ""),
+                str(payload.get("persona_id") or ""),
+                str(payload.get("scope") or "person"),
+                dumps(payload.get("participants") or []),
+                dumps(payload.get("speaker_ids") or []),
+                dumps(payload.get("highlights") or []),
+                dumps(payload.get("keywords") or []),
+                dumps(payload.get("evidence") or []),
+                int(payload.get("start_ts") or 0),
+                int(payload.get("end_ts") or 0),
+                float(payload.get("importance") or 0) or 0.5,
+                float(payload.get("confidence") or 0.6),
+                str(payload.get("status") or "live"),
+                int(payload.get("pinned") or 0),
+                int(payload.get("access_count") or 0),
+                int(payload.get("last_accessed") or 0),
+                str(payload.get("source") or "pipeline"),
+                str(payload.get("review_status") or ""),
+                str(payload.get("origin") or ""),
+                str(payload.get("fingerprint") or ""),
+                str(payload.get("reason") or ""),
+                int(payload.get("edited_at") or 0),
+                str(payload.get("edited_by") or ""),
+                int(payload.get("created_at") or now),
+                int(payload.get("updated_at") or now),
+            ),
+        )
+        if bump:
+            self.bump_revision()
+        event_id = int(cur.lastrowid)
+        participants = payload.get("participants") or []
+        if not isinstance(participants, list):
+            participants = []
+        event_keywords = payload.get("keywords") or []
+        if isinstance(event_keywords, str):
+            event_keywords = [event_keywords]
+        names = [
+            (str(p.get("name") or ""), "person")
+            for p in participants
+            if isinstance(p, dict) and str(p.get("id") or "") != ROLE_BOT_ID
+        ]
+        names.extend((str(k), "keyword") for k in event_keywords)
+        self.link_entities(names, "event", event_id, str(payload.get("persona_id") or ""))
+        return int(cur.lastrowid)
+
+    def update_event(self, event_id: int, bump: bool = True, **fields: Any) -> None:
+        if not fields:
+            return
+        if "updated_at" not in fields:
+            fields["updated_at"] = now_ts()
+        for key in ("participants", "speaker_ids", "highlights", "keywords", "evidence"):
+            if key in fields and not isinstance(fields[key], str):
+                fields[key] = dumps(fields[key])
+        assignments = ", ".join(f"{k}=?" for k in fields)
+        self.execute(f"UPDATE events SET {assignments} WHERE id=?", (*fields.values(), event_id))
+        if bump:
+            self.bump_revision()
+        if {"participants", "keywords", "status"} & set(fields):
+            self._relink_event(int(event_id))
+
+    def delete_event(self, event_id: int) -> bool:
+        cur = self.execute("DELETE FROM events WHERE id=?", (event_id,))
+        self.execute("DELETE FROM entities WHERE ref='event' AND ref_id=?", (int(event_id),))
+        self.bump_revision()
+        return cur.rowcount > 0
+
+    def get_event(self, event_id: int) -> Event | None:
+        rows = self.query("SELECT * FROM events WHERE id=?", (event_id,))
+        return self._event(rows[0]) if rows else None
+
+    def event_by_fingerprint(self, fingerprint: str) -> Event | None:
+        if not fingerprint:
+            return None
+        rows = self.query("SELECT * FROM events WHERE fingerprint=? LIMIT 1", (fingerprint,))
+        return self._event(rows[0]) if rows else None
+
+    def live_events(
+        self,
+        speaker_id: str | None = None,
+        speaker_ids: list[str] | None = None,
+        persona_id: str | None = None,
+        limit: int = 120,
+        since_ts: int = 0,
+        until_ts: int = 0,
+        window_tag: str | None = None,
+        include_owner: bool = True,
+        statuses: tuple[str, ...] = ("live",),
+    ) -> list[Event]:
+        ids = list(speaker_ids or [])
+        if speaker_id and speaker_id not in ids:
+            ids.append(speaker_id)
+        marks = ",".join("?" * len(statuses or ("live",)))
+        clauses = [f"status IN ({marks})"]
+        params: list[Any] = list(statuses or ("live",))
+        if persona_id:
+            clauses.append("(persona_id=? OR persona_id='')")
+            params.append(persona_id)
+        if since_ts > 0:
+            clauses.append("end_ts>=?")
+            params.append(int(since_ts))
+        if until_ts > 0:
+            clauses.append("start_ts<=?")
+            params.append(int(until_ts))
+        if window_tag:
+            clauses.append("window_tag=?")
+            params.append(window_tag)
+        if ids:
+            placeholders = ",".join("?" * len(ids))
+            speaker_clause = f"speaker_id IN ({placeholders})"
+            params.extend(ids)
+            if include_owner:
+                speaker_clause = f"({speaker_clause} OR scope='owner')"
+            clauses.append(speaker_clause)
+        params.append(limit)
+        sql = f"SELECT * FROM events WHERE {' AND '.join(clauses)} ORDER BY start_ts DESC, id DESC LIMIT ?"
+        return [self._event(r) for r in self.query(sql, params)]
+
+    def events_by_status(self, status: str = "live", limit: int = 60) -> list[Event]:
+        rows = self.query(
+            "SELECT * FROM events WHERE status=? ORDER BY start_ts DESC, id DESC LIMIT ?",
+            (status, limit),
+        )
+        return [self._event(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Entity links (facts/events <-> people, keywords, topics)
+    # ------------------------------------------------------------------
+
+    ENTITY_STOPWORDS = {
+        "bot", "bot_self", "未知", "某人", "主人", "admin", "用户",
+        "我", "你", "他", "她", "它", "我们", "你们", "他们",
+    }
+
+    def _clean_entity(self, raw: str) -> str:
+        name = normalize_slot(str(raw or ""))
+        if len(name) < 2 or len(name) > 20:
+            return ""
+        if name.isdigit() or name in self.ENTITY_STOPWORDS:
+            return ""
+        return name
+
+    def link_entities(
+        self,
+        names: list[tuple[str, str]],
+        ref: str,
+        ref_id: int,
+        persona_id: str = "",
+    ) -> None:
+        rows: list[tuple[str, str, str, int, str, int]] = []
+        seen: set[tuple[str, str]] = set()
+        for raw, kind in names:
+            name = self._clean_entity(raw)
+            key = (name, kind)
+            if not name or key in seen:
+                continue
+            seen.add(key)
+            rows.append((name, kind, ref, int(ref_id), persona_id or "", now_ts()))
+        if not rows:
+            return
+        with self._lock:
+            self._ensure_conn()
+            self._conn.executemany(
+                "INSERT INTO entities(name, kind, ref, ref_id, persona_id, ts) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(name, ref, ref_id) DO UPDATE SET kind=excluded.kind, ts=excluded.ts",
+                rows,
+            )
+            self._conn.commit()
+
+    def _relink_fact(self, fact_id: int) -> None:
+        self.execute("DELETE FROM entities WHERE ref='fact' AND ref_id=?", (int(fact_id),))
+        rows = self.query("SELECT * FROM facts WHERE id=?", (int(fact_id),))
+        if not rows:
+            return
+        fact = self._fact(rows[0])
+        names = [(fact.speaker_name, "person")]
+        names.extend((str(k), "keyword") for k in (fact.keywords or []))
+        if getattr(fact, "topic", ""):
+            names.append((fact.topic, "topic"))
+        self.link_entities(names, "fact", fact_id, fact.persona_id)
+
+    def _relink_event(self, event_id: int) -> None:
+        self.execute("DELETE FROM entities WHERE ref='event' AND ref_id=?", (int(event_id),))
+        rows = self.query("SELECT * FROM events WHERE id=?", (int(event_id),))
+        if not rows:
+            return
+        event = self._event(rows[0])
+        names = [
+            (str(p.get("name") or ""), "person")
+            for p in (event.participants or [])
+            if isinstance(p, dict) and str(p.get("id") or "") != ROLE_BOT_ID
+        ]
+        names.extend((str(k), "keyword") for k in (event.keywords or []))
+        self.link_entities(names, "event", event_id, event.persona_id)
+
+    def relink_speaker(self, speaker_id: str) -> None:
+        """Refresh person links after a nickname change or identity merge."""
+        if not speaker_id:
+            return
+        for row in self.query("SELECT id FROM facts WHERE speaker_id=?", (speaker_id,)):
+            self._relink_fact(int(row["id"]))
+        for row in self.query("SELECT id FROM events WHERE speaker_id=?", (speaker_id,)):
+            self._relink_event(int(row["id"]))
+
+    def sync_event_participant(self, speaker_id: str, speaker_name: str) -> int:
+        """Fix stale participant names stored inside event cards after a rename."""
+        sid = (speaker_id or "").strip()
+        name = (speaker_name or "").strip()
+        if not sid or not name or name == sid:
+            return 0
+        touched = 0
+        for row in self.query(
+            "SELECT id, participants FROM events WHERE status='live'"
+        ):
+            parts = loads(row["participants"], []) or []
+            if not isinstance(parts, list):
+                continue
+            changed = False
+            for part in parts:
+                if str(part.get("id") or "") == sid and str(part.get("name") or "") != name:
+                    part["name"] = name
+                    changed = True
+            if changed:
+                self.execute(
+                    "UPDATE events SET participants=? WHERE id=?",
+                    (dumps(parts), int(row["id"])),
+                )
+                self._relink_event(int(row["id"]))
+                touched += 1
+        return touched
+
+    def entities_in_text(self, text: str, limit: int = 8) -> list[str]:
+        norm = normalize_slot(text or "")
+        if len(norm) < 2:
+            return []
+        rows = self.query("SELECT DISTINCT name FROM entities LIMIT 5000")
+        hits = [str(r["name"]) for r in rows if len(str(r["name"])) >= 2 and str(r["name"]) in norm]
+        hits.sort(key=len, reverse=True)
+        return hits[:limit]
+
+    def entity_refs(
+        self,
+        names: list[str],
+        limit: int = 400,
+        persona_id: str = "",
+    ) -> tuple[set[int], set[int]]:
+        if not names:
+            return set(), set()
+        marks = ",".join("?" * len(names))
+        params: list[Any] = list(names)
+        clause = ""
+        if persona_id:
+            # 跨人格不串：只认本事人格或全局实体的链接。
+            clause = " AND (persona_id=? OR persona_id='')"
+            params.append(persona_id)
+        params.append(int(limit))
+        rows = self.query(
+            f"SELECT ref, ref_id FROM entities WHERE name IN ({marks}){clause} LIMIT ?",
+            params,
+        )
+        facts = {int(r["ref_id"]) for r in rows if r["ref"] == "fact"}
+        events = {int(r["ref_id"]) for r in rows if r["ref"] == "event"}
+        return facts, events
+
+    def entities_for_ref(self, ref: str, ref_id: int) -> list[dict[str, str]]:
+        rows = self.query(
+            "SELECT name, kind FROM entities WHERE ref=? AND ref_id=? ORDER BY kind, name",
+            (str(ref or "fact"), int(ref_id)),
+        )
+        return [{"name": r["name"], "kind": r["kind"]} for r in rows]
+
+    def person_names_in_text(self, text: str, limit: int = 8) -> list[str]:
+        norm = normalize_slot(text or "")
+        if len(norm) < 2:
+            return []
+        rows = self.query("SELECT DISTINCT name FROM entities WHERE kind='person' LIMIT 2000")
+        hits = [str(r["name"]) for r in rows if len(str(r["name"])) >= 2 and str(r["name"]) in norm]
+        hits.sort(key=len, reverse=True)
+        return hits[:limit]
+
+    def speaker_ids_by_name(self, name: str) -> list[str]:
+        text = (name or "").strip()
+        if len(text) < 2:
+            return []
+        rows = self.query(
+            "SELECT DISTINCT speaker_id FROM facts WHERE speaker_name=? "
+            "UNION SELECT speaker_id FROM profiles WHERE speaker_name=? LIMIT 20",
+            (text, text),
+        )
+        return [str(r["speaker_id"]) for r in rows if r["speaker_id"]]
+
+    # ------------------------------------------------------------------
+    # Time-travel queries (facts valid inside a window, events overlapping it)
+    # ------------------------------------------------------------------
+
+    def facts_in_window(
+        self,
+        start_ts: int,
+        end_ts: int,
+        speaker_ids: list[str] | None = None,
+        persona_id: str = "",
+        include_owner: bool = False,
+        limit: int = 240,
+    ) -> list[Fact]:
+        ids = [str(x) for x in (speaker_ids or []) if x]
+        clauses = [
+            "created_at<=?",
+            "(status='live' OR (status IN ('superseded','archived') AND updated_at>=?))",
+            "(expires_at=0 OR expires_at>=?)",
+        ]
+        params: list[Any] = [int(end_ts), int(start_ts), int(start_ts)]
+        if persona_id:
+            clauses.append("(persona_id=? OR persona_id='')")
+            params.append(persona_id)
+        if ids:
+            marks = ",".join("?" * len(ids))
+            speaker_clause = f"speaker_id IN ({marks})"
+            params.extend(ids)
+            if include_owner:
+                speaker_clause = f"({speaker_clause} OR scope='owner')"
+            clauses.append(speaker_clause)
+        params.append(int(limit))
+        sql = f"SELECT * FROM facts WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT ?"
+        return [self._fact(r) for r in self.query(sql, params)]
+
+    def events_between(
+        self,
+        start_ts: int,
+        end_ts: int,
+        speaker_ids: list[str] | None = None,
+        persona_id: str = "",
+        include_owner: bool = True,
+        limit: int = 60,
+    ) -> list[Event]:
+        return self.live_events(
+            speaker_ids=speaker_ids,
+            persona_id=persona_id or None,
+            limit=limit,
+            since_ts=int(start_ts),
+            until_ts=int(end_ts),
+            include_owner=include_owner,
+            statuses=("live", "archived"),
+        )
+
+    def events_for_review(self, status: str = "live", limit: int = 120) -> list[Event]:
+        if status == "needs_review":
+            rows = self.query(
+                "SELECT * FROM events WHERE review_status='needs_review' "
+                "ORDER BY start_ts DESC, id DESC LIMIT ?",
+                (limit,),
+            )
+        else:
+            rows = self.query(
+                "SELECT * FROM events WHERE status=? AND review_status!='needs_review' "
+                "ORDER BY start_ts DESC, id DESC LIMIT ?",
+                (status, limit),
+            )
+        return [self._event(r) for r in rows]
+
+    def latest_event_for_window(self, window_tag: str, after_ts: int, before_ts: int) -> Event | None:
+        """Most recent auto event in this window closed inside the merge window."""
+        if not window_tag:
+            return None
+        rows = self.query(
+            """SELECT * FROM events
+               WHERE window_tag=? AND status='live' AND source='pipeline'
+                 AND review_status NOT IN ('manual', 'needs_review') AND pinned=0
+                 AND end_ts>=? AND end_ts<=?
+               ORDER BY end_ts DESC, id DESC LIMIT 1""",
+            (window_tag, int(after_ts), int(before_ts)),
+        )
+        return self._event(rows[0]) if rows else None
+
+    def live_events_oldest(self, limit: int = 300) -> list[Event]:
+        rows = self.query(
+            "SELECT * FROM events WHERE status='live' AND pinned=0 ORDER BY start_ts ASC LIMIT ?",
+            (limit,),
+        )
+        return [self._event(r) for r in rows]
+
+    def bump_event_access(self, event_id: int) -> None:
+        self.execute(
+            "UPDATE events SET access_count=access_count+1, last_accessed=? WHERE id=?",
+            (now_ts(), int(event_id)),
+        )
+
+    def set_event_pinned(self, event_id: int, pinned: bool) -> bool:
+        if self.get_event(event_id) is None:
+            return False
+        self.update_event(event_id, pinned=int(bool(pinned)))
+        return True
+
+    def archive_events(self, ids: list[int], reason: str = "ui_delete") -> dict[str, Any]:
+        archived: list[int] = []
+        missing: list[int] = []
+        for raw in ids:
+            try:
+                eid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if self.get_event(eid) is None:
+                missing.append(eid)
+                continue
+            self.update_event(eid, status="archived", reason=reason)
+            archived.append(eid)
+        return {"ok": True, "archived": archived, "missing": missing, "count": len(archived)}
+
+    def restore_events(self, ids: list[int]) -> dict[str, Any]:
+        restored: list[int] = []
+        missing: list[int] = []
+        for raw in ids:
+            try:
+                eid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if self.get_event(eid) is None:
+                missing.append(eid)
+                continue
+            self.update_event(eid, status="live")
+            restored.append(eid)
+        return {"ok": True, "restored": restored, "missing": missing}
+
+    def recent_event_recall_ids(self, window_tag: str, since_ts: int) -> set[int]:
+        rows = self.query(
+            "SELECT event_id FROM event_recall_log WHERE window_tag=? AND ts>=?",
+            (window_tag, int(since_ts)),
+        )
+        return {int(r["event_id"]) for r in rows}
+
+    def add_event_recall(self, window_tag: str, event_ids: list[int], ts: int) -> None:
+        if not window_tag or not event_ids:
+            return
+        with self._lock:
+            self._ensure_conn()
+            self._conn.executemany(
+                "INSERT INTO event_recall_log(window_tag, event_id, ts) VALUES(?,?,?) "
+                "ON CONFLICT(window_tag, event_id) DO UPDATE SET ts=excluded.ts",
+                [(window_tag, int(eid), int(ts)) for eid in event_ids],
+            )
+            self._conn.execute(
+                "DELETE FROM event_recall_log WHERE ts < ?", (int(ts) - 7 * 86400,)
+            )
+            self._conn.commit()
+
+    def _event(self, row: sqlite3.Row) -> Event:
+        keys = row.keys()
+
+        def _str_list(raw: Any) -> list[str]:
+            items = loads(raw, [])
+            if isinstance(items, str):
+                items = [items]
+            return [str(x) for x in (items or []) if x]
+
+        def _dict_list(raw: Any) -> list[dict[str, Any]]:
+            items = loads(raw, [])
+            return [dict(x) for x in (items or []) if isinstance(x, dict)]
+
+        def _int_list(raw: Any) -> list[int]:
+            items = loads(raw, [])
+            if isinstance(items, (int, str)):
+                items = [items]
+            out: list[int] = []
+            for x in items or []:
+                try:
+                    out.append(int(x))
+                except (TypeError, ValueError):
+                    continue
+            return out
+        return Event(
+            id=int(row["id"]),
+            kind=row["kind"] if "kind" in keys else "life",
+            title=row["title"] if "title" in keys else "",
+            summary=row["summary"] if "summary" in keys else "",
+            speaker_id=row["speaker_id"] if "speaker_id" in keys else "",
+            speaker_name=row["speaker_name"] if "speaker_name" in keys else "",
+            bot_id=row["bot_id"] if "bot_id" in keys else "",
+            window_tag=row["window_tag"] if "window_tag" in keys else "",
+            persona_id=row["persona_id"] if "persona_id" in keys else "",
+            scope=row["scope"] if "scope" in keys else "",
+            participants=_dict_list(row["participants"]) if "participants" in keys else [],
+            speaker_ids=_str_list(row["speaker_ids"]) if "speaker_ids" in keys else [],
+            highlights=_str_list(row["highlights"]) if "highlights" in keys else [],
+            keywords=_str_list(row["keywords"]) if "keywords" in keys else [],
+            evidence=_int_list(row["evidence"]) if "evidence" in keys else [],
+            start_ts=int(row["start_ts"] or 0) if "start_ts" in keys else 0,
+            end_ts=int(row["end_ts"] or 0) if "end_ts" in keys else 0,
+            importance=float(row["importance"] or 0) if "importance" in keys else 0.0,
+            confidence=float(row["confidence"] or 0) if "confidence" in keys else 0.6,
+            status=row["status"] if "status" in keys else "live",
+            pinned=int(row["pinned"] or 0) if "pinned" in keys else 0,
+            access_count=int(row["access_count"] or 0) if "access_count" in keys else 0,
+            last_accessed=int(row["last_accessed"] or 0) if "last_accessed" in keys else 0,
+            source=row["source"] if "source" in keys else "",
+            review_status=row["review_status"] if "review_status" in keys else "",
+            origin=row["origin"] if "origin" in keys else "",
+            fingerprint=row["fingerprint"] if "fingerprint" in keys else "",
+            reason=row["reason"] if "reason" in keys else "",
+            edited_at=int(row["edited_at"] or 0) if "edited_at" in keys else 0,
+            edited_by=row["edited_by"] if "edited_by" in keys else "",
+            created_at=int(row["created_at"] or 0) if "created_at" in keys else 0,
+            updated_at=int(row["updated_at"] or 0) if "updated_at" in keys else 0,
+        )
+
     def referenced_timeline_ids(self) -> set[int]:
         ids: set[int] = set()
         for table in ("facts", "memory_reviews"):
@@ -1636,6 +2491,15 @@ class Store:
                 continue
             for row in rows:
                 ids.add(int(row["source_event_id"]))
+        try:
+            for row in self.query("SELECT evidence FROM events WHERE evidence!='' AND evidence!='[]'"):
+                for raw in loads(row["evidence"], []) or []:
+                    try:
+                        ids.add(int(raw))
+                    except (TypeError, ValueError):
+                        continue
+        except sqlite3.OperationalError:
+            pass
         return ids
 
     def clear_dirty_v280(self) -> dict[str, int]:
@@ -1651,6 +2515,8 @@ class Store:
             "memory_reviews",
             "recall_log",
             "profiles",
+            "events",
+            "event_recall_log",
         ):
             try:
                 cur = self.execute(f"DELETE FROM {table}")

@@ -194,6 +194,7 @@ def import_jsonl(store: Store, path: Path) -> dict[str, Any]:
         "profiles": 0,
         "memory_reviews": 0,
         "aliases": 0,
+        "events": 0,
         "skipped": 0,
         "errors": 0,
     }
@@ -239,6 +240,13 @@ def import_jsonl(store: Store, path: Path) -> dict[str, Any]:
             ):
                 if store.import_memory_review(row):
                     inserted["memory_reviews"] += 1
+                else:
+                    inserted["skipped"] += 1
+            elif wrapper == "events" or (
+                "start_ts" in row and "end_ts" in row and "summary" in row and "participants" in row
+            ):
+                if store.import_event(row):
+                    inserted["events"] += 1
                 else:
                     inserted["skipped"] += 1
             elif wrapper == "aliases" or (
@@ -361,6 +369,34 @@ def archive_decayed(
             if n >= limit:
                 break
     return n
+
+
+def archive_decayed_events(
+    store: Store,
+    min_age_days: int = 90,
+    threshold: float = 0.12,
+    half_life_days: float = 30.0,
+    reinforce_factor: float = 0.5,
+    max_multiplier: float = 3.0,
+    limit: int = 200,
+) -> int:
+    """Archive low-weight events (importance decayed past the threshold)."""
+    from .util import fact_weight
+
+    if threshold <= 0:
+        return 0
+    now = now_ts()
+    cutoff = now - max(1, min_age_days) * 86400
+    archived = 0
+    for event in store.live_events_oldest(limit=max(limit * 3, 300)):
+        if int(event.end_ts or 0) >= cutoff:
+            continue
+        if fact_weight(event, now, half_life_days, reinforce_factor, max_multiplier) < threshold:
+            store.update_event(event.id, status="archived", reason="importance_decayed")
+            archived += 1
+            if archived >= limit:
+                break
+    return archived
 
 
 def prune_jargon_stats(store: Store, min_age_days: int = 30, limit: int = 500) -> int:

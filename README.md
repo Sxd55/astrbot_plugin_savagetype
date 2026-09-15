@@ -2,7 +2,7 @@
 
 **Savage Type** 是面向 AstrBot 的全局人格记忆中枢。Savage 只是插件名：身份和语气永远读 AstrBot 当前人格，本插件只负责**记住事实、处理改口、在需要时把少量相关记忆注入本轮对话**。不改写人格文件，不做日程和主动陪伴。
 
-当前版本 `v4.1.0`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
+当前版本 `v4.4.1`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
 要求 AstrBot `>= 4.22.0`；运行依赖只有 `jieba`（可选，BM25 分词用，装不上自动回退）；离线测试只需 Python 3.11+ 标准库。
 
 ---
@@ -12,7 +12,11 @@
 | 问题 | 本插件的做法 |
 | --- | --- |
 | 对话记录不等于记忆，全塞回上下文又贵又乱 | 消息先落时间线，后台 AI 缩写成「直白事实」并对照原文审核，只把与本轮相关的一小包注入 |
+| 「喜欢美式」这种碎片记住了，整件事却记不住 | **事件层**：一段连续聊天整理成「一件事」（经历 / 决定 / 聊过的话题），追加式互不覆盖，按时间注入 |
+| 提到小明只想起「小明说的」，想不起「和小明有关的事」 | **实体链接**：人名、关键词、领域登记成实体；提问里出现谁，相关的事实和事件一起加权召回 |
+| 「他以前喜欢什么」答不了 | **时序查询**：问「以前 / 去年 / 上个月」时，检索那段时间为真的旧记忆，注入时自带「现在：…」对照 |
 | 改口/纠正会并存矛盾记忆 | 槽位冲突引擎：同槽新说法覆盖旧条（旧条作废保留可回滚），高证据旧条先人工确认；玩笑、转述、不确定不覆盖 |
+| 记忆越积越多、旧的永远占上下文 | 重要性 + 半衰期衰减 + 召回强化；低价值进回收站；置顶永不归档；事件同规则归档 |
 | 「喜欢猫 / 喜欢狗 / 喜欢咖啡」互相覆盖 | 偏好按**主题分槽**，不同主题并存；同一个词不同含义（美式咖啡 / 美式穿搭）按**领域**分槽 |
 | 同一个人有多个 id（QQ + ChatUI） | 身份归一：ChatUI 主人自动并入主人 QQ，别名映射 + 历史迁移 |
 | 记忆越积越多、旧的永远占上下文 | 重要性 + 半衰期衰减 + 召回强化；低价值进回收站；置顶永不归档 |
@@ -37,13 +41,31 @@
 
 ### 2. AI 整理与审核管线（pipeline）
 
-- 候选门槛：只挑有长期价值的消息（自述、指令、状态、纠正），闲聊不进。
+- 候选门槛：只挑有长期价值的消息（自述、指令、状态、纠正），闲聊不进。自述允许主语和谓语之间夹副词（「我平时喜欢…」「我其实不喜欢…」「我最近迷上了…」），也认「我家的猫叫…」「我养了…」这类自家信息。
 - **三段式**：批量缩写（normalize）→ 对照原文审核（verify）→ 至多 `pipeline_max_revisions`（默认 2）轮修订 → 通过才写入；不通过进「待审记忆」。
 - 拆句：一条消息里的多个独立事实拆成多条（「喜欢美式，不喜欢拿铁」「喜欢和平精英和王者荣耀」都会拆）；模型偷懒合成一条时，修订轮也会走确定性拆句兜底。
 - 证据绑定：每条事实必须挂在真实来源消息 id 上，`subject=self` 只接受用户消息，`subject=bot` 只接受 bot 消息。
 - 静默触发：会话静默超过 `extract_idle_seconds`（默认 300 秒）后，即使没到批量阈值也整理一次。
 - 失败降级：没有可用模型或模型输出无法解析时，退回**启发式抽取**（正则偏好模式），标「未审核」，不阻塞使用；抽取失败有冷却。
 - 导入候选走启发式快速通道，不进 LLM。
+
+### 2.5 事件层（整件事记忆，v4.2.0）
+
+- **切段**：同一会话按静默间隔（`event_gap_minutes`，默认 45 分钟）和最长时长（`event_max_hours`，默认 6 小时）切成段；封段后整段送模型。
+- **门槛**：用户消息达到 `event_min_messages`（默认 4）或出现叙事线索（去了/决定/参加/聚会…）才成事件，防止把灌水记成事件。
+- **续聊合并**：封段后 `event_merge_minutes`（默认 120 分钟）内继续聊，会并入原事件重新摘要（`event_max_per_run` 控制单轮次数）。
+- **一次产出**：`kind`（life 经历 / talk 聊过）、标题、80–160 字摘要、2–4 条要点、关键词、重要度、置信度；证据绑定这一段真实消息 id，原文受保护不被时间线压缩。
+- **审核**：对照原文审核 + 至多一次修订；没通过不静默丢，存成「待审事件」（低置信），面板确认或改写后转正。
+- **降级**：没有可用模型/模型输出不可解析时，用确定性摘要兜底（标记待审），保证事件不丢。
+- **追加式**：事件永不互相覆盖；同一窗口短期内继续聊只会更新同一条。
+
+### 2.6 实体链接与时序查询（v4.3.0）
+
+- **实体登记**：写入事实/事件时自动登记人名、关键词、领域（不需要额外模型调用）；改昵称、身份归并后自动跟着换。
+- **实体加权**：提问里出现某个实体（「小明」「成都」）时，登记了同一实体的事实和事件加权召回，解决「提谁只想起谁本人说的」。
+- **时序查询**：路由识别「以前 / 原来 / 当时 / 曾经」和具体时间（`2025年3月` / `去年12月` / `上个月` / `最近3天`）；检索那段时间为真的旧记忆（含被覆盖的旧说法）。
+- **现状对照**：历史块注入时带有效期，被覆盖的旧条同时给出「现在：…」，防止模型把旧状态当现状。
+- **隐私照旧**：历史记忆同样遵守 `memory_session_isolation` 的会话隔离规则。
 
 ### 3. 写入护栏（contradiction）
 
@@ -61,6 +83,7 @@
 - 基础重要性：主人手动写入 1.0 / AI 审核通过 0.8 / 未审核 0.5，显式纠正和第一人称再加权。
 - 衰减：按半衰期指数衰减；被召回会缩短密度、拉长半衰期（访问强化）。
 - 归档：权重低于阈值且超期的记忆在维护时进回收站；状态类记忆按 TTL 过期归档。
+- 事件：同一套衰减/强化/归档规则（`event_archive_days`，默认 90 天）；置顶事件不归档，归档后可在面板恢复。
 - 作废：改口覆盖的旧说法转 `superseded` 保留（参与「改口摘要」注入、支持回滚），超过 `sleep_superseded_retain_days`（默认 90 天）由维护清理。
 - 回收站可恢复；若槽位已被新记忆占用会阻止恢复，避免出现两条冲突事实。
 - 面板事实卡显示**当前权重**，可编辑基础重要度；置顶/取消置顶。
@@ -71,6 +94,7 @@
 - 可选 Embedding：默认关；live 事实达到 `embedding_auto_threshold`（默认 2500，0=从不自动）时自动补一路向量召回（不改配置开关）。
 - 可选 Rerank：默认 `auto`（有 Rerank Provider 就用）；Embedding + Rerank 双路结果用 **RRF** 融合，**MMR** 做多样性去重。
 - 主人条目与第三人点名（「查一下小明的资料」）单独并入。
+- 事件检索：BM25 对标题+摘要+要点+关键词打分，叠加时间新鲜度、重要度衰减与访问强化；`recall`（还记得/上次）事件优先，`time_window`（上周/那天）按事件时间过滤，`current_status`（最近怎么样）只带最近 7 天。
 - 检索缓存：昂贵路径（候选扫描、打分、Embedding、Rerank）按 query + 库版本缓存；去重、新颖度过滤在出包前做，所以**缓存不会被去重关掉**。
 - 超时降级：Embedding / Rerank 单次调用有 `provider_timeout_seconds`（默认 5 秒，0=不限），超时回退关键词结果并记 `provider_timeout` 诊断。
 - 预热：AstrBot 支持 `on_waiting_llm_request` 时，会在会话锁排队期间先跑检索，和等待时间重叠。
@@ -81,6 +105,7 @@
   - **hot**：Bot 设定（Savage 记忆）等稳定内容，每轮都带且不占去重名额；
   - **warm**：约定 / 近况，只有话题相关（触发词或主题命中）才注入；
   - **cold**：本轮相关事实，按预算逐行装入。
+- **事件块**：`【事件】` 放在核心事实之前，按时间渲染 `[日期 · 标题] 摘要（谁讲的）`；预算 `event_budget_chars`（默认 300，0=不限），每轮最多 `event_max_inject`（默认 2）条。
 - **新颖度过滤**：用户当前消息里已经说到的事实（值 ≥2 字）不重复注入。
 - **跨轮去重**：同一会话刚注入过的事实，在 `inject_dedup_window_seconds`（默认 600 秒）内不重复；「还记得 / 上次」类问题豁免；去重记录落库，重载插件不丢。
 - **预算**：`inject_budget_chars`（默认 800，0=不限）；超预算时事实按行尽量塞，黑话 / few-shot / 草稿整块丢；只有真的进了包的事实才占去重名额。
@@ -92,6 +117,7 @@
 ### 7. 过滤与来源可见性
 
 - 人格隔离：记忆带 `persona_id`，跨人格不串。
+- **会话隐私隔离**（`memory_session_isolation`，默认 `strict`）：`owner` 档下主人记忆只在主人自己的会话注入；`strict` 档再加一条——私聊来源的记忆（含别人私聊说的）不再注入到群聊，即使被点名。`off` 回到旧行为。
 - 说话人优先：本人、主人全局条、被点名的人可见；其他人的私事默认不注入。
 - 敏感来源（关系自称）降级为备注或拒收。
 
@@ -114,7 +140,7 @@
 
 ### 10. 备份、导入导出
 
-- 全量 JSONL 导出：facts / timeline / pending / reviews / profiles / memory_reviews / aliases。
+- 全量 JSONL 导出：facts / timeline / pending / reviews / profiles / memory_reviews / aliases / events。
 - 聊天文本导入：支持 QQ 风格和字段风格（发送者/时间/内容），可预览。
 - JSONL 导入：预览、确认导入（导入前自动备份）、冲突自动消解、可重复导入去重（指纹）。
 - SQLite **在线备份 API**（WAL 安全，拷贝不丢未落盘数据）；插件版本升级时自动备份一次。
@@ -133,10 +159,11 @@
 
 ### 13. 面板（AstrBot WebUI → 插件 → Savage Type → 拓展页）
 
-- **记忆库**：主人记忆 / Savage 记忆（Bot 自己的定义，可手动写入）切换；待审记忆（可直接编辑后过审）；手动补记（自动识别偏好句，一次可写多条）；学习审查（状态/类型筛选、批量批准驳回、改回待审）；待确认覆盖（旧→新对比、来源与通过含义说明）；说话人归并建议。
+- **记忆库**：主人记忆 / Savage 记忆（Bot 自己的定义，可手动写入）切换；待审记忆（可直接编辑后过审）；手动补记（自动识别偏好句，一次可写多条）；学习审查（状态/类型筛选、全选、一键批准/驳回全部、改回待审）；待确认覆盖（旧→新对比、来源与通过含义说明）；说话人归并建议。事实卡显示当前权重、有效期（被覆盖/归档的旧条）和「相关」实体。
+- **事件**：经历/聊过的事件列表（当前 / 待审 / 已归档 / 置顶筛选），看原文（这一段消息）、编辑标题/摘要/要点/重要度、确认写入、置顶、删除与恢复。
 - **人物档案**：搜索、点选查看，改昵称/备注，条目增删改、置顶。
 - **诊断**：注入显微镜（路由、命中、过滤原因、`chars≈tokens`）、聊天导入、回收站（归档+被覆盖恢复，槽位冲突阻止）、原始 JSON 诊断、清空并重建（先自动备份）。
-- **设置**：68 项配置按左右分栏展示（左侧导航、右侧只显示选中的一组，未保存的输入切组不丢；保存按钮固定在右下；窄屏导航变为顶部横向条）——总开关与采集 / 抽取与整理 / 检索与注入 / 重要性与维护 / 学习与人格草稿 / 图片 / Embedding 与 Rerank / 外观。
+- **设置**：89 项配置按左右分栏展示（左侧导航、右侧只显示选中的一组，未保存的输入切组不丢；保存按钮固定在右下；窄屏导航变为顶部横向条）——总开关与采集 / 抽取与整理 / 检索与注入 / 重要性与维护 / 学习与人格草稿 / 图片 / Embedding 与 Rerank / 外观。
 - **外观**：Shader Gradient 风格——近黑底上跑真实 WebGL 片元着色器流动渐变（fbm 域扭曲），内容在磨砂玻璃面板上；5 组主题预设（极光 / 碧金 / 暮霞 / 午夜 / 森林）+ 三色取色器；**动态颜色**开关按固定顺序循环渐变（停 1 秒 / 过渡 5 秒），手动点预设自动关闭。
 - 动效降级：devicePixelRatio 封顶 2、离屏暂停、`prefers-reduced-motion` 单帧、WebGL 不可用或上下文丢失时回退静态 CSS 渐变。
 
@@ -151,6 +178,8 @@
 | `/stype explain <关键词>` | 召回路由、命中和过滤原因 |
 | `/stype add <内容>` | 手动写入（说话人是当前聊天对象） |
 | `/stype recent [n]` | 最近时间线 |
+| `/stype events [n]` | 当前会话最近的事件（整件事记忆） |
+| `/stype history [时间或问题]` | 看那段时间的状态与事件，例：`/stype history 去年12月` |
 | `/stype extract` | 立刻抽取/整理 |
 | `/stype sleep` | 全量维护（含偏好折叠、空档案清理，管理员） |
 | `/stype pending` | 待审记忆列表（管理员） |
@@ -192,6 +221,7 @@ savagetype/
   service.py             编排：采集、身份、检索、注入、维护、Provider 调度
   store.py               SQLite 存储（WAL、迁移、原子访问计数、在线备份）
   extract.py             AI 缩写 + 启发式抽取、确定性拆句、证据绑定
+  events.py              事件层：按静默间隔切段、整段摘要、审核、追加式写库
   pipeline.py            后台三段式管线（缩写 → 审核 → 修订）
   contradiction.py       写入护栏引擎（槽位、覆盖、待确认、守卫）
   slots.py               规范槽位、领域检测、主题归一
@@ -217,6 +247,11 @@ pages/console/           面板：index.html / app.js / style.css / shader.js(We
 - **检索融合**：BM25 关键词 + 可选向量余弦，RRF 融合排名，可选 cross-encoder 重排，MMR 去冗余。
 - **检索缓存与降级**：昂贵路径缓存 + Provider 超时降级 + 会话锁期间预热。
 - **注入工程**：预算逐行装载、hot/warm/cold 分层、新颖度过滤、跨轮去重落库、稳定块优先排序、UNTRUSTED 包裹、临时附加块（不动 system_prompt）。
+- **实体链接**：事实/事件写入时登记人名/关键词/领域（改昵称、归并自动跟随），检索时从提问匹配实体并给相关条目加权；不额外调用模型。
+- **时序查询**：确定性时间短语解析（绝对年月 / 去年-上个月 / 最近N天 / 模糊「以前」）→ 有效期窗口查询（`created_at` 起、被覆盖或归档时止）→「当时 vs 现在」对照注入，隐私规则照旧生效。
+- **事件切段（无 LLM 的确定性算法）**：按会话+静默间隔+最长时长切段，续聊窗口合并、超长按条数/字数切块，门槛过滤灌水，保证同一件事只成一条并可持续更新。
+- **会话隐私隔离**：owner 记忆与私聊来源记忆按当前会话类型过滤，拦截原因进注入显微镜。
+- **模型调用策略（v4.4.0）**：任务分档（`quality_provider_id` 精准档 / `fast_provider_id` 快速档）→ 显式单任务配置优先 → 旧回退链 → 当前会话模型；解析来源逐次记账，面板显示「今日用量 + 各任务消耗 + 实际走了哪一档」。Token 预算：硬限额停止一切模型调用（消息留给额度恢复后重试，不丢数据）、软限额只停表达学习/向量回填/重排、单次预估超限切备用模型；模型拒答时自动换备用模型重试一次，不把拒答当整理结果。
 - **学习审查**：统计预筛 + LLM 注释 + 人工批准后才生效，「先审后用」。
 - **WebGL 背景**：手写片元着色器（fbm 噪声域扭曲）、三色插值循环动画、ResizeObserver、上下文丢失回退。
 
@@ -238,15 +273,25 @@ pages/console/           面板：index.html / app.js / style.css / shader.js(We
 | 配置 | 说明 |
 | --- | --- |
 | `owner_qq` | 主人 QQ，只允许一个；留空回退 AstrBot 管理员 |
+| `enabled` / `capture_enabled` / `inject_enabled` / `extract_enabled` / `learning_enabled` | 总开关与采集、注入、抽取、学习各层开关 |
+| `high_evidence_confidence` / `cache_ttl_seconds` / `summary_provider_id` / `debug_log_injection` | 高证据阈值（默认 0.8）、检索缓存秒数、抽取模型、注入调试日志 |
 | `memory_source_platforms` | 记忆来源平台，默认 `aiocqhttp,qq_official,qq_official_webhook` |
 | `memory_whitelist` | 群号/QQ 白名单，留空不限制 |
 | `pipeline_enabled` / `normalize_provider_id` / `verify_provider_id` | AI 整理与审核（面板只列对话模型） |
+| `quality_provider_id` / `fast_provider_id` / `fallback_provider_id` | 模型档位与备用模型（显式单任务配置优先于档位） |
+| `daily_token_limit` / `soft_token_limit` / `single_call_token_cap` | 每日硬限额、软限额、单次预估上限（0=不限） |
 | `extract_min_messages` / `extract_cooldown_seconds` / `extract_idle_seconds` | 抽取阈值、冷却、空闲触发 |
 | `pipeline_batch_size` / `pipeline_max_revisions` / `pipeline_notify_cooldown_seconds` | 批量、最大修订轮数、通知冷却 |
 | `retrieval_mode` / `retrieval_bm25` / `top_k` / `core_fact_limit` / `related_fact_limit` | 检索模式与条数 |
 | `embedding_enabled` / `embedding_auto_threshold` / `embedding_provider_id` / `rerank_provider_id` | 向量与重排（AstrBot 原生页不支持选择器，需手填 ID） |
 | `provider_timeout_seconds` | Embedding/Rerank 超时（默认 5 秒，0=不限） |
 | `inject_budget_chars` / `inject_warm_triggered` / `inject_novelty_filter` / `inject_dedup_window_seconds` | 注入预算、按需注入、新颖度过滤、跨轮去重 |
+| `event_enabled` / `event_gap_minutes` / `event_max_hours` / `event_min_messages` | 事件层开关、切段静默、单段最长时长、成段最少用户消息 |
+| `event_merge_minutes` / `event_max_per_run` / `event_provider_id` | 续聊合并窗口、单轮最多整理段数、事件摘要模型（默认回退整理模型） |
+| `event_budget_chars` / `event_max_inject` / `event_archive_days` | 事件注入预算、每轮最多注入条数、事件归档最短天数 |
+| `memory_session_isolation` | 会话隐私隔离：`off` / `owner` / `strict`（默认 strict） |
+| `entity_linking_enabled` / `entity_boost_weight` | 实体链接开关与命中加成分（默认 0.2） |
+| `history_enabled` / `history_max_facts` | 时序查询开关与历史块条数上限（默认 6） |
 | `importance_weight` / `importance_half_life_days` / `importance_reinforce_factor` / `importance_max_half_life_multiplier` / `importance_prune_threshold` | 重要性、半衰期、强化、归档阈值 |
 | `sleep_timeline_retain_days` / `sleep_low_value_days` / `sleep_low_value_confidence` / `sleep_superseded_retain_days` | 维护保留期与归档条件 |
 | `image_caption_provider_id` / `image_caption_timeout_seconds` | 图片转述模型与超时 |
@@ -270,9 +315,28 @@ pages/console/           面板：index.html / app.js / style.css / shader.js(We
 
 ```text
 python tests/test_core.py -v
+python tests/test_soak.py -v
 ```
 
-104 个测试，只用 Python 3.11+ 标准库，不联网。前端可做静态检查：把 `pages/console/app.js` / `shader.js` 复制为 `.mjs` 后 `node --check`。
+151 + 14 个测试，只用 Python 3.11+ 标准库，不联网。`test_soak.py` 偏慢，专门压异常模型输出、并发写入、几千条规模、老库迁移和全链路。`tests/verify_readme.py` 核查文档里的命令、配置、默认值、面板路由与版本号是否和代码一致。前端可做静态检查：把 `pages/console/app.js` / `shader.js` 复制为 `.mjs` 后 `node --check`。
+
+集成测试（24 个，真实 AstrBot 框架 + 假 Context/假事件/脚本化假模型，覆盖插件加载、采集钩子、注入、全部命令、LLM 工具、全部面板接口，以及任务分档、Token 预算闸、拒答重试）：
+
+```text
+python -m venv .itvenv
+.itvenv/Scripts/python -m pip install astrbot
+.itvenv/Scripts/python tests/test_integration.py -v
+```
+
+面板 UI 测试（jsdom 里跑真实的 `app.js`：学习审查的筛选/全选/批量按钮行为、按钮必须在滚动区之外、卡片不被拉高等排版规则）：
+
+```text
+npm install jsdom --prefix %TEMP%\uitest
+set JSDOM_DIR=%TEMP%\uitest
+node tests/test_panel.mjs
+```
+
+没有 `astrbot` / 没装 jsdom 时对应套件无法运行，不影响其它测试。
 
 ---
 

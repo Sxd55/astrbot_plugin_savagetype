@@ -9,6 +9,7 @@ import asyncio
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1059,6 +1060,57 @@ class V280Test(unittest.TestCase):
         )
         self.assertEqual(candidate_reason(like_ev, False), "self")
 
+    def test_candidate_gate_adverbs_and_new_verbs(self):
+        # 真实语料里最自然的说法：主语和谓语之间夹副词，或换用别的谓词。
+        cases = [
+            "我平时喜欢喝气泡水。",
+            "我最近迷上了爬山。",
+            "我其实不喜欢猫了。",
+            "我家的猫叫团子。",
+            "我不太喜欢甜食。",
+            "我不怎么吃辣。",
+            "我也爱喝咖啡。",
+            "我养了一只叫毛球的猫。",
+            "我住在成都。",
+        ]
+        for index, content in enumerate(cases):
+            ev = TimelineEvent(
+                id=index + 10, ts=1, speaker_id="u1", speaker_name="阿U", bot_id="b",
+                window_tag="w", role="user", content=content,
+            )
+            self.assertEqual(candidate_reason(ev, False), "self", content)
+            self.assertEqual(candidate_reason(ev, True), "owner_self", content)
+
+    def test_candidate_gate_keeps_noise_out(self):
+        cases = [
+            "我可爱吗？",
+            "我朋友叫小明。",
+            "我叫什么名字？",
+            "你是谁？",
+            "今天天气不错。",
+        ]
+        for index, content in enumerate(cases):
+            ev = TimelineEvent(
+                id=index + 50, ts=1, speaker_id="u1", speaker_name="阿U", bot_id="b",
+                window_tag="w", role="user", content=content,
+            )
+            self.assertEqual(candidate_reason(ev, False), "", content)
+
+    def test_heuristic_covers_new_phrasings(self):
+        extractor = Extractor(self.store, self.engine)
+        payloads = []
+        for index, content in enumerate(("我平时喜欢喝气泡水。", "我最近迷上了爬山。")):
+            ev = TimelineEvent(
+                id=index + 70, ts=1, speaker_id="u1", speaker_name="阿U", bot_id="b",
+                window_tag="w", role="user", content=content,
+            )
+            payloads.extend(extractor.extract_heuristic([ev]))
+        values = {(p.get("attribute"), p.get("value")) for p in payloads}
+        self.assertIn(("likes", "气泡水"), values)
+        self.assertIn(("likes", "爬山"), values)
+        # 「我最近迷上了爬山」不该被写成 3 天有效的 status。
+        self.assertNotIn("status", {attr for attr, _ in values})
+
     def test_inject_returns_blank_when_empty(self):
         result = RetrievalResult(
             query="q",
@@ -1938,6 +1990,938 @@ class V330Test(unittest.TestCase):
         r2 = asyncio.run(second.build_injection("我喜欢什么", "u1", window_tag="w1"))
         self.assertEqual(r2[2]["dedup"], 1)
         self.assertEqual([f.id for f in r2[1].core], [])
+
+
+class EventLayerTest(unittest.TestCase):
+    """v4.2.0 episodic layer: segmentation, summary, merge, lifecycle."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "events.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _ev(i, ts, window="w1", role="user", content="x", sid="u1"):
+        return TimelineEvent(
+            id=i, ts=ts, speaker_id=sid, speaker_name=sid, bot_id="b",
+            window_tag=window, role=role, content=content, persona_id="",
+        )
+
+    def _add(self, i, ts, window="w1", role="user", content="x", sid="u1"):
+        self.store.add_timeline(
+            {
+                "ts": ts, "speaker_id": sid, "speaker_name": sid, "bot_id": "b",
+                "window_tag": window, "role": role, "content": content,
+                "fingerprint": f"ev-{i}",
+            }
+        )
+
+    def _pipeline(self, store=None, summary=None, verify=None, summary_llm=None, **config):
+        from savagetype.events import EventPipeline
+
+        calls = {"summary": 0, "verify": 0}
+        verdict = verify or '{"pass": true, "reason": "", "fix_hint": ""}'
+        payload = summary or json.dumps(
+            {
+                "kind": "life", "title": "成都之行", "summary": "去成都玩了，吃了火锅",
+                "highlights": ["吃火锅"], "keywords": ["成都"], "importance": 0.7, "confidence": 0.9,
+            },
+            ensure_ascii=False,
+        )
+
+        async def default_summary(_prompt):
+            calls["summary"] += 1
+            return payload
+
+        async def default_verify(_prompt):
+            calls["verify"] += 1
+            return verdict
+
+        cfg = {
+            "event_enabled": True,
+            "event_gap_minutes": 30,
+            "event_min_messages": 2,
+            "event_merge_minutes": 120,
+            "event_max_per_run": 5,
+        }
+        cfg.update(config)
+        pipe = EventPipeline(
+            store or self.store, cfg, None,
+            summary_llm if summary_llm is not None else default_summary,
+            default_verify,
+        )
+        return pipe, calls
+
+    def test_split_episodes_by_gap_and_window(self):
+        from savagetype.events import split_episodes
+
+        rows = [
+            self._ev(1, 1000, window="w1"),
+            self._ev(2, 1100, window="w2"),
+            self._ev(3, 1200, window="w1"),
+            self._ev(4, 5000, window="w1"),
+        ]
+        episodes = split_episodes(rows, gap_seconds=1800, max_span_seconds=6 * 3600)
+        self.assertEqual([[e.id for e in ep] for ep in episodes], [[1, 3], [2], [4]])
+
+    def test_split_episodes_hard_span(self):
+        from savagetype.events import split_episodes
+
+        rows = [self._ev(1, 0), self._ev(2, 100), self._ev(3, 200)]
+        episodes = split_episodes(rows, gap_seconds=10 ** 9, max_span_seconds=150)
+        self.assertEqual([[e.id for e in ep] for ep in episodes], [[1, 2], [3]])
+
+    def test_episode_worthy_gate(self):
+        from savagetype.events import episode_worthy
+
+        chatter = [
+            self._ev(1, 1, content="哈哈哈"),
+            self._ev(2, 2, content="嗯嗯"),
+            self._ev(3, 3, content="好的"),
+        ]
+        self.assertFalse(episode_worthy(chatter, min_messages=4))
+        narrative = [
+            self._ev(1, 1, content="我昨天去了成都"),
+            self._ev(2, 2, content="嗯"),
+        ]
+        self.assertTrue(episode_worthy(narrative, min_messages=4))
+        plain = [self._ev(i, i, content="今天天气不错") for i in range(1, 5)]
+        self.assertTrue(episode_worthy(plain, min_messages=4))
+        bot_only = [self._ev(1, 1, role="assistant", sid="bot_self")]
+        self.assertFalse(episode_worthy(bot_only, min_messages=1))
+
+    def test_chunk_episode_by_count_and_chars(self):
+        from savagetype.events import chunk_episode
+
+        rows = [self._ev(i, i, content="x" * 10) for i in range(10)]
+        chunks = chunk_episode(rows, max_messages=4, max_chars=10 ** 6)
+        self.assertEqual([len(c) for c in chunks], [4, 4, 2])
+        wide = [self._ev(i, i, content="x" * 60) for i in range(4)]
+        chunks = chunk_episode(wide, max_messages=10, max_chars=100)
+        self.assertEqual([len(c) for c in chunks], [1, 1, 1, 1])
+
+    def test_pipeline_creates_and_extends_one_event(self):
+        base = now_ts() - 6 * 3600
+        self._add("a1", base, content="我昨天去了成都")
+        self._add("a2", base + 60, content="吃了火锅，很好吃")
+        self._add("a3", base + 70, role="assistant", sid="bot_self", content="听起来不错")
+        pipe, calls = self._pipeline()
+        first = asyncio.run(pipe.run())
+        self.assertEqual(first["created"], 1)
+        events = self.store.events_by_status("live")
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event.kind, "life")
+        self.assertEqual(event.title, "成都之行")
+        self.assertEqual(event.review_status, "ai_passed")
+        self.assertEqual(len(event.evidence), 3)
+        self.assertEqual(event.scope, "person")
+
+        self._add("b1", base + 7200, content="第二天又去爬山了")
+        self._add("b2", base + 7260, content="累死了")
+        second = asyncio.run(pipe.run())
+        self.assertEqual(second["extended"], 1)
+        events = self.store.events_by_status("live")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].id, event.id)
+        self.assertEqual(len(events[0].evidence), 5)
+        self.assertEqual(events[0].end_ts, base + 7260)
+        self.assertEqual(calls["summary"], 2)
+
+    def test_pipeline_verify_failure_marks_needs_review(self):
+        base = now_ts() - 7200
+        self._add("v1", base, content="我昨天去了成都")
+        self._add("v2", base + 10, content="吃了火锅")
+        pipe, _calls = self._pipeline(verify='{"pass": false, "reason": "加了原文没有的细节", "fix_hint": "删掉"}')
+        result = asyncio.run(pipe.run())
+        self.assertEqual(result["created"], 1)
+        event = self.store.events_by_status("live")[0]
+        self.assertEqual(event.review_status, "needs_review")
+        self.assertLessEqual(event.confidence, 0.4)
+
+    def test_pipeline_fallback_without_llm_keeps_evidence(self):
+        base = now_ts() - 7200
+        self._add("f1", base, content="我昨天去了成都")
+        self._add("f2", base + 10, content="吃了火锅")
+        pipe, _calls = self._pipeline(summary_llm=None)
+        pipe.llm = None
+        result = asyncio.run(pipe.run())
+        self.assertEqual(result["created"], 1)
+        event = self.store.events_by_status("live")[0]
+        self.assertEqual(event.review_status, "needs_review")
+        self.assertIn("成都", event.summary)
+        self.assertEqual(len(event.evidence), 2)
+
+    def test_event_recall_log_is_separate_from_facts(self):
+        self.store.add_recall("w1", [7], 1000)
+        self.store.add_event_recall("w1", [7], 1000)
+        self.assertEqual(self.store.recent_recall_ids("w1", 0), {7})
+        self.assertEqual(self.store.recent_event_recall_ids("w1", 0), {7})
+
+    def test_archive_decayed_events(self):
+        from savagetype.archive import archive_decayed_events
+
+        eid = self.store.add_event(
+            {
+                "title": "旧事", "summary": "很久以前的事", "speaker_id": "u1",
+                "start_ts": now_ts() - 400 * 86400, "end_ts": now_ts() - 400 * 86400,
+                "importance": 0.05, "evidence": [1],
+            }
+        )
+        self.assertEqual(archive_decayed_events(self.store, min_age_days=90, threshold=0.12), 1)
+        self.assertEqual(self.store.get_event(eid).status, "archived")
+
+    def test_referenced_timeline_ids_includes_event_evidence(self):
+        self._add("r1", now_ts() - 7200, content="我去了成都")
+        self.store.add_event(
+            {
+                "title": "成都", "summary": "去了成都", "speaker_id": "u1",
+                "start_ts": now_ts() - 7200, "end_ts": now_ts() - 7200, "evidence": [1],
+            }
+        )
+        self.assertIn(1, self.store.referenced_timeline_ids())
+
+    def test_events_export_import_roundtrip(self):
+        from savagetype.archive import import_jsonl
+        from savagetype.service import SavageTypeService
+
+        service = SavageTypeService(
+            store=self.store, config={}, llm_generate=lambda *_a, **_k: "",
+            get_provider=lambda *_a, **_k: None, logger=None,
+        )
+        self.store.add_event(
+            {
+                "title": "成都之行", "summary": "去成都玩了", "speaker_id": "u1",
+                "start_ts": 1000, "end_ts": 1200, "evidence": [1], "fingerprint": "ev-fp-1",
+            }
+        )
+        path = Path(self.tmp.name) / "events.jsonl"
+        service.export_jsonl(path)
+        store2 = Store(Path(self.tmp.name) / "imported.db")
+        try:
+            result = import_jsonl(store2, path)
+            self.assertGreaterEqual(result["events"], 1)
+            self.assertEqual(len(store2.events_by_status("live")), 1)
+            again = import_jsonl(store2, path)
+            self.assertEqual(again["events"], 0)
+            self.assertGreaterEqual(again["skipped"], 1)
+        finally:
+            store2.close()
+
+    def test_maybe_extract_runs_event_layer(self):
+        from savagetype.service import SavageTypeService
+
+        base = now_ts() - 7200
+        self._add("s1", base, content="我昨天去了成都")
+        self._add("s2", base + 30, content="吃了火锅")
+        service = SavageTypeService(
+            store=self.store,
+            config={
+                "event_enabled": True,
+                "event_gap_minutes": 30,
+                "event_min_messages": 2,
+                "event_merge_minutes": 120,
+                "extract_enabled": True,
+            },
+            llm_generate=lambda *_a, **_k: "",
+            get_provider=lambda *_a, **_k: None,
+            logger=None,
+        )
+        result = asyncio.run(service.maybe_extract(force=True))
+        self.assertIn("events_layer", result)
+        self.assertEqual(result["events_layer"]["created"], 1)
+
+    # ------------------------------------------------------------------
+    # P2: retrieval, injection, privacy isolation
+    # ------------------------------------------------------------------
+
+    def _service(self, **config):
+        from savagetype.service import SavageTypeService
+
+        service = SavageTypeService(
+            store=self.store,
+            config=config,
+            llm_generate=lambda *_a, **_k: "",
+            get_provider=lambda *_a, **_k: None,
+            logger=None,
+        )
+        service.apply_config()
+        return service
+
+    def _add_event(self, title, summary, window="w1", sid="u1", days_ago=1.0, **kw):
+        now = now_ts()
+        end = int(now - days_ago * 86400)
+        payload = {
+            "title": title,
+            "summary": summary,
+            "speaker_id": sid,
+            "speaker_name": sid,
+            "speaker_ids": [sid],
+            "window_tag": window,
+            "start_ts": end - 600,
+            "end_ts": end,
+            "kind": kw.pop("kind", "life"),
+            "importance": kw.pop("importance", 0.8),
+            "confidence": kw.pop("confidence", 0.9),
+            "review_status": kw.pop("review_status", "ai_passed"),
+            "evidence": kw.pop("evidence", [1]),
+        }
+        payload.update(kw)
+        return self.store.add_event(payload)
+
+    def test_event_injected_once_per_window(self):
+        eid = self._add_event("成都之行", "去成都玩了三天，吃了火锅")
+        service = self._service(memory_session_isolation="strict", event_enabled=True)
+        pack, _result, snapshot = asyncio.run(
+            service.build_injection("最近怎么样", "u1", window_tag="w1")
+        )
+        self.assertIn("【事件】", pack)
+        self.assertIn("成都之行", pack)
+        self.assertEqual(snapshot["injected_event_ids"], [eid])
+        self.assertEqual(self.store.get_event(eid).access_count, 1)
+        again, _r2, snap2 = asyncio.run(
+            service.build_injection("最近怎么样", "u1", window_tag="w1")
+        )
+        self.assertNotIn("成都之行", again)
+        self.assertEqual(snap2["injected_event_ids"], [])
+
+    def test_event_blocked_in_other_session_when_isolated(self):
+        self._add_event("成都之行", "去成都玩了三天", window="w2")
+        strict = self._service(memory_session_isolation="strict", event_enabled=True)
+        pack, _r, _s = asyncio.run(strict.build_injection("成都", "u1", window_tag="w1"))
+        self.assertNotIn("成都之行", pack)
+
+        open_service = self._service(memory_session_isolation="off", event_enabled=True)
+        pack2, _r2, snap2 = asyncio.run(
+            open_service.build_injection("成都", "u1", window_tag="w1")
+        )
+        self.assertIn("成都之行", pack2)
+        self.assertTrue(snap2["injected_event_ids"])
+
+    def test_owner_facts_not_leaked_to_others(self):
+        self.store.add_fact(
+            {
+                "subject": "self", "attribute": "likes", "value": "咖啡",
+                "content": "我喜欢咖啡", "speaker_id": "owner", "speaker_name": "主人",
+                "scope": "owner", "confidence": 0.9, "first_person": 1,
+                "window_tag": "default:FriendMessage:owner",
+            }
+        )
+        service = self._service(memory_session_isolation="strict", owner_qq="owner")
+        result = asyncio.run(
+            service.retrieve_for("主人喜欢什么", "u1", window_tag="aiocqhttp:GroupMessage:1")
+        )
+        self.assertTrue(any(h.filter_reason == "owner_private" for h in result.blocked))
+        result2 = asyncio.run(
+            service.retrieve_for("我喜欢什么", "owner", window_tag="default:FriendMessage:owner")
+        )
+        self.assertTrue(result2.core or result2.related)
+
+    def test_private_origin_fact_hidden_in_group(self):
+        self.store.add_fact(
+            {
+                "subject": "self", "attribute": "note", "value": "养了两只猫",
+                "content": "我养了两只猫", "speaker_id": "u1", "speaker_name": "阿U",
+                "scope": "person", "confidence": 0.9, "first_person": 1,
+                "window_tag": "default:FriendMessage:u1-1",
+            }
+        )
+        service = self._service(memory_session_isolation="strict")
+        group = asyncio.run(
+            service.retrieve_for("我养了什么", "u1", window_tag="aiocqhttp:GroupMessage:1")
+        )
+        self.assertTrue(any(h.filter_reason == "private_origin" for h in group.blocked))
+        private = asyncio.run(
+            service.retrieve_for("我养了什么", "u1", window_tag="default:FriendMessage:u1-1")
+        )
+        self.assertTrue(private.core or private.related)
+
+    def test_time_window_route_limits_event_age(self):
+        recent = self._add_event("新事件", "上周去了成都", days_ago=3)
+        self._add_event("老事件", "很久以前去了成都", days_ago=40)
+        service = self._service(memory_session_isolation="strict", event_enabled=True)
+        result = asyncio.run(
+            service.retrieve_for("上周去成都做了什么", "u1", window_tag="w1")
+        )
+        self.assertEqual(result.route, "time_window")
+        self.assertEqual([e.id for e in result.events], [recent])
+
+    def test_event_budget_zero_keeps_facts_only(self):
+        self._add_event("成都之行", "去成都玩了三天")
+        service = self._service(
+            memory_session_isolation="strict", event_enabled=True, event_budget_chars=1
+        )
+        pack, _r, snap = asyncio.run(service.build_injection("成都", "u1", window_tag="w1"))
+        self.assertNotIn("【事件】", pack)
+        self.assertEqual(snap["injected_event_ids"], [])
+
+    def test_needs_review_event_not_injected(self):
+        self._add_event("乱写的", "模型编的内容", review_status="needs_review")
+        service = self._service(memory_session_isolation="strict", event_enabled=True)
+        pack, _r, _s = asyncio.run(service.build_injection("成都", "u1", window_tag="w1"))
+        self.assertNotIn("乱写的", pack)
+
+    # ------------------------------------------------------------------
+    # P4: promise / habit per-topic slots
+    # ------------------------------------------------------------------
+
+    def test_promise_and_habit_topics_coexist(self):
+        engine = ContradictionEngine(self.store, high_evidence=0.8)
+        a = engine.ingest(
+            _payload(attribute="promise", value="带饭", content="答应小明带饭"),
+            "答应小明带饭",
+        )
+        b = engine.ingest(
+            _payload(attribute="promise", value="交作业", content="答应周五交作业"),
+            "答应周五交作业",
+        )
+        self.assertEqual(a["action"], "insert")
+        self.assertEqual(b["action"], "insert")
+        lives = [f for f in self.store.person_facts("u1") if f.attribute == "promise"]
+        self.assertEqual(len(lives), 2)
+
+        h1 = engine.ingest(
+            _payload(attribute="habit", value="早起", content="我习惯早起"),
+            "我习惯早起",
+        )
+        h2 = engine.ingest(
+            _payload(attribute="habit", value="戒烟", content="我戒烟了"),
+            "我戒烟了",
+        )
+        self.assertEqual(h1["action"], "insert")
+        self.assertEqual(h2["action"], "insert")
+        habits = [f for f in self.store.person_facts("u1") if f.attribute == "habit"]
+        self.assertEqual(len(habits), 2)
+
+    def test_close_targets_latest_promise(self):
+        engine = ContradictionEngine(self.store, high_evidence=0.8)
+        a = engine.ingest(
+            _payload(attribute="promise", value="带饭", content="答应小明带饭"),
+            "答应小明带饭",
+        )
+        b = engine.ingest(
+            _payload(attribute="promise", value="交作业", content="答应周五交作业"),
+            "答应周五交作业",
+        )
+        self.store.update_fact(b["fact_id"], updated_at=now_ts() + 5)
+        close = engine.ingest(
+            _payload(attribute="promise", value="交作业做完了", content="交作业做完了", write_op="close"),
+            "交作业做完了",
+        )
+        self.assertEqual(close["action"], "closed")
+        self.assertEqual(self.store.get_fact(b["fact_id"]).status, "archived")
+        self.assertEqual(self.store.get_fact(a["fact_id"]).status, "live")
+
+    def test_close_without_existing_is_ignored(self):
+        engine = ContradictionEngine(self.store, high_evidence=0.8)
+        result = engine.ingest(
+            _payload(attribute="promise", value="没写过的约定", content="做完了", write_op="close"),
+            "做完了",
+        )
+        self.assertEqual(result["action"], "ignored")
+        self.assertEqual(result["reason"], "close_without_existing")
+
+
+class EntityHistoryTest(unittest.TestCase):
+    """v4.3.0: entity linking weights and time-travel queries."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "eh.db")
+        self.engine = ContradictionEngine(self.store, high_evidence=0.8)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _service(self, **config):
+        from savagetype.service import SavageTypeService
+
+        service = SavageTypeService(
+            store=self.store,
+            config=config,
+            llm_generate=lambda *_a, **_k: "",
+            get_provider=lambda *_a, **_k: None,
+            logger=None,
+        )
+        service.apply_config()
+        return service
+
+    def _note(self, value, content, keywords=None, speaker="u1", window="w1", attribute="note"):
+        return self.engine.ingest(
+            _payload(
+                speaker=speaker,
+                attribute=attribute,
+                value=value,
+                content=content,
+                keywords=keywords or [],
+                window_tag=window,
+            ),
+            content,
+        )
+
+    def test_entity_links_and_rename(self):
+        result = self._note("爬山", "和小明约了周末爬山", keywords=["小明", "爬山"])
+        names = {item["name"]: item["kind"] for item in self.store.entities_for_ref("fact", result["fact_id"])}
+        self.assertIn("小明", names)
+        self.assertIn("爬山", names)
+        self.assertEqual(names["小明"], "keyword")
+
+        found = self.store.entities_in_text("小明这周末干嘛")
+        self.assertIn("小明", found)
+        fact_ids, event_ids = self.store.entity_refs(found)
+        self.assertIn(result["fact_id"], fact_ids)
+        self.assertEqual(event_ids, set())
+
+        self.store.update_fact(result["fact_id"], speaker_name="阿优")
+        renamed = {item["name"] for item in self.store.entities_for_ref("fact", result["fact_id"])}
+        self.assertIn("阿优", renamed)
+
+    def test_entity_boost_changes_score(self):
+        from savagetype.retrieve import Retriever
+
+        result = self._note("爬山", "和小明约了周末爬山", keywords=["小明"])
+        fact = self.store.get_fact(result["fact_id"])
+        retriever = Retriever(self.store)
+        query = "小明最近去哪了"
+        base = retriever._local_score(query, fact, "u1", "long_term")
+        boosted = retriever._local_score(
+            query, fact, "u1", "long_term", entity_ids={fact.id}, entity_boost=0.2
+        )
+        self.assertAlmostEqual(boosted - base, 0.2, places=6)
+        custom = retriever._local_score(
+            query, fact, "u1", "long_term", entity_ids={fact.id}, entity_boost=0.5
+        )
+        self.assertAlmostEqual(custom - base, 0.5, places=6)
+
+        service = self._service(entity_linking_enabled=True)
+        retrieved = asyncio.run(service.retrieve_for(query, "u1", window_tag="w1"))
+        self.assertIn(result["fact_id"], [hit.fact.id for hit in retrieved.hits])
+
+    def test_parse_time_range_cases(self):
+        from savagetype.util import parse_time_range
+
+        now = int(now_ts())
+        start, end, label = parse_time_range("2025年3月的事", now)
+        self.assertEqual(label, "2025-03")
+        self.assertEqual(
+            time.strftime("%Y-%m", time.localtime(start)), "2025-03"
+        )
+        start, end, label = parse_time_range("最近3天", now)
+        self.assertEqual(label, "最近3天")
+        self.assertLess(start, end)
+        start, end, label = parse_time_range("以前喜欢什么", now)
+        self.assertEqual(label, "当时")
+        self.assertEqual(start, 0)
+        self.assertGreater(end, 0)
+        self.assertEqual(parse_time_range("今天天气不错", now), (0, 0, ""))
+
+    def test_facts_in_window_respects_validity(self):
+        first = self._note("美式", "我喜欢喝美式", attribute="likes")
+        second = self.engine.ingest(
+            _payload(
+                speaker="u1", attribute="likes", value="不美式",
+                content="我改口了，不喜欢美式", explicit_correction=1, window_tag="w1",
+            ),
+            "我改口了，不喜欢美式",
+        )
+        self.assertEqual(second["action"], "supersede")
+        start = now_ts() - 60
+        end = now_ts() + 60
+        window = self.store.facts_in_window(start, end, speaker_ids=["u1"], include_owner=True)
+        ids = {f.id for f in window}
+        self.assertIn(first["fact_id"], ids)
+        empty = self.store.facts_in_window(0, start - 120, speaker_ids=["u1"], include_owner=True)
+        self.assertNotIn(first["fact_id"], {f.id for f in empty})
+
+    def test_history_retrieval_and_injection(self):
+        first = self._note("美式", "我喜欢喝美式", attribute="likes")
+        self.engine.ingest(
+            _payload(
+                speaker="u1", attribute="likes", value="不美式",
+                content="我改口了，不喜欢美式", explicit_correction=1, window_tag="w1",
+            ),
+            "我改口了，不喜欢美式",
+        )
+        service = self._service(memory_session_isolation="strict")
+        result = asyncio.run(
+            service.retrieve_for("我以前喜欢喝什么", "u1", window_tag="w1")
+        )
+        self.assertEqual(result.route, "history")
+        self.assertIn(first["fact_id"], [f.id for f in result.history])
+        self.assertTrue(result.history_current.get(first["fact_id"]))
+
+        pack, _r, snapshot = asyncio.run(
+            service.build_injection("我以前喜欢喝什么", "u1", window_tag="w1")
+        )
+        self.assertIn("【当时】", pack)
+        self.assertIn("现在：", pack)
+        self.assertIn(first["fact_id"], snapshot["history"])
+
+    def test_history_events_filtered_by_time_range(self):
+        import datetime
+
+        def ts(year, month, day):
+            return int(datetime.datetime(year, month, day, 12, 0).timestamp())
+
+        in_range = self.store.add_event(
+            {
+                "title": "成都之行", "summary": "去成都玩了", "speaker_id": "u1",
+                "speaker_ids": ["u1"], "window_tag": "w1",
+                "start_ts": ts(2025, 3, 5), "end_ts": ts(2025, 3, 5) + 3600,
+            }
+        )
+        self.store.add_event(
+            {
+                "title": "旧事", "summary": "很久以前", "speaker_id": "u1",
+                "speaker_ids": ["u1"], "window_tag": "w1",
+                "start_ts": ts(2024, 1, 2), "end_ts": ts(2024, 1, 2) + 3600,
+            }
+        )
+        service = self._service(memory_session_isolation="strict")
+        result = asyncio.run(
+            service.retrieve_for("2025年3月发生了什么", "u1", window_tag="w1")
+        )
+        self.assertEqual(result.route, "history")
+        self.assertEqual([e.id for e in result.events], [in_range])
+
+    def test_history_owner_private_not_leaked(self):
+        owner = self.engine.ingest(
+            {
+                "subject": "self", "attribute": "likes", "value": "咖啡",
+                "content": "我喜欢咖啡", "speaker_id": "owner", "speaker_name": "主人",
+                "scope": "owner", "confidence": 0.9, "first_person": 1,
+                "window_tag": "default:FriendMessage:owner",
+            },
+            "我喜欢咖啡",
+        )
+        self.store.update_fact(owner["fact_id"], status="superseded", updated_at=now_ts())
+        service = self._service(memory_session_isolation="strict", owner_qq="owner")
+        result = asyncio.run(
+            service.retrieve_for("主人以前喜欢什么", "u1", window_tag="aiocqhttp:GroupMessage:1")
+        )
+        self.assertEqual(result.route, "history")
+        self.assertEqual(result.history, [])
+
+    def test_events_between_window(self):
+        now = now_ts()
+        inside = self.store.add_event(
+            {
+                "title": "近事", "summary": "刚发生", "speaker_id": "u1",
+                "speaker_ids": ["u1"], "window_tag": "w1",
+                "start_ts": now - 3600, "end_ts": now - 60,
+            }
+        )
+        self.store.add_event(
+            {
+                "title": "远事", "summary": "很久以前", "speaker_id": "u1",
+                "speaker_ids": ["u1"], "window_tag": "w1",
+                "start_ts": now - 400 * 86400, "end_ts": now - 400 * 86400 + 3600,
+            }
+        )
+        ids = [e.id for e in self.store.events_between(now - 7200, now, speaker_ids=["u1"])]
+        self.assertEqual(ids, [inside])
+
+    def test_archived_event_visible_on_history_route(self):
+        now = now_ts()
+        eid = self.store.add_event(
+            {
+                "title": "老聚会", "summary": "很久以前的聚会", "speaker_id": "u1",
+                "speaker_ids": ["u1"], "window_tag": "w1",
+                "start_ts": now - 400 * 86400, "end_ts": now - 400 * 86400 + 3600,
+            }
+        )
+        self.store.update_event(eid, status="archived")
+        service = self._service(memory_session_isolation="strict")
+        plain = asyncio.run(service.retrieve_for("去年聚会了吗", "u1", window_tag="w1"))
+        self.assertIn(eid, [e.id for e in plain.events])
+        live_only = asyncio.run(service.retrieve_for("最近怎么样", "u1", window_tag="w1"))
+        self.assertNotIn(eid, [e.id for e in live_only.events])
+
+    def test_history_ask_other_sees_named_person(self):
+        self.engine.ingest(
+            _payload(speaker="u2", value="咖啡", content="我喜欢喝咖啡"),
+            "我喜欢喝咖啡",
+        )
+        old = self.engine.ingest(
+            {
+                "subject": "self", "attribute": "likes", "value": "茶",
+                "content": "我喜欢喝茶", "speaker_id": "u2", "speaker_name": "小明",
+                "confidence": 0.9, "first_person": 1, "window_tag": "w1",
+            },
+            "我喜欢喝茶",
+        )
+        self.store.update_fact(old["fact_id"], status="superseded", updated_at=now_ts())
+        service = self._service(memory_session_isolation="strict")
+        result = asyncio.run(
+            service.retrieve_for("小明以前喜欢什么", "u1", window_tag="w1")
+        )
+        self.assertIn(old["fact_id"], [f.id for f in result.history])
+
+    def test_history_current_walks_supersede_chain(self):
+        r1 = self.engine.ingest(_payload(value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
+        r2 = self.engine.ingest(
+            _payload(value="不茶", content="我改口了，不喜欢茶了", explicit_correction=1),
+            "我改口了，不喜欢茶了",
+        )
+        r3 = self.engine.ingest(
+            _payload(value="茶", content="我又喜欢茶了", explicit_correction=1),
+            "我又喜欢茶了",
+        )
+        service = self._service(memory_session_isolation="strict")
+        result = asyncio.run(
+            service.retrieve_for("我以前喜欢什么", "u1", window_tag="w1")
+        )
+        latest = self.store.get_fact(r3["fact_id"])
+        self.assertIn(r1["fact_id"], [f.id for f in result.history])
+        self.assertEqual(
+            result.history_current.get(r1["fact_id"]), latest.plain or latest.value
+        )
+
+    def test_history_novelty_filter_skips_mentioned_value(self):
+        self._note("美式", "我喜欢喝美式", attribute="likes")
+        self.engine.ingest(
+            _payload(
+                speaker="u1", attribute="likes", value="不美式",
+                content="我改口了，不喜欢美式", explicit_correction=1, window_tag="w1",
+            ),
+            "我改口了，不喜欢美式",
+        )
+        service = self._service(memory_session_isolation="strict")
+        pack, _r, _s = asyncio.run(
+            service.build_injection("我以前喜欢美式吗", "u1", window_tag="w1")
+        )
+        self.assertNotIn("【当时】", pack)
+
+    def test_event_participant_name_follows_rename(self):
+        now = now_ts()
+        eid = self.store.add_event(
+            {
+                "title": "爬山", "summary": "一起去爬山", "speaker_id": "u1",
+                "speaker_name": "阿U", "speaker_ids": ["u1"],
+                "participants": [{"id": "u1", "name": "阿U"}],
+                "window_tag": "w1", "start_ts": now - 3600, "end_ts": now - 60,
+            }
+        )
+        self.assertEqual(self.store.sync_event_participant("u1", "阿优"), 1)
+        event = self.store.get_event(eid)
+        self.assertEqual(event.participants[0]["name"], "阿优")
+        fact_ids, event_ids = self.store.entity_refs(["阿优"])
+        self.assertIn(eid, event_ids)
+
+    def test_events_run_despite_fact_pipeline_failure(self):
+        service = self._service(
+            event_enabled=True,
+            event_gap_minutes=30,
+            event_min_messages=2,
+            extract_enabled=True,
+        )
+
+        async def boom(**_kw):
+            raise RuntimeError("normalize provider down")
+
+        service.pipeline.run = boom
+        base = now_ts()
+        self.store.add_timeline(
+            {
+                "ts": base, "speaker_id": "u1", "speaker_name": "阿U", "bot_id": "b",
+                "window_tag": "w1", "role": "user", "content": "我决定下个月去成都",
+                "fingerprint": "isolate-1",
+            }
+        )
+        self.store.add_timeline(
+            {
+                "ts": base + 10, "speaker_id": "u1", "speaker_name": "阿U", "bot_id": "b",
+                "window_tag": "w1", "role": "user", "content": "还要去吃火锅",
+                "fingerprint": "isolate-2",
+            }
+        )
+        result = asyncio.run(service.maybe_extract(force=True))
+        self.assertEqual(result["reason"], "extract_fail")
+        self.assertIn("events_layer", result)
+        self.assertEqual(result["events_layer"]["created"], 1)
+
+    def test_entity_refs_respect_persona(self):
+        self.store.add_fact(
+            {
+                "subject": "self", "attribute": "note", "value": "和小明爬山",
+                "content": "和小明爬山", "speaker_id": "u1", "speaker_name": "u1",
+                "confidence": 0.8, "first_person": 1, "persona_id": "persona-a",
+                "keywords": ["小明"], "window_tag": "w1",
+            }
+        )
+        fact_ids, _events = self.store.entity_refs(["小明"])
+        self.assertTrue(fact_ids)
+        scoped, _events2 = self.store.entity_refs(["小明"], persona_id="persona-b")
+        self.assertEqual(scoped, set())
+
+    def test_event_pipeline_force_processes_fresh_rows(self):
+        from savagetype.events import EventPipeline
+
+        now = now_ts()
+        self.store.add_timeline(
+            {
+                "ts": now, "speaker_id": "u1", "speaker_name": "阿U", "bot_id": "b",
+                "window_tag": "w1", "role": "user", "content": "我决定下个月去成都",
+                "fingerprint": "force-1",
+            }
+        )
+        self.store.add_timeline(
+            {
+                "ts": now + 5, "speaker_id": "u1", "speaker_name": "阿U", "bot_id": "b",
+                "window_tag": "w1", "role": "user", "content": "还要去吃火锅",
+                "fingerprint": "force-2",
+            }
+        )
+        pipe = EventPipeline(
+            self.store,
+            {"event_enabled": True, "event_gap_minutes": 45, "event_min_messages": 2},
+            None,
+            None,
+        )
+        idle_result = asyncio.run(pipe.run())
+        self.assertTrue(idle_result.get("skipped"))
+        forced = asyncio.run(pipe.run(force=True))
+        self.assertEqual(forced.get("created"), 1)
+
+
+class LLMStrategyTest(unittest.TestCase):
+    """v4.4.0 模型调用策略：任务分档、回退链、Token 预算闸、拒答识别、用量账。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "llm.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_resolve_provider_precedence(self):
+        from savagetype.llm import resolve_provider
+
+        config = {
+            "normalize_provider_id": "p-norm",
+            "verify_provider_id": "p-verify",
+            "summary_provider_id": "p-summary",
+            "quality_provider_id": "p-quality",
+            "fast_provider_id": "p-fast",
+        }
+        self.assertEqual(resolve_provider("normalize", config), ("p-norm", "explicit:normalize_provider_id"))
+        self.assertEqual(resolve_provider("verify", config), ("p-verify", "explicit:verify_provider_id"))
+        # event 走旧回退链（event → normalize → summary）
+        self.assertEqual(resolve_provider("event", config), ("p-norm", "explicit:normalize_provider_id"))
+        # learn 走 fast 档（normalize/summary 都清掉之后）
+        config["normalize_provider_id"] = ""
+        config["summary_provider_id"] = ""
+        self.assertEqual(resolve_provider("learn", config), ("p-fast", "tier:fast"))
+        self.assertEqual(resolve_provider("verify", config), ("p-verify", "explicit:verify_provider_id"))
+        # 全清空后跟随会话模型
+        config["verify_provider_id"] = ""
+        config["quality_provider_id"] = ""
+        config["fast_provider_id"] = ""
+        self.assertEqual(resolve_provider("normalize", config), ("", "default"))
+        self.assertEqual(resolve_provider("learn", config), ("", "default"))
+
+    def test_estimate_and_refusal(self):
+        from savagetype.llm import estimate_tokens, looks_refusal
+
+        self.assertEqual(estimate_tokens("中文四个字"), 5)
+        self.assertEqual(estimate_tokens(""), 0)
+        self.assertTrue(looks_refusal("抱歉，我无法协助完成这个请求。"))
+        self.assertTrue(looks_refusal("As an AI, I cannot provide that."))
+        self.assertFalse(looks_refusal("标题：测试事件\n分区：科技"))
+
+    def test_budget_hard_soft_single_cap(self):
+        from savagetype.llm import BudgetGuard
+
+        used = {"n": 0}
+        guard = BudgetGuard({"daily_token_limit": 100, "soft_token_limit": 50}, lambda: used["n"])
+        self.assertTrue(guard.check("normalize", "x").allowed)
+        used["n"] = 60
+        self.assertTrue(guard.check("normalize", "x").allowed, "高优先级任务不受软限")
+        blocked = guard.check("learn", "x")
+        self.assertFalse(blocked.allowed)
+        self.assertEqual(blocked.reason, "soft_token_limit")
+        used["n"] = 100
+        hard = guard.check("normalize", "x")
+        self.assertFalse(hard.allowed)
+        self.assertEqual(hard.reason, "daily_token_limit")
+
+        cap = BudgetGuard(
+            {"single_call_token_cap": 10, "fallback_provider_id": "p-backup"},
+            lambda: 0,
+        )
+        decision = cap.check("normalize", "很长的提示词" * 50)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.provider_override, "p-backup")
+        no_fb = BudgetGuard({"single_call_token_cap": 10}, lambda: 0).check(
+            "normalize", "很长的提示词" * 50
+        )
+        self.assertTrue(no_fb.allowed)
+        self.assertEqual(no_fb.reason, "single_call_cap_no_fallback")
+
+    def test_usage_daily_accounting(self):
+        self.store.add_usage(
+            "llm", "p1", True, 10, 20, tokens_in=100, tokens_out=50,
+            task="normalize", source="tier:quality",
+        )
+        self.store.add_usage("llm", "", False, task="learn", source="tier:fast", reason="soft_token_limit")
+        self.store.add_usage("embed", "e1", True, 30, 0, tokens_in=40, task="embed")
+        self.assertEqual(self.store.tokens_today(), 190)
+        rows = {row["task"]: row for row in self.store.usage_by_task_today()}
+        self.assertEqual(rows["normalize"]["tokens"], 150)
+        self.assertEqual(rows["normalize"]["source"], "tier:quality")
+        self.assertEqual(rows["learn"]["skipped"], 1)
+        self.assertEqual(rows["learn"]["skip_reason"], "soft_token_limit")
+        self.assertEqual(rows["embed"]["tokens_in"], 40)
+
+    def test_budget_blocked_extraction_keeps_timeline(self):
+        """硬限额下抽取被跳过：时间线不标记已总结，也没有新事实。"""
+        from savagetype.service import SavageTypeService
+
+        self.store.add_timeline(
+            {
+                "ts": now_ts(), "speaker_id": "u1", "speaker_name": "阿U", "bot_id": "b",
+                "window_tag": "w1", "role": "user", "content": "我喜欢喝美式",
+                "fingerprint": "budget-1",
+            }
+        )
+        service = SavageTypeService(
+            store=self.store,
+            config={"daily_token_limit": 1, "extract_enabled": True, "event_enabled": False},
+            llm_generate=lambda *_a, **_k: "",
+            get_provider=lambda *_a, **_k: None,
+            logger=None,
+        )
+        service.apply_config()
+        self.store.add_usage("llm", "p", True, tokens_in=10)
+        result = asyncio.run(service.maybe_extract(force=True))
+        self.assertTrue(result.get("skipped"))
+        self.assertEqual(result.get("reason"), "budget")
+        self.assertEqual(self.store.counts()["unsummarized"], 1, "消息必须留着重试")
+        self.assertEqual(self.store.counts()["facts_live"], 0)
+        rows = {row["task"]: row for row in self.store.usage_by_task_today()}
+        self.assertGreaterEqual(rows.get("normalize", {}).get("skipped", 0), 1)
+
+    def test_tokens_status_shape(self):
+        from savagetype.service import SavageTypeService
+
+        service = SavageTypeService(
+            store=self.store,
+            config={"soft_token_limit": 500, "daily_token_limit": 1000},
+            llm_generate=lambda *_a, **_k: "",
+            get_provider=lambda *_a, **_k: None,
+            logger=None,
+        )
+        service.apply_config()
+        status = service.tokens_status()
+        self.assertEqual(status["hard_limit"], 1000)
+        self.assertEqual(status["soft_limit"], 500)
+        self.assertIn("by_task", status)
+        self.assertEqual(service.overview()["tokens"]["hard_limit"], 1000)
 
 
 if __name__ == "__main__":

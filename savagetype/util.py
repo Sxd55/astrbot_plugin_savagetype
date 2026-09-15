@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import time
+from datetime import datetime
 from typing import Any
 
 PLUGIN_NAME = "astrbot_plugin_savagetype"
@@ -57,7 +58,10 @@ TIME_WINDOW_RE = re.compile(
     r"(昨天|前天|上周|上个月|最近一周|这周|那天|上次|刚才|刚刚|今天早|今晚)",
 )
 RECALL_RE = re.compile(
-    r"(还记得|你记得|记不记得|你不是说|你说过|我跟你说过|改口)",
+    r"(还记得|你记得|记不记得|你不是说|你说过|我跟你说过|改口)"
+)
+HISTORY_RE = re.compile(
+    r"(以前|之前|原来|过去|当时|那时候|那时|从前|曾经|当年|那年|改口前|原来叫|以前叫)"
 )
 CORRECTION_RE = re.compile(
     r"(不是|改口|纠正|以后叫|以后请|其实是|记错|说错|不要再说|别再记)",
@@ -76,11 +80,17 @@ DIRECTIVE_RE = re.compile(
     r"主人喜欢|主人不喜欢|主人讨厌)"
 )
 
+_PREF_SUBJ = r"(?:我|俺|咱|主人)?"
+_PREF_ADV = r"(?:其实|平时|一般|通常|最近|现在|一直|以前|原来|真的|也|就|更|又|还)?"
+_PREF_DEG = r"(?:很|最|超|挺|特别|尤其|真的)?"
 PREF_PATTERNS = [
-    (re.compile(r"(?:我|俺|咱|主人)?(?:其实)?(?:现在)?(?:不|没|不再)喜欢(?:听|喝|吃)?(.+?)(?:[，。！!？?\s]|$)"), "likes"),
+    (re.compile(rf"{_PREF_SUBJ}{_PREF_ADV}{_PREF_DEG}(?:不|没|不再)(?:太|怎么|是很)?喜欢(?:听|喝|吃|看|玩)?(.+?)(?:[，。！!？?\s]|$)"), "likes"),
     # 主语可选：AI 整理出的 plain 常写「喜欢 X」不带主语；无主语时靠「句首/标点后」守卫防转述。
-    (re.compile(r"(?:我|俺|咱|主人)?(?:其实)?(?:很|最|超)?喜欢(?:听|喝|吃)?(.+?)(?:[，。！!？?\s]|$)"), "likes"),
-    (re.compile(r"(?:我|俺|咱|主人)?(?:讨厌|受不了)(.+?)(?:[，。！!？?\s]|$)"), "dislikes"),
+    (re.compile(rf"{_PREF_SUBJ}{_PREF_ADV}{_PREF_DEG}喜欢(?:听|喝|吃|看|玩)?(.+?)(?:[，。！!？?\s]|$)"), "likes"),
+    (re.compile(rf"{_PREF_SUBJ}{_PREF_ADV}(?:迷上|入坑|上瘾)(?:了)?(?:听|喝|吃|玩|看)?(.+?)(?:[，。！!？?\s]|$)"), "likes"),
+    (re.compile(rf"{_PREF_SUBJ}{_PREF_ADV}{_PREF_DEG}爱(?:听|喝|吃|看|玩)(.+?)(?:[，。！!？?\s]|$)"), "likes"),
+    (re.compile(rf"{_PREF_SUBJ}{_PREF_ADV}{_PREF_DEG}(?:不(?:太|怎么)?|没)(?:吃|喝|看|玩|碰)(.+?)(?:[，。！!？?\s]|$)"), "likes"),
+    (re.compile(rf"{_PREF_SUBJ}{_PREF_ADV}{_PREF_DEG}(?:讨厌|受不了)(.+?)(?:[，。！!？?\s]|$)"), "dislikes"),
     (re.compile(r"(?:我|俺|咱|主人)叫(.+?)(?:[，。！!？?\s]|$)"), "name"),
     (re.compile(r"(?:请)?(?:叫我|称呼我)(.+?)(?:[，。！!？?\s]|$)"), "name"),
     (re.compile(r"(?:我|俺|咱|主人)(?:是|住在|在)(.+?)(?:人|[，。！!？?\s]|$)"), "identity"),
@@ -89,6 +99,30 @@ PREF_PATTERNS = [
 ]
 CLOSE_RE = re.compile(r"(做完了|完成了|已经寄了|已经办了|不用记了|算了当我没说|取消约定)")
 STATUS_NOW_RE = re.compile(r"(加班|熬夜|感冒|发烧|失眠|出差|请假)")
+
+# 第一人称「自述」候选门。旧写法要求「我」和谓语字面相连（我喜欢 / 我不喜欢），
+# 「我平时喜欢喝…」「我其实不喜欢…」「我最近迷上了…」这类最自然的说法全部进不了候选，
+# LLM 根本看不到。这里允许主语和谓语之间夹副词，并补齐 爱/迷上/入坑/上瘾 等谓词。
+SELF_SUBJECT_PAT = r"(?:我|俺|咱|本人|主人)"
+SELF_ADVERB_PAT = (
+    r"(?:其实|平时|一般|通常|最近|现在|一直|以前|原来|真的|特别|尤其|最|很|超|挺|也|就|更|又|还)*"
+)
+PREF_VERB_PAT = (
+    r"(?:不(?:太|怎么|是很)?喜欢|不爱|受不了|喜欢|爱喝|爱吃|爱看|爱玩|爱听|爱|讨厌|迷上|入坑|上瘾|习惯|偏好|常吃|常喝|常去|"
+    r"不(?:太|怎么)?(?:吃|喝|看|玩|碰))"
+)
+SELF_PREF_RE = re.compile(rf"{SELF_SUBJECT_PAT}{SELF_ADVERB_PAT}{PREF_VERB_PAT}")
+# 「我(家)的 X 叫 Y」这类自家称呼（宠物名、物件名）；排除「我叫什么」这类疑问。
+SELF_POSSESSIVE_NAME_RE = re.compile(
+    rf"{SELF_SUBJECT_PAT}(?:家|的)[^，。！!？?\s]{{0,6}}叫(?!什么|啥|名字)"
+)
+# 身份/居住/养宠：我是…、我叫…、我住在…、我养了…（同样允许夹副词）。
+SELF_IDENTITY_RE = re.compile(
+    rf"{SELF_SUBJECT_PAT}{SELF_ADVERB_PAT}(?:是|住(?:在)?|养了|养着|吃素|叫(?!什么|啥|名字))"
+)
+SELF_STATEMENT_RE = re.compile(
+    f"(?:{SELF_PREF_RE.pattern}|{SELF_POSSESSIVE_NAME_RE.pattern}|{SELF_IDENTITY_RE.pattern})"
+)
 
 OWNER_DIRECTIVE_RE = re.compile(
     r"(记住|记一下|记下来|别忘了|帮我记|以后|从现在起|从今以后|不要|别再|别忘|必须|禁止|叫你|称呼我|改口|"
@@ -108,6 +142,123 @@ BOT_DEFINE_RE = re.compile(
 
 def now_ts() -> int:
     return int(time.time())
+
+
+def fmt_ts(ts: int) -> str:
+    try:
+        return time.strftime("%m-%d %H:%M", time.localtime(int(ts or 0)))
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def today_str(now: int | None = None) -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(int(now or time.time())))
+
+
+def today_start_ts(now: int | None = None) -> int:
+    current = datetime.fromtimestamp(int(now or time.time()))
+    return int(current.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+
+def fmt_date(ts: int) -> str:
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(int(ts or 0)))
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+TIME_WINDOW_CUTOFFS: tuple[tuple[re.Pattern[str], int], ...] = (
+    (re.compile(r"(刚才|刚刚|今天早|今晚|今天)"), 1),
+    (re.compile(r"昨天"), 2),
+    (re.compile(r"前天"), 3),
+    (re.compile(r"(这周|本周|最近)"), 7),
+    (re.compile(r"(上周|上星期)"), 14),
+    (re.compile(r"上个月"), 40),
+)
+
+
+def time_window_days(query: str) -> int:
+    """Days back implied by a time phrase; 0 = no restriction."""
+    text = query or ""
+    for pattern, days in TIME_WINDOW_CUTOFFS:
+        if pattern.search(text):
+            return days
+    return 0
+
+
+def session_isolation(value: str) -> str:
+    mode = (value or "").strip().lower()
+    return mode if mode in {"off", "owner", "strict"} else "strict"
+
+
+_RE_YM = re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月")
+_RE_YEAR = re.compile(r"(?<![\d\-])(\d{4})\s*年(?!\s*\d)")
+_RE_LAST_YM = re.compile(r"去年\s*(\d{1,2})\s*月")
+_RE_THIS_YM = re.compile(r"(?:今年|本年)\s*(\d{1,2})\s*月")
+_RE_MONTH = re.compile(r"(?<![\d年\-])(\d{1,2})\s*月")
+_RE_RECENT = re.compile(r"最近\s*(\d+)\s*(天|周|个?月|年)")
+_RECENT_UNIT_DAYS = {"天": 1, "周": 7, "月": 30, "个月": 30, "年": 365}
+
+
+def _month_range(year: int, month: int) -> tuple[int, int]:
+    start = datetime(year, month, 1)
+    end = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
+    return int(start.timestamp()), int(end.timestamp())
+
+
+def _year_range(year: int) -> tuple[int, int]:
+    return _month_range(year, 1)[0], _month_range(year, 12)[1]
+
+
+def parse_time_range(query: str, now: int | None = None) -> tuple[int, int, str]:
+    """Resolve a time phrase to (start_ts, end_ts, label); (0, 0, "") when none.
+
+    Deterministic on purpose: the router and history retrieval share it.
+    """
+    text = query or ""
+    current = int(now or time.time())
+    dt = datetime.fromtimestamp(current)
+
+    match = _RE_YM.search(text)
+    if match and 1 <= int(match.group(2)) <= 12:
+        year, month = int(match.group(1)), int(match.group(2))
+        return (*_month_range(year, month), f"{year}-{month:02d}")
+    match = _RE_YEAR.search(text)
+    if match:
+        return (*_year_range(int(match.group(1))), match.group(1))
+    match = _RE_LAST_YM.search(text)
+    if match and 1 <= int(match.group(1)) <= 12:
+        year, month = dt.year - 1, int(match.group(1))
+        return (*_month_range(year, month), f"{year}-{month:02d}")
+    match = _RE_THIS_YM.search(text)
+    if match and 1 <= int(match.group(1)) <= 12:
+        year, month = dt.year, int(match.group(1))
+        return (*_month_range(year, month), f"{year}-{month:02d}")
+    if "前年" in text:
+        return (*_year_range(dt.year - 2), str(dt.year - 2))
+    if "去年" in text:
+        return (*_year_range(dt.year - 1), str(dt.year - 1))
+    if "今年" in text or "本年" in text:
+        return (*_year_range(dt.year), str(dt.year))
+    if "上个月" in text or "上月" in text:
+        year, month = (dt.year - 1, 12) if dt.month == 1 else (dt.year, dt.month - 1)
+        return (*_month_range(year, month), f"{year}-{month:02d}")
+    if "这个月" in text or "本月" in text:
+        return (*_month_range(dt.year, dt.month), f"{dt.year}-{dt.month:02d}")
+    match = _RE_RECENT.search(text)
+    if match:
+        count = max(1, int(match.group(1)))
+        unit = match.group(2)
+        days = _RECENT_UNIT_DAYS.get(unit, 1)
+        return current - count * days * 86400, current, f"最近{count}{unit}"
+    match = _RE_MONTH.search(text)
+    if match and 1 <= int(match.group(1)) <= 12:
+        month = int(match.group(1))
+        year = dt.year if month <= dt.month else dt.year - 1
+        return (*_month_range(year, month), f"{year}-{month:02d}")
+    if HISTORY_RE.search(text):
+        return 0, current, "当时"
+    return 0, 0, ""
 
 
 def default_importance(payload: dict[str, Any]) -> float:
@@ -301,7 +452,8 @@ def make_slot_key(
     attr = canonical_attribute(attribute)
     subj = canonical_subject(subject, speaker_id=speaker_id)
     key = f"{persona_id or ''}|{speaker_id or ''}|{normalize_slot(subj)}|{attr}"
-    if attr in {"likes", "dislikes"}:
+    if attr in {"likes", "dislikes", "promise", "habit"}:
+        # 约定和习惯也按主题分槽：答应带饭 / 答应交作业、早起 / 戒烟 都要能并存。
         topic = topic_key(value)
         if topic:
             key = f"{key}|{topic}"

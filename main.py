@@ -20,13 +20,31 @@ try:
     from .savagetype.service import SavageTypeService
     from .savagetype.slots import apply_slot
     from .savagetype.store import Store
-    from .savagetype.util import PLUGIN_NAME, clip, fact_weight, make_slot_key, now_ts, parse_csv
+    from .savagetype.util import (
+        PLUGIN_NAME,
+        clip,
+        estimate_tokens,
+        fact_weight,
+        fmt_ts,
+        make_slot_key,
+        now_ts,
+        parse_csv,
+    )
 except ImportError:
     from savagetype import __version__ as PLUGIN_VERSION
     from savagetype.service import SavageTypeService
     from savagetype.slots import apply_slot
     from savagetype.store import Store
-    from savagetype.util import PLUGIN_NAME, clip, fact_weight, make_slot_key, now_ts, parse_csv
+    from savagetype.util import (
+        PLUGIN_NAME,
+        clip,
+        estimate_tokens,
+        fact_weight,
+        fmt_ts,
+        make_slot_key,
+        now_ts,
+        parse_csv,
+    )
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "_conf_schema.json"
 
@@ -47,7 +65,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "4.1.0",
+    "4.4.1",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -124,6 +142,13 @@ class SavageTypePlugin(Star):
             ("chat/import", self.page_chat_import, ["POST"], "Import chat transcript"),
             ("microscope", self.page_microscope, ["GET"], "Recent injection snapshots"),
             ("facts/archive", self.page_facts_archive, ["POST"], "Archive facts"),
+            ("events", self.page_events, ["GET"], "List events"),
+            ("events/update", self.page_event_update, ["POST"], "Edit one event"),
+            ("events/pin", self.page_event_pin, ["POST"], "Pin or unpin an event"),
+            ("events/archive", self.page_events_archive, ["POST"], "Archive events"),
+            ("events/restore", self.page_events_restore, ["POST"], "Restore events"),
+            ("events/evidence", self.page_event_evidence, ["GET"], "Event source messages"),
+            ("entities", self.page_entities, ["GET"], "Entity links for one ref"),
             ("config", self.page_config_get, ["GET"], "Plugin config and schema"),
             ("config/save", self.page_config_save, ["POST"], "Save plugin config"),
             ("dossiers", self.page_dossiers, ["GET"], "List QQ dossiers"),
@@ -219,6 +244,7 @@ class SavageTypePlugin(Star):
                     query,
                     ident["speaker_id"],
                     persona_id=persona_id,
+                    window_tag=ident.get("window_tag") or "",
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Savage Type warm retrieval skipped: %s", exc)
@@ -301,15 +327,21 @@ class SavageTypePlugin(Star):
         ov = self.service.overview()
         c = ov["counts"]
         co = ov["coexistence"]
+        tk = ov.get("tokens") or {}
+        hard = tk.get("hard_limit") or "不限"
+        soft = tk.get("soft_limit") or "不限"
+        skipped = sum(int(row.get("skipped") or 0) for row in (tk.get("by_task") or []))
         skip = ov["config"].get("capture_skip") or {}
         skip_line = f"{skip.get('reason')}（{skip.get('platform') or '?'}）" if skip else "无"
         yield event.plain_result(
             f"Savage Type 状态 v{PLUGIN_VERSION}\n"
             f"时间线 {c['timeline']} / 未总结 {c['unsummarized']}\n"
             f"live {c['facts_live']} / superseded {c['facts_superseded']} / 覆盖待确认 {c['pending']}\n"
+            f"事件 {c.get('events', 0)} / 事件待审 {c.get('events_needs_review', 0)}\n"
             f"主人记忆 {c.get('owner_facts', 0)} / 档案 {c.get('profiles', 0)} / 待审记忆 {c.get('memory_pending', 0)}\n"
             f"学习待审 {c.get('reviews_pending', 0)} / 黑话 {c.get('jargon_approved', 0)} / few-shot {c.get('fewshot_approved', 0)}\n"
             f"采集 {'开' if ov['config']['capture'] else '关'} 注入 {'开' if ov['config']['inject'] else '关'}\n"
+            f"今日Token {tk.get('used', 0)}（硬限 {hard} / 软限 {soft} / 预算跳过 {skipped} 次）\n"
             f"本会话平台 {self.service.event_platform(event) or '未知'}\n"
             f"允许平台 {', '.join(ov['config'].get('platforms') or []) or '不限'}\n"
             f"上次采集跳过 {skip_line}\n"
@@ -355,7 +387,12 @@ class SavageTypePlugin(Star):
         ):
             yield event.plain_result("查看别人的档案需要管理员权限。")
             return
-        card = self.service.dossier_for(sid, persona_id=ident.get("persona_id") or "")
+        card = self.service.dossier_for(
+            sid,
+            persona_id=ident.get("persona_id") or "",
+            window_tag=ident.get("window_tag") or "",
+            isolation=self.service.session_isolation_mode(),
+        )
         if not card.get("card"):
             yield event.plain_result(f"{sid} 还没有短档案（需要至少一条 live 事实）。")
             return
@@ -373,6 +410,7 @@ class SavageTypePlugin(Star):
             keyword,
             ident["speaker_id"],
             persona_id=ident.get("persona_id") or "",
+            window_tag=ident.get("window_tag") or "",
         )
         lines = [
             f"route={result.route} path={result.path} cache={result.cache}",
@@ -406,6 +444,50 @@ class SavageTypePlugin(Star):
             yield event.plain_result("时间线为空。")
             return
         lines = [f"{r.id} {r.role} {clip(r.content, 60)}" for r in rows]
+        yield event.plain_result("\n".join(lines))
+
+    @stype.command("events")
+    async def cmd_events(self, event: AstrMessageEvent, n: int = 5):
+        """最近事件（整件事记忆）"""
+        ident = await self._ident(event)
+        window = ident.get("window_tag") or ""
+        events = self.store.live_events(
+            limit=max(1, min(int(n or 5), 20)),
+            window_tag=window or None,
+            persona_id=ident.get("persona_id") or "",
+        )
+        if not events:
+            yield event.plain_result("还没有事件记忆。聊一段后会自动整理；也可以 /stype extract 手动触发。")
+            return
+        lines = []
+        for item in events:
+            when = fmt_ts(item.start_ts)
+            flag = "（待审）" if item.review_status == "needs_review" else ""
+            lines.append(f"{item.id} {when} 【{item.title}】{item.summary}{flag}")
+        yield event.plain_result("\n".join(lines))
+
+    @stype.command("history")
+    async def cmd_history(self, event: AstrMessageEvent):
+        """看某段时间的状态：/stype history 去年12月 或者 /stype history 以前喜欢什么"""
+        keyword = self._rest_after(event, "history").strip()
+        ident = await self._ident(event)
+        result = await self.service.retrieve_for(
+            keyword or "以前",
+            ident["speaker_id"],
+            persona_id=ident.get("persona_id") or "",
+            window_tag=ident.get("window_tag") or "",
+        )
+        lines = [f"路线 {result.route}" + (f"｜范围 {result.history_label}" if result.history_label else "")]
+        for fact in result.history[:8]:
+            current = (result.history_current or {}).get(fact.id, "")
+            line = f"{fact.id} [{fmt_ts(fact.created_at)}~{fmt_ts(fact.updated_at)}] {fact.plain or fact.value}"
+            if current:
+                line += f"（现在：{current}）"
+            lines.append(line)
+        for item in result.events[:3]:
+            lines.append(f"事件 {item.id} [{fmt_ts(item.start_ts)}] 【{item.title}】{item.summary}")
+        if len(lines) == 1:
+            lines.append("没有找到那段时间的记忆。换一个时间说法，或先让插件多整理几轮。")
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -583,12 +665,16 @@ class SavageTypePlugin(Star):
             query,
             ident["speaker_id"],
             persona_id=ident.get("persona_id") or "",
+            window_tag=ident.get("window_tag") or "",
         )
         facts = result.core + result.related + result.uncertain
-        if not facts:
-            return "没有找到直接相关的 live 事实。"
-        lines = [f"{f.id}: {clip(f.content, 80)}" for f in facts[:8]]
-        return "相关事实：\n" + "\n".join(lines)
+        events = list(getattr(result, "events", None) or [])
+        if not facts and not events:
+            return "没有找到直接相关的 live 事实或事件。"
+        lines = [f"事实 {f.id}: {clip(f.content, 80)}" for f in facts[:8]]
+        for item in events[:3]:
+            lines.append(f"事件 {item.id}: [{item.title}] {clip(item.summary, 120)}")
+        return "相关记忆：\n" + "\n".join(lines)
 
     @filter.llm_tool(name="savagetype_remember")
     async def tool_remember(self, event: AstrMessageEvent, content: str) -> str:
@@ -619,6 +705,7 @@ class SavageTypePlugin(Star):
             speaker_id=ident["speaker_id"],
             persona_id=ident.get("persona_id") or "",
             fact_id=int(fact_id or 0),
+            window_tag=ident.get("window_tag") or "",
         )
         lines = []
         for step in result.get("steps") or []:
@@ -731,13 +818,28 @@ class SavageTypePlugin(Star):
         if not callable(call):
             note("image_caption_fail", {"error": "provider_has_no_text_chat"})
             return ""
-        result = call(prompt="用一句中文客观描述这张图片，不要推测。", image_urls=urls)
+        prompt = "用一句中文客观描述这张图片，不要推测。"
+        decision = self.service.llm_guard().check("image", prompt)
+        if not decision.allowed:
+            self.store.add_usage(
+                "llm", provider_id, ok=False, task="image",
+                source="explicit:image_caption_provider_id", reason=decision.reason,
+            )
+            note("image_caption_skip", {"reason": decision.reason})
+            return ""
+        result = call(prompt=prompt, image_urls=urls)
         if asyncio.iscoroutine(result):
             result = await asyncio.wait_for(result, timeout=timeout)
         text = getattr(result, "completion_text", "") or ""
         text = str(text).strip()
         if text:
             note("image_caption_ok", {"field": used, "chars": len(text)})
+            self.store.add_usage(
+                "llm", provider_id, True, len(prompt), len(text),
+                tokens_in=estimate_tokens(prompt),
+                tokens_out=estimate_tokens(text),
+                task="image", source="explicit:image_caption_provider_id",
+            )
         else:
             note("image_caption_fail", {"error": "empty_response"})
         return text
@@ -1451,6 +1553,167 @@ class SavageTypePlugin(Star):
             ids = [ids]
         return json_response(self.store.archive_facts(ids, reason="ui_delete"))
 
+    def _event_view(self, e) -> dict:
+        return {
+            "id": e.id,
+            "kind": e.kind,
+            "title": e.title,
+            "summary": e.summary,
+            "highlights": e.highlights or [],
+            "keywords": e.keywords or [],
+            "participants": e.participants or [],
+            "speaker_id": e.speaker_id,
+            "speaker_name": e.speaker_name,
+            "scope": e.scope,
+            "persona_id": e.persona_id,
+            "window_tag": e.window_tag,
+            "status": e.status,
+            "review_status": e.review_status,
+            "importance": round(float(e.importance or 0), 3),
+            "weight": self._fact_weight(e),
+            "confidence": e.confidence,
+            "pinned": int(e.pinned or 0),
+            "access_count": int(e.access_count or 0),
+            "start_ts": int(e.start_ts or 0),
+            "end_ts": int(e.end_ts or 0),
+            "evidence": list(e.evidence or []),
+            "reason": e.reason,
+            "edited_at": int(e.edited_at or 0),
+            "created_at": int(e.created_at or 0),
+            "updated_at": int(e.updated_at or 0),
+        }
+
+    async def page_events(self):
+        status = request.query.get("status", "live") or "live"
+        pinned_only = str(request.query.get("pinned", "") or "").lower() in {"1", "true", "yes"}
+        keyword = str(request.query.get("q", "") or "").strip().lower()
+        if status == "pinned":
+            items = [
+                e for e in self.store.events_for_review("live", limit=200)
+                if int(e.pinned or 0)
+            ]
+        else:
+            items = self.store.events_for_review(status, limit=200)
+        if pinned_only:
+            items = [e for e in items if int(e.pinned or 0)]
+        if keyword:
+            items = [
+                e
+                for e in items
+                if keyword in (e.title or "").lower()
+                or keyword in (e.summary or "").lower()
+                or any(keyword in str(k).lower() for k in (e.keywords or []))
+            ]
+        return json_response({"items": [self._event_view(e) for e in items[:120]]})
+
+    async def page_event_update(self):
+        payload = await request.json(default={})
+        event_id = int(payload.get("id") or 0)
+        if not event_id:
+            return error_response("missing id", status_code=400)
+        event = self.store.get_event(event_id)
+        if event is None:
+            return error_response("event not found", status_code=404)
+        fields: dict = {}
+        if "title" in payload:
+            title = str(payload.get("title") or "").strip()
+            if not title:
+                return error_response("title required", status_code=400)
+            fields["title"] = clip(title, 60)
+        if "summary" in payload:
+            fields["summary"] = clip(str(payload.get("summary") or ""), 400)
+        if "highlights" in payload:
+            raw = payload.get("highlights")
+            if isinstance(raw, str):
+                raw = [line.strip() for line in raw.splitlines() if line.strip()]
+            fields["highlights"] = [clip(str(x), 40) for x in (raw or [])][:4]
+        if "keywords" in payload:
+            raw = payload.get("keywords")
+            if isinstance(raw, str):
+                raw = [x.strip() for x in re.split(r"[,，、\s]+", raw) if x.strip()]
+            fields["keywords"] = [clip(str(x), 16) for x in (raw or [])][:6]
+        if "importance" in payload:
+            try:
+                importance = float(payload.get("importance"))
+            except (TypeError, ValueError):
+                return error_response("bad importance", status_code=400)
+            fields["importance"] = max(0.0, min(1.0, importance))
+        if "status" in payload:
+            new_status = str(payload.get("status") or "").strip()
+            if new_status not in {"live", "archived"}:
+                return error_response("bad status", status_code=400)
+            fields["status"] = new_status
+        if str(payload.get("approve", "")).lower() in {"1", "true", "yes"}:
+            fields["review_status"] = "manual"
+            fields["confidence"] = max(float(event.confidence or 0), 0.8)
+            fields["status"] = "live"
+        if fields:
+            fields["edited_at"] = now_ts()
+            fields["edited_by"] = "ui"
+            self.store.update_event(event_id, **fields)
+        return json_response({"ok": True, "event": self._event_view(self.store.get_event(event_id))})
+
+    async def page_event_pin(self):
+        payload = await request.json(default={})
+        event_id = int(payload.get("id") or 0)
+        if not event_id:
+            return error_response("missing id", status_code=400)
+        raw_pinned = payload.get("pinned", True)
+        if isinstance(raw_pinned, str):
+            pinned = raw_pinned.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            pinned = bool(raw_pinned)
+        if not self.store.set_event_pinned(event_id, pinned):
+            return error_response("event not found", status_code=404)
+        return json_response({"ok": True, "id": event_id, "pinned": int(pinned)})
+
+    async def page_events_archive(self):
+        payload = await request.json(default={})
+        ids = payload.get("ids") or payload.get("id")
+        if ids is None:
+            return error_response("missing ids", status_code=400)
+        if not isinstance(ids, list):
+            ids = [ids]
+        return json_response(self.store.archive_events(ids, reason="ui_delete"))
+
+    async def page_events_restore(self):
+        payload = await request.json(default={})
+        ids = payload.get("ids") or payload.get("id")
+        if ids is None:
+            return error_response("missing ids", status_code=400)
+        if not isinstance(ids, list):
+            ids = [ids]
+        return json_response(self.store.restore_events(ids))
+
+    async def page_event_evidence(self):
+        event_id = request.query.get("id", 0, type=int)
+        if not event_id:
+            return error_response("missing id", status_code=400)
+        event = self.store.get_event(event_id)
+        if event is None:
+            return error_response("event not found", status_code=404)
+        rows = self.store.timeline_by_ids(list(event.evidence or [])[:40])
+        items = [
+            {
+                "id": r.id,
+                "role": r.role,
+                "speaker": r.speaker_name or r.speaker_id,
+                "ts": r.ts,
+                "content": clip(r.content, 500),
+            }
+            for r in rows
+        ]
+        return json_response({"items": items})
+
+    async def page_entities(self):
+        ref = str(request.query.get("ref", "fact") or "fact")
+        ref_id = request.query.get("id", 0, type=int)
+        if not ref_id:
+            return error_response("missing id", status_code=400)
+        if ref not in {"fact", "event"}:
+            return error_response("bad ref", status_code=400)
+        return json_response({"items": self.store.entities_for_ref(ref, ref_id)})
+
     async def page_facts_restore(self):
         payload = await request.json(default={})
         ids = payload.get("ids") or payload.get("id")
@@ -1531,6 +1794,7 @@ class SavageTypePlugin(Star):
             "supersedes": f.supersedes,
             "created_at": int(getattr(f, "created_at", 0) or 0),
             "updated_at": f.updated_at,
+            "valid_to": int(f.updated_at) if f.status != "live" else 0,
             "reason": f.reason,
             "persona_id": getattr(f, "persona_id", ""),
             "slot_key": f.slot_key(),

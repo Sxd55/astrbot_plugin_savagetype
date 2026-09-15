@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable
 
 from .extract import Extractor
 from .contradiction import ContradictionEngine
+from .llm import LLMBudgetExceeded
 from .models import TimelineEvent
 from .store import Store
 from .util import (
@@ -29,6 +30,7 @@ from .util import (
     ROLE_USER,
     SCOPE_OWNER,
     SCOPE_PERSON,
+    SELF_STATEMENT_RE,
     STATUS_NOW_RE,
     clip,
     platform_of,
@@ -67,12 +69,12 @@ def candidate_reason(ev: TimelineEvent, is_owner: bool) -> str:
         and (DIRECTIVE_RE.search(text) or REMEMBER_RE.search(text) or CORRECTION_RE.search(text))
     )
     if is_owner:
-        if self_directive:
+        if self_directive or SELF_STATEMENT_RE.search(text):
             return "owner_self"
         if OWNER_DIRECTIVE_RE.search(text):
             return "owner_directive"
         return ""
-    if self_directive:
+    if self_directive or SELF_STATEMENT_RE.search(text):
         return "self"
     if STATUS_NOW_RE.search(text) and FIRST_PERSON_RE.search(text):
         return "status"
@@ -161,6 +163,15 @@ class MemoryPipeline:
         try:
             entries = await self.extractor.normalize_llm(candidates)
             entries = self.extractor.expand_split(entries)
+        except LLMBudgetExceeded:
+            # 预算闸：不标记已总结，等额度恢复后重试同一批消息。
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "budget",
+                "events": len(events),
+                "unsummarized": len(events),
+            }
         except Exception as exc:  # noqa: BLE001
             return await self._fallback(events, candidates, reason=f"normalize_error: {exc}", error=True)
 
@@ -175,7 +186,16 @@ class MemoryPipeline:
             rounds += 1
             if not entries:
                 break
-            verdicts = await self._verify(entries, by_id)
+            try:
+                verdicts = await self._verify(entries, by_id)
+            except LLMBudgetExceeded:
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "budget",
+                    "events": len(events),
+                    "unsummarized": len(events),
+                }
             failed: list[tuple[dict[str, Any], dict[str, Any]]] = []
             for index, entry in enumerate(entries):
                 key = int(entry.get("source_event_id") or 0)
@@ -206,6 +226,14 @@ class MemoryPipeline:
                 break
             try:
                 revised = await self._revise(failed, by_id)
+            except LLMBudgetExceeded:
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "budget",
+                    "events": len(events),
+                    "unsummarized": len(events),
+                }
             except Exception as exc:  # noqa: BLE001
                 self.store.add_diag("pipeline_revise_fail", {"error": str(exc)})
                 pending.extend(failed)

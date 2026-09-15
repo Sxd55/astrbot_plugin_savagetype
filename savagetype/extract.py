@@ -22,6 +22,7 @@ from .util import (
     ROLE_ASSISTANT,
     ROLE_BOT_ID,
     ROLE_USER,
+    SELF_STATEMENT_RE,
     STATUS_NOW_RE,
     clip,
     fingerprint,
@@ -55,6 +56,20 @@ write_op(create|update|close|ignore), ttl_seconds, topic
 候选消息：
 {events}
 """
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 class Extractor:
@@ -106,8 +121,13 @@ class Extractor:
                 raw_value = clip(match.group(1), 40)
                 if not raw_value:
                     continue
+                if attr == "status" and re.search(
+                    r"(迷上|入坑|上瘾|喜欢|爱喝|爱吃|爱看|爱玩|爱听|讨厌)", match.group(0)
+                ):
+                    # 「我最近迷上了爬山」是长期偏好，交给 likes，不写成 3 天有效的状态。
+                    continue
                 negated = attr == "likes" and bool(
-                    re.search(r"(不喜欢|没喜欢|现在不喜欢|不再喜欢)", match.group(0))
+                    re.search(r"(不(?:太|怎么|是很)?喜欢|没喜欢|现在不喜欢|不再喜欢)", match.group(0))
                 )
                 raw_clause = match.group(0).strip().rstrip("，。！!？?、；;：: \t")
                 values: list[str] = []
@@ -203,7 +223,12 @@ class Extractor:
                 continue
             if not (FIRST_PERSON_RE.search(text) or MASTER_RE.search(text)):
                 continue
-            if not (DIRECTIVE_RE.search(text) or REMEMBER_RE.search(text) or looks_correction(text)):
+            if not (
+                DIRECTIVE_RE.search(text)
+                or REMEMBER_RE.search(text)
+                or SELF_STATEMENT_RE.search(text)
+                or looks_correction(text)
+            ):
                 continue
             seen_values: set[tuple[str, str]] = set()
             for attr, value, clause in self._pref_hits(text):
@@ -274,7 +299,11 @@ class Extractor:
             raise ValueError("normalize output not a list")
         out: list[dict[str, Any]] = []
         for item in parsed:
-            payload = self._normalize_item(item, by_id)
+            try:
+                payload = self._normalize_item(item, by_id)
+            except Exception:  # noqa: BLE001
+                # 单条脏数据不拖死整批。
+                continue
             if payload is not None:
                 out.append(payload)
         return out
@@ -329,14 +358,14 @@ class Extractor:
             attribute=clip(attribute, 40),
             value=clip(value, 80),
             content=clip(ev.content or "", 160),
-            confidence=float(item.get("confidence") or 0.6),
+            confidence=_safe_float(item.get("confidence"), 0.6),
             extra={
-                "first_person": int(bool(item.get("first_person"))),
-                "explicit_correction": int(bool(item.get("explicit_correction"))),
+                "first_person": _safe_int(item.get("first_person"), 0),
+                "explicit_correction": _safe_int(item.get("explicit_correction"), 0),
                 "mention_policy": item.get("mention_policy") or "mention",
                 "source": "llm",
                 "write_op": op,
-                "ttl_seconds": int(item.get("ttl_seconds") or 0),
+                "ttl_seconds": _safe_int(item.get("ttl_seconds"), 0),
                 "plain": plain,
                 "keywords": keywords,
                 "topic": clip(str(item.get("topic") or ""), 20),
