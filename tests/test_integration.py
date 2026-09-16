@@ -271,6 +271,47 @@ class IntegrationTest(unittest.TestCase):
         asyncio.run(self.plugin.on_message(cmd))
         self.assertEqual(self.store.counts()["timeline"], 1)
 
+    def test_reply_gate_wakes_group_message(self):
+        self.plugin.config.update(
+            {
+                "reply_gate_enabled": True,
+                "reply_gate_mode": "probability",
+                "reply_gate_probability": 1.0,
+                "reply_gate_cooldown_seconds": 0,
+            }
+        )
+        self.service.apply_config()
+        event = make_event("在吗各位", sid="u2", group="1")
+        self.assertFalse(event.is_at_or_wake_command)
+        asyncio.run(self.plugin.reply_gate(event))
+        self.assertTrue(event.is_at_or_wake_command)
+        meta = event.get_extra("_stype_reply_gate")
+        self.assertTrue(meta and meta.get("fire") is True)
+        self.assertEqual(meta.get("mode"), "probability")
+
+    def test_reply_gate_off_by_default(self):
+        event = make_event("在吗各位", sid="u2", group="1")
+        asyncio.run(self.plugin.reply_gate(event))
+        self.assertFalse(event.is_at_or_wake_command)
+        self.assertIsNone(event.get_extra("_stype_reply_gate"))
+
+    def test_speak_request_owner_private(self):
+        from savagetype.util import ROLE_BOT_ID
+
+        self.plugin.config.update({"speak_enabled": True})
+        self.service.apply_config()
+        asyncio.run(self.plugin.on_message(make_event("群里说句话", sid="u2", group="1")))
+        event = make_event("去群里说：晚上八点开黑", sid="owner1", group="")
+        asyncio.run(self.plugin.on_message(event))
+        target_sends = [item for item in self.ctx.sent if item[0] == "aiocqhttp:GroupMessage:1"]
+        self.assertTrue(target_sends)
+        self.assertEqual(target_sends[-1][1], "晚上八点开黑")
+        self.assertTrue(event.is_stopped())
+        receipt = [item for item in self.ctx.sent if item[0] == event.unified_msg_origin]
+        self.assertTrue(receipt and "已发到群 1" in receipt[-1][1])
+        rows = self.store.timeline_recent(limit=5, speaker_id=ROLE_BOT_ID)
+        self.assertTrue(any("晚上八点开黑" in row.content for row in rows))
+
     def test_owner_reply_flow(self):
         rid = self.store.add_memory_review(
             scope="owner", speaker_id="owner1", speaker_name="主人",

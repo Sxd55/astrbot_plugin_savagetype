@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from .models import Fact
-from .util import SCOPE_OWNER, clip, now_ts
+from .util import SCOPE_OWNER, clip, is_private_window, now_ts
 
 SECTION_ORDER = ("name", "identity", "likes", "dislikes", "habit", "promise", "status", "note")
 SECTION_TITLES = {
@@ -78,11 +78,30 @@ def _collect(facts: list[Fact]) -> dict[str, list[str]]:
     return buckets
 
 
+def _window_visible(fact: Fact, window_tag: str, isolation: str) -> bool:
+    """strict 隔离时，私聊来源的事实在非私聊窗口不可见（群来源进私聊保持可见）。
+
+    window_tag 为空表示「不针对具体窗口」（面板 / 命令查看跨会话画像），不过滤。
+    """
+    mode = (isolation or "").strip().lower()
+    current = (window_tag or "").strip()
+    if mode in ("", "off") or not current:
+        return True
+    origin = str(getattr(fact, "window_tag", "") or "").strip()
+    if not origin:
+        return True  # 老数据没有来源窗口，保守放行
+    if mode == "strict" and is_private_window(origin) and not is_private_window(current):
+        return False
+    return True
+
+
 def build_profile_card(
     store,
     speaker_id: str,
     persona_id: str = "",
     max_chars: int = 300,
+    window_tag: str = "",
+    isolation: str = "",
 ) -> tuple[str, dict[str, Any]]:
     """组装当前说话人的跨会话画像卡。
 
@@ -97,6 +116,8 @@ def build_profile_card(
         speaker_ids=ids,
         limit=60,
     )
+    if window_tag and isolation:
+        facts = [fact for fact in facts if _window_visible(fact, window_tag, isolation)]
     is_owner = any(getattr(fact, "scope", "") == SCOPE_OWNER for fact in facts)
     name = ""
     for fact in facts:

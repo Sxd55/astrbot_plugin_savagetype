@@ -42,7 +42,7 @@ from savagetype.crosswin import (  # noqa: E402
 from savagetype.profile import build_profile_card  # noqa: E402
 from savagetype.slots import canonical_attribute, canonical_subject  # noqa: E402
 from savagetype.store import Store  # noqa: E402
-from savagetype.util import now_ts  # noqa: E402
+from savagetype.util import ROLE_ASSISTANT, ROLE_BOT_ID, now_ts  # noqa: E402
 
 
 def _payload(speaker="u1", subject="用户", attribute="likes", value="茶", content=None, **kw):
@@ -911,6 +911,7 @@ class FakeEvent:
         self._window = window
         self.role = role
         self.unified_msg_origin = window
+        self.message_str = message_text
         self.message_obj = SimpleNamespace(
             self_id=bot_id,
             sender=SimpleNamespace(user_id=sender),
@@ -2987,6 +2988,31 @@ class CrossSessionTest(unittest.TestCase):
         self.assertEqual(meta["name"], "鳄鱼")
         self.assertFalse(meta["is_owner"])
 
+    def test_profile_card_privacy_by_window(self):
+        """A 层画像卡也要遵守会话隔离：strict 下私聊事实不进群聊。"""
+        self._fact(attribute="note", value="养了两只猫", window_tag="default:FriendMessage:u1-1")
+        card, _meta = build_profile_card(
+            self.store,
+            "u1",
+            window_tag="aiocqhttp:GroupMessage:1",
+            isolation="strict",
+        )
+        self.assertNotIn("两只猫", card)
+        card2, _meta2 = build_profile_card(
+            self.store,
+            "u1",
+            window_tag="default:FriendMessage:u1-1",
+            isolation="strict",
+        )
+        self.assertIn("两只猫", card2)
+        card3, _meta3 = build_profile_card(
+            self.store,
+            "u1",
+            window_tag="aiocqhttp:GroupMessage:1",
+            isolation="off",
+        )
+        self.assertIn("两只猫", card3)
+
     def test_profile_card_owner_marked(self):
         self._fact(scope="owner", speaker_id="owner1", speaker_name="主人")
         card, meta = build_profile_card(self.store, "owner1")
@@ -3226,6 +3252,439 @@ class CrossSessionTest(unittest.TestCase):
         block, cross_meta = service.cross_window_for("u1", window_tag="aiocqhttp:FriendMessage:456")
         self.assertEqual(block, "")
         self.assertFalse(cross_meta["enabled"])
+
+
+class WindowFlowTest(unittest.TestCase):
+    """C 层窗口全流上下文：其他窗口的完整消息流注入。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "flow.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _msg(self, ts, window, text, speaker="u1", role="user", name="阿U", persona=""):
+        self.store.add_timeline(
+            {
+                "ts": ts,
+                "speaker_id": speaker,
+                "speaker_name": name,
+                "bot_id": "b",
+                "window_tag": window,
+                "role": role,
+                "content": text,
+                "persona_id": persona,
+                "fingerprint": f"{window}-{ts}-{speaker}-{text[:8]}",
+            }
+        )
+
+    def _bot(self, ts, window, text, persona=""):
+        self._msg(ts, window, text, speaker=ROLE_BOT_ID, role=ROLE_ASSISTANT, name="bot", persona=persona)
+
+    def _service(self, **config):
+        from savagetype.service import SavageTypeService
+
+        service = SavageTypeService(
+            store=self.store,
+            config=config,
+            llm_generate=lambda *_a, **_k: "",
+            get_provider=lambda *_a, **_k: None,
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, debug=lambda *a, **k: None),
+        )
+        service.apply_config()
+        return service
+
+    def test_flow_carries_group_members_and_bot(self):
+        from savagetype.windowflow import build_window_flow
+
+        now = now_ts()
+        self._msg(now - 300, "aiocqhttp:GroupMessage:123", "今晚八点开黑", speaker="u2", name="阿强")
+        self._bot(now - 280, "aiocqhttp:GroupMessage:123", "好，我定个闹钟")
+        self._msg(now - 100, "aiocqhttp:FriendMessage:456", "在吗", speaker="u1")
+        block, meta = build_window_flow(self.store, "aiocqhttp:FriendMessage:456")
+        self.assertIn("▸ 群 123", block)
+        self.assertIn("阿强", block)
+        self.assertIn("我(Bot)", block)
+        self.assertNotIn("在吗", block)
+        self.assertEqual(meta["windows"], 1)
+        self.assertGreaterEqual(meta["items"], 2)
+
+    def test_flow_direction_and_exclude(self):
+        from savagetype.windowflow import build_window_flow
+
+        now = now_ts()
+        self._msg(now - 100, "aiocqhttp:FriendMessage:456", "私聊内容", speaker="u1")
+        block, _meta = build_window_flow(self.store, "aiocqhttp:GroupMessage:123", private_to_group=False)
+        self.assertEqual(block, "")
+        block2, _meta2 = build_window_flow(self.store, "aiocqhttp:GroupMessage:123", private_to_group=True)
+        self.assertIn("私聊内容", block2)
+        block3, _meta3 = build_window_flow(
+            self.store,
+            "aiocqhttp:GroupMessage:123",
+            private_to_group=True,
+            exclude_private_users=["u1"],
+        )
+        self.assertEqual(block3, "")
+
+    def test_flow_budget_keeps_newest(self):
+        from savagetype.windowflow import build_window_flow
+
+        now = now_ts()
+        for index in range(30):
+            self._msg(now - 900 + index, "aiocqhttp:GroupMessage:1", f"第{index}条消息，内容写长一点", speaker="u2")
+        block, _meta = build_window_flow(self.store, "aiocqhttp:FriendMessage:9", max_items=6)
+        self.assertIn("第29条", block)
+        self.assertNotIn("第0条", block)
+
+    def test_flow_persona_isolation(self):
+        from savagetype.windowflow import build_window_flow
+
+        now = now_ts()
+        self._msg(now - 100, "aiocqhttp:GroupMessage:1", "别的性格说的话", speaker="u2", persona="p-other")
+        block, meta = build_window_flow(self.store, "aiocqhttp:FriendMessage:9", persona_id="p1")
+        self.assertEqual(block, "")
+        self.assertEqual(meta["items"], 0)
+
+    def test_flow_for_keyword_gate(self):
+        service = self._service(window_flow_enabled=True, window_flow_keywords="群里,群友")
+        now = now_ts()
+        self._msg(now - 60, "aiocqhttp:GroupMessage:1", "群里在聊新插件", speaker="u2", name="阿强")
+        block, meta = service.window_flow_for("你好", window_tag="aiocqhttp:FriendMessage:9")
+        self.assertEqual(block, "")
+        self.assertEqual(meta.get("skipped"), "no_keyword")
+        block2, meta2 = service.window_flow_for("群里什么情况", window_tag="aiocqhttp:FriendMessage:9")
+        self.assertIn("新插件", block2)
+        self.assertTrue(meta2["enabled"])
+        self.assertGreaterEqual(meta2["items"], 1)
+
+    def test_flow_for_always_and_disabled(self):
+        now = now_ts()
+        self._msg(now - 60, "aiocqhttp:GroupMessage:1", "随手一句", speaker="u2")
+        always = self._service(window_flow_enabled=True, window_flow_always=True)
+        block, _meta = always.window_flow_for("你好", window_tag="aiocqhttp:FriendMessage:9")
+        self.assertIn("随手一句", block)
+        off = self._service(window_flow_enabled=False, window_flow_always=True)
+        block2, meta2 = off.window_flow_for("你好", window_tag="aiocqhttp:FriendMessage:9")
+        self.assertEqual(block2, "")
+        self.assertFalse(meta2["enabled"])
+
+    def test_flow_chars_budget(self):
+        from savagetype.windowflow import build_window_flow
+
+        now = now_ts()
+        for index in range(40):
+            self._msg(now - 400 + index, "aiocqhttp:GroupMessage:1", f"消息{index}：" + "内容" * 30, speaker="u2")
+        block, _meta = build_window_flow(self.store, "aiocqhttp:FriendMessage:9", max_chars=600)
+        self.assertLessEqual(len(block), 700)
+        self.assertIn("消息39", block)
+
+
+class ReplyGateTest(unittest.TestCase):
+    """免@主动接话（reply gate）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "gate.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _service(self, **config):
+        from savagetype.service import SavageTypeService
+
+        service = SavageTypeService(
+            store=self.store,
+            config=config,
+            llm_generate=lambda *_a, **_k: "",
+            get_provider=lambda *_a, **_k: None,
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, debug=lambda *a, **k: None),
+        )
+        service.apply_config()
+        return service
+
+    def _event(self, text: str = "在吗各位", window: str = "aiocqhttp:GroupMessage:100", sender: str = "u2") -> FakeEvent:
+        return FakeEvent(sender=sender, window=window, message_text=text)
+
+    def test_evaluate_gates(self):
+        from savagetype.replygate import evaluate
+
+        base = dict(
+            enabled=True,
+            is_group=True,
+            already_handled=False,
+            is_self=False,
+            window_tag="aiocqhttp:GroupMessage:100",
+            targets=set(),
+            text="在吗各位",
+            min_chars=2,
+            skip_commands=True,
+            cooldown_ok=True,
+            daily_ok=True,
+            mode_hit=True,
+            mode_reason="probability",
+        )
+        fire, _reason = evaluate(**base)
+        self.assertTrue(fire)
+        for field, value, expected in (
+            ("enabled", False, "disabled"),
+            ("is_group", False, "not_group"),
+            ("already_handled", True, "already_handled"),
+            ("is_self", True, "bot_self"),
+            ("mode_hit", False, "probability_miss"),
+            ("cooldown_ok", False, "cooldown"),
+            ("daily_ok", False, "daily_limit"),
+        ):
+            payload = dict(base)
+            payload[field] = value
+            if field == "mode_hit":
+                payload["mode_reason"] = "probability_miss"
+            fire, reason = evaluate(**payload)
+            self.assertFalse(fire)
+            self.assertEqual(reason, expected)
+        payload = dict(base)
+        payload["text"] = "哈"
+        self.assertEqual(evaluate(**payload)[1], "too_short")
+        payload = dict(base)
+        payload["text"] = "/stype status"
+        self.assertEqual(evaluate(**payload)[1], "command")
+        payload = dict(base)
+        payload["targets"] = {"999"}
+        self.assertEqual(evaluate(**payload)[1], "group_not_allowed")
+
+    def test_probability_mode_and_cooldown(self):
+        service = self._service(
+            reply_gate_enabled=True,
+            reply_gate_mode="probability",
+            reply_gate_probability=1.0,
+            reply_gate_cooldown_seconds=3600,
+        )
+        fire, meta = asyncio.run(service.reply_gate_for(self._event()))
+        self.assertTrue(fire)
+        self.assertEqual(meta["mode"], "probability")
+        fire2, meta2 = asyncio.run(service.reply_gate_for(self._event("再来一句")))
+        self.assertFalse(fire2)
+        self.assertEqual(meta2["reason"], "cooldown")
+
+    def test_daily_limit_and_group_whitelist(self):
+        service = self._service(
+            reply_gate_enabled=True,
+            reply_gate_mode="probability",
+            reply_gate_probability=1.0,
+            reply_gate_cooldown_seconds=0,
+            reply_gate_daily_limit=1,
+        )
+        first, _meta = asyncio.run(service.reply_gate_for(self._event("第一句")))
+        self.assertTrue(first)
+        fire, meta = asyncio.run(service.reply_gate_for(self._event("第二句")))
+        self.assertFalse(fire)
+        self.assertEqual(meta["reason"], "daily_limit")
+
+        limited = self._service(
+            reply_gate_enabled=True,
+            reply_gate_mode="probability",
+            reply_gate_probability=1.0,
+            reply_gate_groups="12345",
+        )
+        fire2, meta2 = asyncio.run(limited.reply_gate_for(self._event()))
+        self.assertFalse(fire2)
+        self.assertEqual(meta2["reason"], "group_not_allowed")
+
+    def test_keyword_mode(self):
+        service = self._service(
+            reply_gate_enabled=True,
+            reply_gate_mode="keyword",
+            reply_gate_keywords="在吗,问个事",
+        )
+        fire, meta = asyncio.run(service.reply_gate_for(self._event("在吗，问个事")))
+        self.assertTrue(fire)
+        self.assertIn("keyword", meta["reason"])
+        fire2, _meta2 = asyncio.run(service.reply_gate_for(self._event("今天天气不错")))
+        self.assertFalse(fire2)
+
+    def test_memory_mode(self):
+        self.store.add_fact(
+            {
+                "subject": "self",
+                "attribute": "likes",
+                "value": "美式咖啡",
+                "content": "我喜欢美式咖啡",
+                "speaker_id": "u2",
+                "speaker_name": "阿U",
+                "status": "live",
+                "confidence": 0.9,
+                "first_person": 1,
+            }
+        )
+        service = self._service(reply_gate_enabled=True, reply_gate_mode="memory")
+        fire, meta = asyncio.run(service.reply_gate_for(self._event("美式咖啡还有吗")))
+        self.assertTrue(fire)
+        self.assertIn("memory", meta["reason"])
+        fire2, meta2 = asyncio.run(service.reply_gate_for(self._event("？？？")))
+        self.assertFalse(fire2)
+
+    def test_disabled_by_default(self):
+        service = self._service()
+        fire, meta = asyncio.run(service.reply_gate_for(self._event()))
+        self.assertFalse(fire)
+        self.assertFalse(meta["enabled"])
+
+
+class SpeakTest(unittest.TestCase):
+    """指派发言：私聊让 Bot 去群里说话。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "speak.db")
+        self.sends: list[tuple[str, str]] = []
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _service(self, **config):
+        from savagetype.service import SavageTypeService
+
+        async def fake_send(umo: str, text: str) -> None:
+            self.sends.append((umo, text))
+
+        service = SavageTypeService(
+            store=self.store,
+            config=config,
+            llm_generate=lambda *_a, **_k: "",
+            get_provider=lambda *_a, **_k: None,
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, debug=lambda *a, **k: None),
+            send_message=fake_send,
+        )
+        service.apply_config()
+        return service
+
+    def _msg(self, window: str, text: str = "群里说句话", speaker: str = "u2", ts: int | None = None):
+        self.store.add_timeline(
+            {
+                "ts": ts if ts is not None else now_ts(),
+                "speaker_id": speaker,
+                "speaker_name": "阿U",
+                "bot_id": "b",
+                "window_tag": window,
+                "role": "user",
+                "content": text,
+                "persona_id": "",
+                "fingerprint": f"{window}-{text}-{speaker}",
+            }
+        )
+
+    def _owner_event(self, text: str = "去群里说：晚上八点开黑") -> FakeEvent:
+        return FakeEvent(sender="owner1", window="aiocqhttp:FriendMessage:owner1", message_text=text)
+
+    # -- 纯函数 -----------------------------------------------------------
+
+    def test_parse_intent(self):
+        from savagetype.speak import parse_intent
+
+        cases = {
+            "去群里说：晚上八点开黑": ("default", "", "晚上八点开黑"),
+            "在群里说 明天休息": ("default", "", "明天休息"),
+            "跟群友说，我下课了": ("default", "", "我下课了"),
+            "去 2 群说：我到了": ("index", "2", "我到了"),
+            "去第3个群说 帮忙看下": ("index", "3", "帮忙看下"),
+            "去 987654321 群说：到家了": ("number", "987654321", "到家了"),
+            "帮我跟群友说 晚安": ("default", "", "晚安"),
+        }
+        for text, (kind, value, content) in cases.items():
+            intent = parse_intent(text)
+            self.assertIsNotNone(intent, text)
+            self.assertEqual(intent["target"], kind, text)
+            self.assertEqual(intent["value"], value, text)
+            self.assertEqual(intent["content"], content, text)
+        for text in ("今天天气不错", "去群里说", "群友说"):
+            self.assertIsNone(parse_intent(text), text)
+
+    def test_resolve_and_allow(self):
+        from savagetype.speak import allowed_target, resolve_index, resolve_number, resolve_target
+
+        groups = ["aiocqhttp:GroupMessage:111", "aiocqhttp:GroupMessage:222"]
+        self.assertEqual(resolve_index("1", groups), groups[0])
+        self.assertEqual(resolve_index("5", groups), "")
+        self.assertEqual(resolve_number("222", groups), groups[1])
+        self.assertEqual(
+            resolve_target({"target": "default", "value": ""}, default_umo=groups[0], groups=groups),
+            (groups[0], ""),
+        )
+        self.assertEqual(
+            resolve_target({"target": "default", "value": ""}, default_umo="", groups=[groups[0]]),
+            (groups[0], ""),
+        )
+        self.assertEqual(resolve_target({"target": "default", "value": ""}, default_umo="", groups=[])[1], "no_default_group")
+        self.assertEqual(resolve_target({"target": "number", "value": "999"}, default_umo="", groups=groups)[1], "group_not_found")
+        self.assertTrue(allowed_target(groups[1], default_umo=groups[0], allow=set()))
+        self.assertFalse(allowed_target(groups[1], default_umo=groups[0], allow={groups[0]}))
+        self.assertTrue(allowed_target(groups[1], default_umo=groups[0], allow={groups[1]}))
+
+    # -- 服务层 -----------------------------------------------------------
+
+    def test_handle_speak_sends_and_records(self):
+        self._msg("aiocqhttp:GroupMessage:111")
+        service = self._service(owner_qq="owner1", speak_enabled=True)
+        event = self._owner_event()
+        receipt = asyncio.run(service.handle_speak_request(event, "去群里说：晚上八点开黑"))
+        self.assertIn("已发到群 111", receipt or "")
+        self.assertEqual(self.sends, [("aiocqhttp:GroupMessage:111", "晚上八点开黑")])
+        rows = self.store.timeline_recent(limit=5, speaker_id=ROLE_BOT_ID)
+        self.assertTrue(any("晚上八点开黑" in row.content for row in rows))
+
+    def test_handle_speak_requires_owner_and_private(self):
+        self._msg("aiocqhttp:GroupMessage:111")
+        service = self._service(owner_qq="owner1", speak_enabled=True)
+        other = FakeEvent(sender="u9", window="aiocqhttp:FriendMessage:u9", message_text="去群里说：测试")
+        receipt = asyncio.run(service.handle_speak_request(other, "去群里说：测试"))
+        self.assertIn("只有主人", receipt or "")
+        self.assertEqual(self.sends, [])
+        group_event = FakeEvent(sender="owner1", window="aiocqhttp:GroupMessage:111", message_text="去群里说：测试")
+        self.assertIsNone(asyncio.run(service.handle_speak_request(group_event, "去群里说：测试")))
+
+    def test_handle_speak_rate_limit_and_whitelist(self):
+        self._msg("aiocqhttp:GroupMessage:111")
+        self._msg("aiocqhttp:GroupMessage:222", ts=now_ts() + 10)
+        service = self._service(
+            owner_qq="owner1",
+            speak_enabled=True,
+            speak_rate_limit_per_min=1,
+            speak_default_group="111",
+        )
+        event = self._owner_event()
+        first = asyncio.run(service.handle_speak_request(event, "去群里说：第一条"))
+        self.assertIn("已发到群", first or "")
+        second = asyncio.run(service.handle_speak_request(event, "去群里说：第二条"))
+        self.assertIn("太快了", second or "")
+        self.assertEqual(len(self.sends), 1)
+
+        limited = self._service(
+            owner_qq="owner1",
+            speak_enabled=True,
+            speak_default_group="111",
+            speak_groups="999999999",
+        )
+        blocked = asyncio.run(limited.handle_speak_request(event, "去 1 群说：越界"))
+        self.assertIn("不在允许名单", blocked or "")
+        self.assertEqual(len(self.sends), 1)
+
+    def test_set_speak_default(self):
+        self._msg("aiocqhttp:GroupMessage:111")
+        service = self._service(owner_qq="owner1", speak_enabled=True)
+        message = service.set_speak_default("1")
+        self.assertIn("默认群已设为 111", message)
+        self.assertEqual(service.speak_default_umo(), "aiocqhttp:GroupMessage:111")
+        self.assertIn("已清除", service.set_speak_default("clear"))
+        self.assertEqual(service.speak_default_umo(), "")
+
+    def test_speak_disabled_by_default(self):
+        self._msg("aiocqhttp:GroupMessage:111")
+        service = self._service(owner_qq="owner1")
+        self.assertIsNone(asyncio.run(service.handle_speak_request(self._owner_event(), "去群里说：测试")))
+        self.assertEqual(self.sends, [])
 
 
 if __name__ == "__main__":

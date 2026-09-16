@@ -2,7 +2,7 @@
 
 **Savage Type** 是面向 AstrBot 的全局人格记忆中枢。Savage 只是插件名：身份和语气永远读 AstrBot 当前人格，本插件只负责**记住事实、处理改口、在需要时把少量相关记忆注入本轮对话**。不改写人格文件，不做日程和主动陪伴。
 
-当前版本 `v4.5.0`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
+当前版本 `v4.8.0`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
 要求 AstrBot `>= 4.22.0`；运行依赖只有 `jieba`（可选，BM25 分词用，装不上自动回退）；离线测试只需 Python 3.11+ 标准库。
 
 ---
@@ -106,6 +106,11 @@
   - **warm**：约定 / 近况，只有话题相关（触发词或主题命中）才注入；
   - **cold**：本轮相关事实，按预算逐行装入。
 - **事件块**：`【事件】` 放在核心事实之前，按时间渲染 `[日期 · 标题] 摘要（谁讲的）`；预算 `event_budget_chars`（默认 300，0=不限），每轮最多 `event_max_inject`（默认 2）条。
+- **窗口全流（C 层，v4.6.0）**：把其他窗口（群聊 / 私聊）最近的**完整消息流**单独作为一段动态内容注入，含其他成员与 Bot 发言、带说话人与时间，解决「群里什么情况」这类问题——B 层只带本人发言的碎片，C 层带整段。默认**双向全通**（私聊 ↔ 群聊），回看 24 小时、最多 150 条 / 6000 字 / 3 个窗口；命中 `window_flow_keywords`（默认「群里 / 群友 / 私聊…」）时才注入，或把 `window_flow_always` 打开每次注入；`window_flow_exclude_private_users` 可屏蔽指定用户的私聊窗口，防止他人私聊内容流入群聊。预览：`/stype flow`。
+| `/stype groups` | 列出已知群与编号（指派发言选目标用） |
+| `/stype default <群号\|序号>` | 设置默认群（指派发言的默认目标；`clear` 清除） |
+- **免@主动接话（v4.7.0）**：群聊里没 @ 机器人时，插件按 `reply_gate_mode` 判定是否主动接话——probability 按概率、keyword 命中词表、memory 只在「这条消息命中了记忆（核心/相关事实/事件）」时才接；判定命中后把事件标记为已唤醒，走 AstrBot 默认 LLM 通路（人格 / 记忆注入 / 分段 / TTS 全部照旧）。另有同群冷却（`reply_gate_cooldown_seconds`）、每群每日上限（`reply_gate_daily_limit`）、群白名单（`reply_gate_groups`）、最小字数与跳过命令（`reply_gate_min_chars` / `reply_gate_skip_commands`）。建议与 AstrBot 内置「主动回复」（配置→扩展功能→群聊上下文感知）**二选一**，避免重复接话；判定过程记录在 `/stype diagnostics` 的 `reply_gate` 项。
+- **指派发言（v4.8.0）**：主人在私聊说「去群里说：晚上八点开黑」「跟群友说 明天休息」「去 2 群说：我下课了」「去 987654321 群说：到家了」，Bot 就会把这句发到目标群（默认群或指定群），并回执「已发到群 X」。目标群从插件见过的群窗口里解析（`/stype groups` 查看编号，`/stype default` 设默认群）；发言会计入目标群时间线（`speak_record_to_target`）保证记忆一致；另有每分钟限流、最大字数与群名单（`speak_groups`）约束。发送走 `context.send_message`，需要平台支持主动消息（QQ/NapCat 支持）。
 - **新颖度过滤**：用户当前消息里已经说到的事实（值 ≥2 字）不重复注入。
 - **跨轮去重**：同一会话刚注入过的事实，在 `inject_dedup_window_seconds`（默认 600 秒）内不重复；「还记得 / 上次」类问题豁免；去重记录落库，重载插件不丢。
 - **预算**：`inject_budget_chars`（默认 800，0=不限）；超预算时事实按行尽量塞，黑话 / few-shot / 草稿整块丢；只有真的进了包的事实才占去重名额。
@@ -163,7 +168,7 @@
 - **事件**：经历/聊过的事件列表（当前 / 待审 / 已归档 / 置顶筛选），看原文（这一段消息）、编辑标题/摘要/要点/重要度、确认写入、置顶、删除与恢复。
 - **人物档案**：搜索、点选查看，改昵称/备注，条目增删改、置顶。
 - **诊断**：注入显微镜（路由、命中、过滤原因、`chars≈tokens`）、聊天导入、回收站（归档+被覆盖恢复，槽位冲突阻止）、原始 JSON 诊断、清空并重建（先自动备份）。
-- **设置**：97 项配置按左右分栏展示（左侧导航、右侧只显示选中的一组，未保存的输入切组不丢；保存按钮固定在右下；窄屏导航变为顶部横向条）——总开关与采集 / 抽取与整理 / 检索与注入 / 重要性与维护 / 学习与人格草稿 / 图片 / Embedding 与 Rerank / 外观。
+- **设置**：126 项配置按左右分栏展示（左侧导航、右侧只显示选中的一组，未保存的输入切组不丢；保存按钮固定在右下；窄屏导航变为顶部横向条）——总开关与采集 / 抽取与整理 / 检索与注入 / 重要性与维护 / 学习与人格草稿 / 图片 / Embedding 与 Rerank / 外观。
 - **外观**：Shader Gradient 风格——近黑底上跑真实 WebGL 片元着色器流动渐变（fbm 域扭曲），内容在磨砂玻璃面板上；5 组主题预设（极光 / 碧金 / 暮霞 / 午夜 / 森林）+ 三色取色器；**动态颜色**开关按固定顺序循环渐变（停 1 秒 / 过渡 5 秒），手动点预设自动关闭。
 - 动效降级：devicePixelRatio 封顶 2、离屏暂停、`prefers-reduced-motion` 单帧、WebGL 不可用或上下文丢失时回退静态 CSS 渐变。
 
@@ -192,6 +197,7 @@
 | `/stype dossier [QQ]` | 当前说话人或指定 QQ 的短档案（查别人需管理员/主人） |
 | `/stype profile` | 查看自己的跨会话画像（私聊/群里同一份） |
 | `/stype cross` | 预览跨会话衔接块：条数、方向拦截（管理员） |
+| `/stype flow` | 预览窗口全流（其他窗口最近消息流，含群成员与 Bot；管理员/主人） |
 | `/stype export` | 导出 JSONL 到数据目录（管理员） |
 | `/stype import 预览\|确认 <路径>` | 预览或导入 JSONL（确认前备份） |
 | `/stype alias <旧id> <主id>` | 说话人归并（管理员） |
@@ -295,6 +301,18 @@ pages/console/           面板：index.html / app.js / style.css / shader.js(We
 | `profile_inject_enabled` / `profile_max_chars` | 每轮注入跨会话画像卡（称呼/身份/偏好/语气），默认 开、上限 300 字 |
 | `cross_window_enabled` / `cross_window_minutes` / `cross_window_max_items` / `cross_window_max_chars` | 跨会话衔接：默认 开、窗口 30 分钟、最多 6 条、上限 320 字 |
 | `cross_window_private_to_group` / `cross_window_group_to_group` | 衔接方向：私聊→群、群→群 默认 关（私→私、群→私 恒开） |
+| `window_flow_enabled` / `window_flow_always` / `window_flow_keywords` | 窗口全流（C 层）：其他窗口的完整消息流；开关、是否每次都注入、触发关键词（回看 24 小时 / 150 条 / 6000 字 / 3 窗口为默认值） |
+| `window_flow_hours` / `window_flow_max_items` / `window_flow_max_chars` | 窗口全流回看小时数（24）、最多条数（150）、最多字符（6000） |
+| `window_flow_max_windows` / `window_flow_msg_chars` / `window_flow_include_bot` | 窗口全流最多窗口数（3）、单条截断（200 字）、是否包含 Bot 发言 |
+| `window_flow_group_to_private` / `window_flow_private_to_group` / `window_flow_exclude_private_users` | 窗口全流方向（默认双向开）与私聊排除名单（填用户 ID，逗号分隔） |
+| `reply_gate_enabled` / `reply_gate_mode` | 免@主动接话开关与判定方式（probability 概率 / keyword 关键词 / memory 记忆命中） |
+| `reply_gate_probability` / `reply_gate_keywords` | 概率模式的接话概率（默认 0.05）、关键词模式的词表 |
+| `reply_gate_groups` / `reply_gate_cooldown_seconds` / `reply_gate_daily_limit` | 接话群白名单（空=所有群）、同群冷却（90 秒）、每群每日上限（30） |
+| `reply_gate_min_chars` / `reply_gate_skip_commands` | 最小接话字数（2）、是否跳过以 / ！ 开头的命令消息 |
+| `speak_enabled` / `speak_default_group` | 指派发言开关与默认目标群（群号或 umo；留空用最近活跃的群） |
+| `speak_groups` / `speak_require_owner` | 允许发言的群名单（留空=不额外限制）、是否仅主人可指派 |
+| `speak_rate_limit_per_min` / `speak_max_chars` | 每分钟上限（5）、单条最大字数（300） |
+| `speak_reply_receipt` / `speak_record_to_target` | 发送后私聊回执、是否记入目标群时间线 |
 | `entity_linking_enabled` / `entity_boost_weight` | 实体链接开关与命中加成分（默认 0.2） |
 | `history_enabled` / `history_max_facts` | 时序查询开关与历史块条数上限（默认 6） |
 | `importance_weight` / `importance_half_life_days` / `importance_reinforce_factor` / `importance_max_half_life_multiplier` / `importance_prune_threshold` | 重要性、半衰期、强化、归档阈值 |

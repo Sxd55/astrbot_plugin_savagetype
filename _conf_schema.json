@@ -592,5 +592,179 @@
     "type": "bool",
     "hint": "默认关闭：A 群说的话不进 B 群，避免跨群泄漏。只在自己明确需要时打开。",
     "default": false
+  },
+  "window_flow_enabled": {
+    "description": "窗口全流上下文",
+    "type": "bool",
+    "hint": "把其他窗口（群聊/私聊）最近的完整消息流注入当前会话。B 层「跨窗口衔接」只带碎片，本项负责整段，解决「群里什么情况」答不上来的问题。",
+    "default": true
+  },
+  "window_flow_always": {
+    "description": "每次都注入窗口全流",
+    "type": "bool",
+    "hint": "关闭时只在消息命中关键词时注入；打开则每次 LLM 请求都注入（提示词开销明显变大）。",
+    "default": false
+  },
+  "window_flow_keywords": {
+    "description": "窗口全流触发词",
+    "type": "string",
+    "hint": "逗号分隔；消息包含任一关键词时才注入窗口全流（window_flow_always 打开时忽略本项）。",
+    "default": "群里,群聊,群友,那个群,群里的,群怎么样,群里什么情况,查群,看群,私聊,私聊里"
+  },
+  "window_flow_hours": {
+    "description": "窗口全流回看小时数",
+    "type": "int",
+    "hint": "取最近多少小时的其他窗口消息。",
+    "default": 24
+  },
+  "window_flow_max_items": {
+    "description": "窗口全流最多条数",
+    "type": "int",
+    "hint": "最多注入多少条消息（跨所有窗口合计）。",
+    "default": 150
+  },
+  "window_flow_max_chars": {
+    "description": "窗口全流最多字符",
+    "type": "int",
+    "hint": "窗口全流块的最大字符数；超预算时从最旧的消息开始丢。",
+    "default": 6000
+  },
+  "window_flow_max_windows": {
+    "description": "窗口全流最多窗口数",
+    "type": "int",
+    "hint": "按最近活跃取前几个窗口，避免几十个群全部塞进上下文。",
+    "default": 3
+  },
+  "window_flow_msg_chars": {
+    "description": "窗口全流单条截断",
+    "type": "int",
+    "hint": "每条消息最多保留多少字符。",
+    "default": 200
+  },
+  "window_flow_include_bot": {
+    "description": "窗口全流含 Bot 发言",
+    "type": "bool",
+    "hint": "窗口流里是否包含 Bot 自己在其他会话的回复（关掉后只有用户消息）。",
+    "default": true
+  },
+  "window_flow_group_to_private": {
+    "description": "方向 群→私聊",
+    "type": "bool",
+    "hint": "允许把群聊内容注入私聊（默认开）。",
+    "default": true
+  },
+  "window_flow_private_to_group": {
+    "description": "方向 私聊→群",
+    "type": "bool",
+    "hint": "允许把私聊内容注入群聊（默认开；注意这会把私聊内容带进群，必要时配合排除名单使用）。",
+    "default": true
+  },
+  "window_flow_exclude_private_users": {
+    "description": "私聊排除名单",
+    "type": "string",
+    "hint": "填用户 QQ/ID，逗号分隔；这些人的私聊窗口不会进入窗口全流，防止他人私聊内容流入群聊。",
+    "default": ""
+  },
+  "reply_gate_enabled": {
+    "description": "免@主动接话",
+    "type": "bool",
+    "hint": "群聊里没 @ 机器人时，按下面的规则判定是否主动回复。命中后走默认 LLM 通路（人格/记忆/分段/TTS 全部照旧）。建议与 AstrBot 内置「主动回复」二选一，避免重复接话。",
+    "default": false
+  },
+  "reply_gate_mode": {
+    "description": "接话判定方式",
+    "type": "string",
+    "hint": "probability=按概率；keyword=命中关键词；memory=这条消息命中了记忆（核心/相关事实/事件）才接话。",
+    "default": "probability"
+  },
+  "reply_gate_probability": {
+    "description": "接话概率",
+    "type": "float",
+    "hint": "0.0-1.0，仅 probability 模式生效。建议 0.02-0.1。",
+    "default": 0.05
+  },
+  "reply_gate_keywords": {
+    "description": "接话关键词",
+    "type": "string",
+    "hint": "逗号分隔，仅 keyword 模式生效。例：在吗,问一下,bot,小助手",
+    "default": ""
+  },
+  "reply_gate_groups": {
+    "description": "接话群白名单",
+    "type": "string",
+    "hint": "填群号或完整 umo，逗号分隔；留空=所有群都可接话。用 /sid 获取群号。",
+    "default": ""
+  },
+  "reply_gate_cooldown_seconds": {
+    "description": "接话冷却（秒）",
+    "type": "int",
+    "hint": "同一个群两次主动接话的最小间隔，0=不限制。",
+    "default": 90
+  },
+  "reply_gate_daily_limit": {
+    "description": "每群每日接话上限",
+    "type": "int",
+    "hint": "0=不限制。超过后当天不再主动接话。",
+    "default": 30
+  },
+  "reply_gate_min_chars": {
+    "description": "接话最小字数",
+    "type": "int",
+    "hint": "太短的消息（如「哈」「？」）不接话。",
+    "default": 2
+  },
+  "reply_gate_skip_commands": {
+    "description": "跳过命令消息",
+    "type": "bool",
+    "hint": "以 / ！ 等开头的消息不接话，避免抢插件命令。",
+    "default": true
+  },
+  "speak_enabled": {
+    "description": "指派发言（私聊指挥去群里说）",
+    "type": "bool",
+    "hint": "开启后，主人在私聊说「去群里说：XXX」「去 2 群说：XXX」即可让 Bot 到群聊发这句话。",
+    "default": false
+  },
+  "speak_default_group": {
+    "description": "默认目标群",
+    "type": "string",
+    "hint": "填群号或完整 umo；留空则用最近活跃的群。可用 /stype default <群号|序号> 覆盖（优先级更高）。",
+    "default": ""
+  },
+  "speak_groups": {
+    "description": "允许发言的群名单",
+    "type": "string",
+    "hint": "群号或 umo，逗号分隔；留空=不额外限制（目标须为已见过的群），填写后只能发到名单内或默认群。",
+    "default": ""
+  },
+  "speak_require_owner": {
+    "description": "仅主人可指派",
+    "type": "bool",
+    "hint": "关闭后任何人都能在私聊指挥 Bot 去群里说话（不建议）。",
+    "default": true
+  },
+  "speak_rate_limit_per_min": {
+    "description": "指派发言每分钟上限",
+    "type": "int",
+    "hint": "0=不限制。",
+    "default": 5
+  },
+  "speak_max_chars": {
+    "description": "指派发言最大字数",
+    "type": "int",
+    "hint": "超出会截断并加省略号。",
+    "default": 300
+  },
+  "speak_reply_receipt": {
+    "description": "发送后私聊回执",
+    "type": "bool",
+    "hint": "关闭后只回「已发送。」，不回显内容。",
+    "default": true
+  },
+  "speak_record_to_target": {
+    "description": "发言记入目标群时间线",
+    "type": "bool",
+    "hint": "开启后这次主动发言会写进目标群的时间线，保持记忆与上下文一致。",
+    "default": true
   }
 }

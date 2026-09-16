@@ -19,6 +19,7 @@ try:
     from .savagetype import __version__ as PLUGIN_VERSION
     from .savagetype.service import SavageTypeService
     from .savagetype.slots import apply_slot
+    from .savagetype.speak import group_label
     from .savagetype.store import Store
     from .savagetype.util import (
         PLUGIN_NAME,
@@ -34,6 +35,7 @@ except ImportError:
     from savagetype import __version__ as PLUGIN_VERSION
     from savagetype.service import SavageTypeService
     from savagetype.slots import apply_slot
+    from savagetype.speak import group_label
     from savagetype.store import Store
     from savagetype.util import (
         PLUGIN_NAME,
@@ -65,7 +67,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "4.5.0",
+    "4.8.0",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -200,6 +202,14 @@ class SavageTypePlugin(Star):
             try:
                 self.service.remember_owner_window(event)
                 if self.service.is_owner_event(event):
+                    spoken = await self.service.handle_speak_request(event, text)
+                    if spoken:
+                        await self.service.send_text(event.unified_msg_origin, spoken)
+                        try:
+                            event.stop_event()
+                        except Exception:
+                            pass
+                        return
                     reply = await self.service.handle_owner_reply(text)
                     if reply:
                         await self.service.send_text(event.unified_msg_origin, reply)
@@ -272,18 +282,27 @@ class SavageTypePlugin(Star):
                 persona_id=persona_id,
                 window_tag=ident.get("window_tag") or "",
             )
-            if not pack:
+            flow_block, flow_meta = self.service.window_flow_for(
+                query,
+                window_tag=ident.get("window_tag") or "",
+                persona_id=persona_id,
+            )
+            if not pack and not flow_block:
                 return
-            self._append_pack(req, pack)
+            if pack:
+                self._append_pack(req, pack)
+            if flow_block:
+                self._append_pack(req, flow_block)
             if self.config.get("debug_log_injection"):
                 logger.info(
-                    "Savage Type inject route=%s path=%s cache=%s core=%s related=%s chars=%s",
+                    "Savage Type inject route=%s path=%s cache=%s core=%s related=%s chars=%s window_flow=%s",
                     snapshot.get("route"),
                     snapshot.get("path"),
                     snapshot.get("cache"),
                     snapshot.get("core"),
                     snapshot.get("related"),
                     snapshot.get("pack_chars"),
+                    flow_meta.get("items"),
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Savage Type inject failed: %s", exc)
@@ -316,6 +335,41 @@ class SavageTypePlugin(Star):
                 self.service.capture_bot(event, text)
         except Exception:
             pass
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def reply_gate(self, event: AstrMessageEvent):
+        """免@主动接话：按配置判定是否让本条群消息进入默认 LLM 回复。
+
+        命中时把事件标记为「已唤醒」（is_at_or_wake_command=True），
+        后续完全走 AstrBot 默认 LLM 通路：人格、记忆注入、分段、TTS 全部照旧。
+        """
+        try:
+            if not self.service.reply_gate_enabled():
+                return
+            if getattr(event, "is_at_or_wake_command", False) or event.is_wake_up():
+                return
+            handled = bool(
+                event.get_result()
+                or event.get_extra("provider_request")
+                or getattr(event, "_has_send_oper", False)
+            )
+            fire, meta = await self.service.reply_gate_for(
+                event,
+                handled=handled,
+                persona_id=await self._persona_id(event),
+            )
+            if fire:
+                event.is_at_or_wake_command = True
+                event.set_extra("_stype_reply_gate", meta)
+                if self.config.get("debug_log_injection"):
+                    logger.info(
+                        "Savage Type reply gate fired: mode=%s reason=%s window=%s",
+                        meta.get("mode"),
+                        meta.get("reason"),
+                        event.unified_msg_origin,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Savage Type reply gate failed: %s", exc)
 
     @filter.command_group("stype")
     def stype(self):
@@ -436,6 +490,55 @@ class SavageTypePlugin(Star):
         )
         if not block:
             yield event.plain_result(f"没有可衔接内容。\n{detail}")
+            return
+        yield event.plain_result(f"{block}\n\n（{detail}）")
+
+    @stype.command("groups")
+    async def cmd_groups(self, event: AstrMessageEvent):
+        """列出已知群与编号（指派发言选目标用）"""
+        rows = self.service.speak_groups()
+        if not rows:
+            yield event.plain_result("还没有记录到任何群（先在群里说句话）。")
+            return
+        default = self.service.speak_default_umo()
+        lines = ["已知群（按最近活跃排序）："]
+        for index, row in enumerate(rows, 1):
+            window = str(row.get("window_tag") or "")
+            mark = " ← 默认" if window == default else ""
+            lines.append(f"{index}. {group_label(window)}（{row.get('count', 0)} 条）{mark}")
+        lines.append("用法：/stype default <群号 或 序号> 设置默认群；/stype default clear 清除。")
+        yield event.plain_result("\n".join(lines))
+
+    @stype.command("default")
+    async def cmd_default(self, event: AstrMessageEvent, target: str = ""):
+        """设置默认群：/stype default <群号 或 序号>"""
+        value = (target or "").strip() or self._rest_after(event, "default")
+        if not value:
+            yield event.plain_result("用法：/stype default <群号 或 序号>（/stype groups 查看）")
+            return
+        if not (self.service.is_owner_event(event) or event.is_admin()):
+            yield event.plain_result("只有主人或管理员能设置默认群。")
+            return
+        yield event.plain_result(self.service.set_speak_default(value))
+
+    @stype.command("flow")
+    async def cmd_flow(self, event: AstrMessageEvent):
+        """预览窗口全流上下文（其他窗口最近消息流，含群成员与 Bot）"""
+        ident = await self._ident(event)
+        block, meta = self.service.window_flow_for(
+            event.message_str or "",
+            window_tag=ident.get("window_tag") or "",
+            persona_id=ident.get("persona_id") or "",
+            force=True,
+        )
+        if not meta.get("enabled", True):
+            yield event.plain_result("窗口全流上下文已在配置里关闭。")
+            return
+        detail = (
+            f"窗口 {meta.get('windows', 0)} 个 · 条数 {meta.get('items', 0)} · 字符 {meta.get('chars', 0)}"
+        )
+        if not block:
+            yield event.plain_result(f"没有可用的窗口全流。\n{detail}")
             return
         yield event.plain_result(f"{block}\n\n（{detail}）")
 

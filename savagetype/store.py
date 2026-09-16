@@ -603,6 +603,37 @@ class Store:
         params.append(max(1, int(limit)))
         return [self._timeline(r) for r in self.query(sql, params)]
 
+    def window_flow_events(
+        self,
+        exclude_window: str = "",
+        since_ts: int = 0,
+        limit: int = 200,
+    ) -> list[TimelineEvent]:
+        """取所有窗口（含 Bot 发言）的最近消息流（窗口全流注入用），最新在前。"""
+        params: list[Any] = [since_ts]
+        sql = "SELECT * FROM timeline WHERE ts>=? AND window_tag!=''"
+        if exclude_window:
+            sql += " AND window_tag!=?"
+            params.append(exclude_window)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        return [self._timeline(r) for r in self.query(sql, params)]
+
+    def recent_windows(self, limit: int = 50, since_ts: int = 0) -> list[dict[str, Any]]:
+        """按最近活跃列出见过的窗口（供 /stype groups 与指派发言选目标）。"""
+        params: list[Any] = [since_ts]
+        sql = (
+            "SELECT window_tag, COUNT(*) AS cnt, MAX(ts) AS last_ts"
+            " FROM timeline WHERE window_tag!='' AND ts>=?"
+            " GROUP BY window_tag ORDER BY last_ts DESC LIMIT ?"
+        )
+        params.append(max(1, int(limit)))
+        rows = self.query(sql, params)
+        return [
+            {"window_tag": str(row[0]), "count": int(row[1] or 0), "last_ts": int(row[2] or 0)}
+            for row in rows
+        ]
+
     def counts(self) -> dict[str, int]:
         def n(sql: str, params: Iterable[Any] = ()) -> int:
             try:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -28,12 +29,30 @@ from .archive import (
 from . import tokenize as tokenizer_mod
 from .coexistence import Coexistence
 from .contradiction import ContradictionEngine
-from .crosswin import build_cross_window
+from .crosswin import build_cross_window, window_kind
 from .events import EventPipeline
 from .extract import Extractor
 from .inject import build_pack
 from .learn import LearningEngine
 from .profile import build_profile_card
+from .speak import (
+    allowed_target,
+    clip_content,
+    group_label,
+    parse_intent,
+    resolve_number,
+    resolve_target,
+)
+from .replygate import (
+    evaluate as reply_gate_evaluate,
+    in_targets,
+    keyword_hit,
+    memory_hit,
+    normalize_mode,
+    parse_targets,
+    probability_hit,
+)
+from .windowflow import build_window_flow
 from .llm import (
     BudgetGuard,
     LLMBudgetExceeded,
@@ -43,7 +62,7 @@ from .llm import (
 )
 from .pipeline import MemoryPipeline
 from .profiles import build_profile
-from .retrieve import Retriever
+from .retrieve import Retriever, classify_route
 from .store import Store
 from .slots import apply_slot
 from .util import (
@@ -1060,8 +1079,18 @@ class SavageTypeService:
                 out.append(card)
         return out
 
-    def profile_card_for(self, speaker_id: str, persona_id: str = "") -> tuple[str, dict[str, Any]]:
-        """跨会话画像卡（A 层）：同一个人在任何会话里的称呼/身份/偏好/语气锚点。"""
+    def profile_card_for(
+        self,
+        speaker_id: str,
+        persona_id: str = "",
+        window_tag: str = "",
+        isolation: str = "",
+    ) -> tuple[str, dict[str, Any]]:
+        """跨会话画像卡（A 层）：同一个人在任何会话里的称呼/身份/偏好/语气锚点。
+
+        window_tag + isolation 传入时按会话隔离过滤来源（strict 下私聊事实不进群聊）；
+        不传则表示面板 / 命令查看跨会话全量画像。
+        """
         if not bool(self._cfg_value("profile_inject_enabled", True)):
             return "", {"enabled": False, "chars": 0}
         try:
@@ -1073,6 +1102,8 @@ class SavageTypeService:
             speaker_id,
             persona_id=persona_id,
             max_chars=max_chars,
+            window_tag=window_tag,
+            isolation=isolation,
         )
         meta["enabled"] = True
         return card, meta
@@ -1108,6 +1139,303 @@ class SavageTypeService:
         meta["enabled"] = True
         return block, meta
 
+    def window_flow_for(
+        self,
+        query: str,
+        window_tag: str = "",
+        persona_id: str = "",
+        owner_ids: set[str] | None = None,
+        force: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
+        """窗口全流上下文（C 层）：其他窗口最近的完整消息流。
+
+        默认双向全通（私聊 <-> 群聊），但可用 window_flow_exclude_private_users
+        屏蔽指定用户的私聊窗口，避免他人私聊内容流入群聊。
+        force=True 时忽略关键词门槛（预览命令用）。
+        """
+        if not bool(self._cfg_value("window_flow_enabled", True)):
+            return "", {"enabled": False, "items": 0, "chars": 0}
+        if not force and not bool(self._cfg_value("window_flow_always", False)):
+            keywords = parse_csv(str(self._cfg_value("window_flow_keywords", "") or ""))
+            text = query or ""
+            if keywords and not any(keyword and keyword in text for keyword in keywords):
+                return "", {"enabled": True, "skipped": "no_keyword", "items": 0, "chars": 0}
+        try:
+            hours = max(1, int(self._cfg_value("window_flow_hours", 24)))
+            max_items = max(1, int(self._cfg_value("window_flow_max_items", 150)))
+            max_chars = max(0, int(self._cfg_value("window_flow_max_chars", 6000)))
+            max_windows = max(1, int(self._cfg_value("window_flow_max_windows", 3)))
+            msg_chars = max(20, int(self._cfg_value("window_flow_msg_chars", 200)))
+        except (TypeError, ValueError):
+            hours, max_items, max_chars, max_windows, msg_chars = 24, 150, 6000, 3, 200
+        exclude_private_users = parse_csv(
+            str(self._cfg_value("window_flow_exclude_private_users", "") or "")
+        )
+        exclude_ids: list[str] = []
+        for item in exclude_private_users:
+            try:
+                exclude_ids.extend(self.store.speaker_ids_for(self.store.resolve_speaker(item)))
+            except Exception:  # noqa: BLE001
+                exclude_ids.append(item)
+        block, meta = build_window_flow(
+            self.store,
+            window_tag,
+            hours=hours,
+            max_items=max_items,
+            max_chars=max_chars,
+            max_windows=max_windows,
+            msg_chars=msg_chars,
+            include_bot=bool(self._cfg_value("window_flow_include_bot", True)),
+            group_to_private=bool(self._cfg_value("window_flow_group_to_private", True)),
+            private_to_group=bool(self._cfg_value("window_flow_private_to_group", True)),
+            exclude_private_users=exclude_ids,
+            persona_id=persona_id,
+        )
+        meta["enabled"] = True
+        if meta.get("items"):
+            self.store.add_diag("window_flow", meta)
+        return block, meta
+
+    def reply_gate_enabled(self) -> bool:
+        return bool(self._cfg_value("reply_gate_enabled", False))
+
+    # ---- 指派发言（私聊让 Bot 去群里说话） ---------------------------------
+
+    def speak_enabled(self) -> bool:
+        return bool(self._cfg_value("speak_enabled", False))
+
+    def speak_groups(self, limit: int = 30, days: int = 30) -> list[dict[str, Any]]:
+        """按最近活跃列出已知群窗口。"""
+        since = now_ts() - max(1, int(days)) * 86400
+        rows = self.store.recent_windows(limit=max(1, int(limit)) * 3, since_ts=since)
+        groups = [row for row in rows if window_kind(str(row.get("window_tag") or "")) == "group"]
+        return groups[: max(1, int(limit))]
+
+    def speak_default_umo(self) -> str:
+        """默认群：优先 /stype default 存在 meta 的覆盖值，其次配置 speak_default_group。"""
+        override = str(self.store.get_meta("speak_default_umo") or "").strip()
+        if override:
+            return override
+        raw = str(self._cfg_value("speak_default_group", "") or "").strip()
+        if not raw:
+            return ""
+        if ":" in raw:
+            return raw
+        known = [str(row["window_tag"]) for row in self.speak_groups(limit=80, days=365)]
+        return resolve_number(raw, known)
+
+    def set_speak_default(self, value: str) -> str:
+        """设置 / 清除默认群，返回给人看的回执。"""
+        raw = (value or "").strip()
+        if not raw or raw in {"clear", "清除", "重置"}:
+            self.store.set_meta("speak_default_umo", "")
+            return "默认群已清除。"
+        groups = [str(row["window_tag"]) for row in self.speak_groups(limit=80, days=365)]
+        target = ""
+        if ":" in raw:
+            target = raw
+        elif raw.isdigit() and len(raw) <= 2:
+            from .speak import resolve_index
+
+            target = resolve_index(raw, groups)
+        if not target:
+            target = resolve_number(raw, groups)
+        if not target:
+            return f"没找到群「{raw}」。用 /stype groups 查看群号或序号。"
+        self.store.set_meta("speak_default_umo", target)
+        self.store.add_diag("speak_default", {"window": target})
+        return f"默认群已设为 {group_label(target)}。"
+
+    async def handle_speak_request(self, event: Any, text: str) -> str | None:
+        """私聊指派发言：命中则发送并返回回执文本；未命中返回 None。"""
+        if not self.speak_enabled():
+            return None
+        intent = parse_intent(text or "")
+        if not intent:
+            return None
+        window_tag = str(getattr(event, "unified_msg_origin", "") or "")
+        if window_kind(window_tag) != "private":
+            return None
+        if bool(self._cfg_value("speak_require_owner", True)) and not self.is_owner_event(event):
+            return "（只有主人能让我去群里说话）"
+        groups = [str(row["window_tag"]) for row in self.speak_groups(limit=80, days=365)]
+        default_umo = self.speak_default_umo()
+        target, reason = resolve_target(intent, default_umo=default_umo, groups=groups)
+        if not target:
+            tips = {
+                "no_default_group": "还没设置默认群：用 /stype groups 看群号，再 /stype default <群号> 设置。",
+                "index_out_of_range": "群序号超出范围，用 /stype groups 看看有哪些群。",
+                "group_not_found": "没找到这个群号，用 /stype groups 核对一下。",
+                "unknown_target": "没认出目标群。",
+            }
+            return tips.get(reason, "没认出目标群。")
+        allow = parse_targets(self._cfg_value("speak_groups", ""))
+        if not allowed_target(target, default_umo=default_umo, allow=allow):
+            return f"群 {group_label(target)} 不在允许名单里（speak_groups）。"
+        try:
+            limit = max(0, int(self._cfg_value("speak_rate_limit_per_min", 5)))
+        except (TypeError, ValueError):
+            limit = 5
+        try:
+            owner_id = str(event.get_sender_id() or "")
+        except Exception:  # noqa: BLE001
+            owner_id = ""
+        minute_key = f"speak_rate:{owner_id}:{datetime.now().strftime('%Y%m%d%H%M')}"
+        try:
+            used = int(self.store.get_meta(minute_key) or 0)
+        except (TypeError, ValueError):
+            used = 0
+        if limit and used >= limit:
+            return f"太快了，每分钟最多 {limit} 条，等一分钟再发。"
+        try:
+            max_chars = max(1, int(self._cfg_value("speak_max_chars", 300)))
+        except (TypeError, ValueError):
+            max_chars = 300
+        content = clip_content(str(intent.get("content") or ""), max_chars)
+        if not content:
+            return "内容为空，没发。"
+        ok = await self.send_text(target, content)
+        if not ok:
+            return "发送失败（目标群可能不支持主动消息，或平台未连接）。"
+        self.store.set_meta(minute_key, str(used + 1))
+        if bool(self._cfg_value("speak_record_to_target", True)):
+            try:
+                ts = now_ts()
+                self.store.add_timeline(
+                    {
+                        "ts": ts,
+                        "role": ROLE_ASSISTANT,
+                        "content": content,
+                        "fingerprint": fingerprint("", ROLE_BOT_ID, ROLE_ASSISTANT, ts, content),
+                        "speaker_id": ROLE_BOT_ID,
+                        "speaker_name": "bot",
+                        "bot_id": "",
+                        "window_tag": target,
+                        "persona_id": "",
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.store.add_diag("speak_record_fail", {"error": str(exc)[:120]})
+        self.store.add_diag("speak", {"window": target, "chars": len(content)})
+        if bool(self._cfg_value("speak_reply_receipt", True)):
+            return f"已发到群 {group_label(target)}：{content}"
+        return "已发送。"
+
+    def _reply_gate_counter_key(self, kind: str, window_tag: str) -> str:
+        day = datetime.now().strftime("%Y%m%d")
+        return f"reply_gate_{kind}:{day}:{window_tag}"
+
+    async def reply_gate_for(
+        self,
+        event: Any,
+        *,
+        handled: bool = False,
+        persona_id: str = "",
+    ) -> tuple[bool, dict[str, Any]]:
+        """免@主动接话判定：命中时由主插件把事件标为唤醒，走默认 LLM 通路。"""
+        meta: dict[str, Any] = {"enabled": self.reply_gate_enabled()}
+        if not meta["enabled"]:
+            return False, meta
+        try:
+            window_tag = str(getattr(event, "unified_msg_origin", "") or "")
+            text = str(getattr(event, "message_str", "") or "")
+            try:
+                is_self = str(event.get_self_id()) == str(event.get_sender_id())
+            except Exception:  # noqa: BLE001
+                is_self = False
+            mode = normalize_mode(str(self._cfg_value("reply_gate_mode", "probability")))
+            try:
+                min_chars = max(1, int(self._cfg_value("reply_gate_min_chars", 2)))
+                cooldown = max(0, int(self._cfg_value("reply_gate_cooldown_seconds", 90)))
+                daily_limit = max(0, int(self._cfg_value("reply_gate_daily_limit", 30)))
+            except (TypeError, ValueError):
+                min_chars, cooldown, daily_limit = 2, 90, 30
+            targets = parse_targets(self._cfg_value("reply_gate_groups", ""))
+            now = now_ts()
+            last_ts = 0
+            today_count = 0
+            if window_tag:
+                try:
+                    last_ts = int(self.store.get_meta(f"reply_gate_last:{window_tag}") or 0)
+                except (TypeError, ValueError):
+                    last_ts = 0
+                try:
+                    today_count = int(
+                        self.store.get_meta(self._reply_gate_counter_key("day", window_tag)) or 0
+                    )
+                except (TypeError, ValueError):
+                    today_count = 0
+            cooldown_ok = cooldown <= 0 or (now - last_ts) >= cooldown
+            daily_ok = daily_limit <= 0 or today_count < daily_limit
+            mode_hit = False
+            mode_reason = ""
+            if mode == "keyword":
+                mode_hit, mode_reason = keyword_hit(
+                    text, parse_targets(self._cfg_value("reply_gate_keywords", ""))
+                )
+            elif mode == "memory":
+                route = classify_route(text)
+                if route == "low_info":
+                    mode_hit, mode_reason = False, "low_info"
+                else:
+                    speaker_id = ""
+                    try:
+                        speaker_id = str(event.get_sender_id() or "")
+                    except Exception:  # noqa: BLE001
+                        speaker_id = ""
+                    result = await self.retrieve_for(
+                        text,
+                        speaker_id,
+                        persona_id=persona_id,
+                        window_tag=window_tag,
+                    )
+                    mode_hit, mode_reason = memory_hit(result)
+                    meta["route"] = getattr(result, "route", "")
+            else:
+                try:
+                    probability = float(self._cfg_value("reply_gate_probability", 0.05))
+                except (TypeError, ValueError):
+                    probability = 0.05
+                mode_hit = probability_hit(probability)
+                mode_reason = "probability" if mode_hit else "probability_miss"
+            fire, reason = reply_gate_evaluate(
+                enabled=True,
+                is_group=window_kind(window_tag) == "group",
+                already_handled=bool(handled),
+                is_self=is_self,
+                window_tag=window_tag,
+                targets=targets,
+                text=text,
+                min_chars=min_chars,
+                skip_commands=bool(self._cfg_value("reply_gate_skip_commands", True)),
+                cooldown_ok=cooldown_ok,
+                daily_ok=daily_ok,
+                mode_hit=mode_hit,
+                mode_reason=mode_reason,
+            )
+            meta.update(
+                {
+                    "fire": fire,
+                    "reason": reason,
+                    "mode": mode,
+                    "cooldown_ok": cooldown_ok,
+                    "daily_ok": daily_ok,
+                    "today": today_count,
+                    "chars": len(text.strip()),
+                }
+            )
+            if fire and window_tag:
+                self.store.set_meta(f"reply_gate_last:{window_tag}", str(now))
+                self.store.set_meta(
+                    self._reply_gate_counter_key("day", window_tag), str(today_count + 1)
+                )
+            self.store.add_diag("reply_gate", meta)
+            return fire, meta
+        except Exception as exc:  # noqa: BLE001
+            meta["error"] = str(exc)[:200]
+            self.store.add_diag("reply_gate", meta)
+            return False, meta
+
     async def build_injection(
         self,
         query: str,
@@ -1135,7 +1463,12 @@ class SavageTypeService:
             isolation=self.session_isolation_mode(),
         )
         card = dossier.get("card") or ""
-        profile_card, profile_meta = self.profile_card_for(speaker_id, persona_id=persona_id)
+        profile_card, profile_meta = self.profile_card_for(
+            speaker_id,
+            persona_id=persona_id,
+            window_tag=window_tag,
+            isolation=self.session_isolation_mode(),
+        )
         cross_block, cross_meta = self.cross_window_for(
             speaker_id,
             window_tag=window_tag,
