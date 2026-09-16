@@ -34,6 +34,12 @@ from savagetype.models import Fact, LearningPack, RetrievalResult, TimelineEvent
 from savagetype.pipeline import MemoryPipeline, candidate_reason  # noqa: E402
 from savagetype.retrieve import Retriever, classify_route  # noqa: E402
 from savagetype.service import SavageTypeService, _unpack_llm_result  # noqa: E402
+from savagetype.crosswin import (  # noqa: E402
+    build_cross_window,
+    direction_allowed,
+    window_kind,
+)
+from savagetype.profile import build_profile_card  # noqa: E402
 from savagetype.slots import canonical_attribute, canonical_subject  # noqa: E402
 from savagetype.store import Store  # noqa: E402
 from savagetype.util import now_ts  # noqa: E402
@@ -2922,6 +2928,304 @@ class LLMStrategyTest(unittest.TestCase):
         self.assertEqual(status["soft_limit"], 500)
         self.assertIn("by_task", status)
         self.assertEqual(service.overview()["tokens"]["hard_limit"], 1000)
+
+
+class CrossSessionTest(unittest.TestCase):
+    """A 层画像卡 + B 层跨窗口衔接。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "cross.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _fact(self, **kwargs):
+        payload = {
+            "subject": "self",
+            "attribute": "likes",
+            "value": "美式咖啡",
+            "plain": "喜欢美式咖啡",
+            "content": "我喜欢美式咖啡",
+            "speaker_id": "u1",
+            "speaker_name": "阿U",
+            "status": "live",
+            "confidence": 0.9,
+        }
+        payload.update(kwargs)
+        return self.store.add_fact(payload)
+
+    def _msg(self, ts, window, text, speaker="u1", role="user", persona="", fp=None):
+        self.store.add_timeline(
+            {
+                "ts": ts,
+                "speaker_id": speaker,
+                "speaker_name": "阿U",
+                "bot_id": "b",
+                "window_tag": window,
+                "role": role,
+                "content": text,
+                "persona_id": persona,
+                "fingerprint": fp or f"{window}-{ts}-{text[:6]}",
+            }
+        )
+
+    # ---- A 层：画像卡 -------------------------------------------------
+
+    def test_profile_card_sections(self):
+        self._fact(attribute="name", value="鳄鱼", plain="以后叫我鳄鱼")
+        self._fact(attribute="likes", value="美式咖啡", plain="喜欢美式咖啡")
+        self._fact(attribute="dislikes", value="拿铁", plain="不喜欢拿铁")
+        self._fact(attribute="habit", value="每天练吉他", plain="每天练半小时吉他")
+        card, meta = build_profile_card(self.store, "u1")
+        self.assertIn("【画像】", card)
+        self.assertIn("称呼：鳄鱼", card)
+        self.assertIn("偏好：美式咖啡", card)
+        self.assertIn("不喜欢：拿铁", card)
+        self.assertIn("习惯：每天练吉他", card)
+        self.assertEqual(meta["name"], "鳄鱼")
+        self.assertFalse(meta["is_owner"])
+
+    def test_profile_card_owner_marked(self):
+        self._fact(scope="owner", speaker_id="owner1", speaker_name="主人")
+        card, meta = build_profile_card(self.store, "owner1")
+        self.assertIn("（主人）", card)
+        self.assertTrue(meta["is_owner"])
+
+    def test_profile_card_tone_only_in_hint_line(self):
+        self._fact(value="私下很黏人", plain="私下很黏人", mention_policy="tone")
+        card, meta = build_profile_card(self.store, "u1")
+        # 语气类只在「语气」行出现一次，不会被当成可复述的事实行。
+        self.assertEqual(card.count("私下很黏人"), 1)
+        tone_line = [line for line in card.splitlines() if line.startswith("语气：")]
+        self.assertEqual(len(tone_line), 1)
+        self.assertIn("私下很黏人", tone_line[0])
+        for line in card.splitlines():
+            if line.startswith(("称呼：", "身份：", "偏好：", "不喜欢：", "习惯：", "约定：", "近况：", "备注：")):
+                self.assertNotIn("私下很黏人", line)
+        self.assertEqual(meta["tone"], 1)
+
+    def test_profile_card_skips_expired_status(self):
+        self._fact(attribute="status", value="加班", plain="在加班", expires_at=1)
+        card, _ = build_profile_card(self.store, "u1")
+        self.assertNotIn("加班", card)
+        self._fact(attribute="status", value="出差", plain="在出差", expires_at=now_ts() + 3600)
+        card, _ = build_profile_card(self.store, "u1")
+        self.assertIn("出差", card)
+
+    def test_profile_card_empty_and_budget(self):
+        card, meta = build_profile_card(self.store, "nobody")
+        self.assertEqual(card, "")
+        self.assertEqual(meta["facts"], 0)
+        for index in range(6):
+            self._fact(attribute="likes", value=f"饮品{index}", plain=f"喜欢饮品{index}")
+        card, _ = build_profile_card(self.store, "u1", max_chars=40)
+        self.assertLessEqual(len(card), 40)
+
+    def test_profile_card_is_window_independent(self):
+        self._fact(attribute="name", value="鳄鱼", plain="叫我鳄鱼")
+        first, _ = build_profile_card(self.store, "u1")
+        second, _ = build_profile_card(self.store, "u1")  # 与窗口无关：同一份
+        self.assertEqual(first, second)
+
+    # ---- B 层：方向规则与解析 ------------------------------------------
+
+    def test_window_kind(self):
+        self.assertEqual(window_kind("aiocqhttp:GroupMessage:123"), "group")
+        self.assertEqual(window_kind("aiocqhttp:FriendMessage:456"), "private")
+        self.assertEqual(window_kind("webchat:FriendMessage:webchat!a!b"), "private")
+        self.assertEqual(window_kind(""), "unknown")
+        self.assertEqual(window_kind("import"), "unknown")
+
+    def test_direction_matrix(self):
+        self.assertTrue(direction_allowed("group", "private"))
+        self.assertTrue(direction_allowed("private", "private"))
+        self.assertFalse(direction_allowed("private", "group"))
+        self.assertFalse(direction_allowed("group", "group"))
+        self.assertTrue(direction_allowed("private", "group", private_to_group=True))
+        self.assertTrue(direction_allowed("group", "group", group_to_group=True))
+        self.assertFalse(direction_allowed("unknown", "private"))
+        self.assertFalse(direction_allowed("private", "unknown"))
+
+    # ---- B 层：组装 ---------------------------------------------------
+
+    def test_cross_window_group_to_private(self):
+        now = int(time.time())
+        self._msg(now - 600, "aiocqhttp:GroupMessage:123", "周末要加班")
+        self._msg(now - 540, "aiocqhttp:GroupMessage:123", "想换个键盘")
+        block, meta = build_cross_window(
+            self.store,
+            ["u1"],
+            "aiocqhttp:FriendMessage:456",
+            minutes=30,
+        )
+        self.assertIn("周末要加班", block)
+        self.assertIn("想换个键盘", block)
+        self.assertIn("在群里说过", block)
+        self.assertEqual(meta["items"], 2)
+        self.assertEqual(meta["sources"], ["group"])
+
+    def test_cross_window_private_to_group_blocked_by_default(self):
+        now = int(time.time())
+        self._msg(now - 300, "aiocqhttp:FriendMessage:456", "我偷偷准备了生日礼物")
+        block, meta = build_cross_window(
+            self.store,
+            ["u1"],
+            "aiocqhttp:GroupMessage:123",
+            minutes=30,
+        )
+        self.assertEqual(block, "")
+        self.assertEqual(meta["items"], 0)
+        self.assertGreaterEqual(meta["skipped_direction"], 1)
+        allowed, _ = build_cross_window(
+            self.store,
+            ["u1"],
+            "aiocqhttp:GroupMessage:123",
+            minutes=30,
+            private_to_group=True,
+        )
+        self.assertIn("生日礼物", allowed)
+
+    def test_cross_window_group_to_group_blocked_by_default(self):
+        now = int(time.time())
+        self._msg(now - 300, "aiocqhttp:GroupMessage:111", "A 群的事")
+        block, _ = build_cross_window(self.store, ["u1"], "aiocqhttp:GroupMessage:222", minutes=30)
+        self.assertEqual(block, "")
+        allowed, _ = build_cross_window(
+            self.store, ["u1"], "aiocqhttp:GroupMessage:222", minutes=30, group_to_group=True
+        )
+        self.assertIn("A 群的事", allowed)
+
+    def test_cross_window_filters_and_limits(self):
+        now = int(time.time())
+        self._msg(now - 400, "aiocqhttp:GroupMessage:123", "/stype status")
+        self._msg(now - 399, "aiocqhttp:GroupMessage:123", "[图片]")
+        self._msg(now - 398, "aiocqhttp:GroupMessage:123", "嗯")
+        self._msg(now - 397, "aiocqhttp:GroupMessage:123", "Bot 的回复", speaker="bot_self", role="assistant")
+        self._msg(now - 200, "aiocqhttp:GroupMessage:123", "第三人说的话", speaker="u2")
+        self._msg(now - 60 * 60, "aiocqhttp:GroupMessage:123", "一小时前的旧话")
+        for index in range(8):
+            self._msg(now - 100 + index, "aiocqhttp:GroupMessage:123", f"近况第{index}条")
+        block, meta = build_cross_window(
+            self.store,
+            ["u1"],
+            "aiocqhttp:FriendMessage:456",
+            minutes=30,
+            max_items=3,
+        )
+        self.assertEqual(meta["items"], 3)
+        self.assertNotIn("stype", block)
+        self.assertNotIn("[图片]", block)
+        self.assertNotIn("第三人说的话", block)
+        self.assertNotIn("一小时前的旧话", block)
+        self.assertNotIn("Bot 的回复", block)
+
+    def test_cross_window_persona_isolation(self):
+        now = int(time.time())
+        self._msg(now - 120, "aiocqhttp:GroupMessage:123", "别的人格的发言", persona="other")
+        block, meta = build_cross_window(
+            self.store, ["u1"], "aiocqhttp:FriendMessage:456", minutes=30, persona_id="default"
+        )
+        self.assertNotIn("别的人格的发言", block)
+        self.assertEqual(meta["items"], 0)
+
+    def test_cross_window_ordering_and_budget(self):
+        now = int(time.time())
+        self._msg(now - 300, "aiocqhttp:GroupMessage:123", "先说的")
+        self._msg(now - 200, "aiocqhttp:GroupMessage:123", "后说的")
+        block, _ = build_cross_window(self.store, ["u1"], "aiocqhttp:FriendMessage:456", minutes=30)
+        self.assertLess(block.index("先说的"), block.index("后说的"))
+        tight, meta = build_cross_window(
+            self.store, ["u1"], "aiocqhttp:FriendMessage:456", minutes=30, max_chars=60
+        )
+        self.assertLessEqual(len(tight), 90)
+        self.assertLessEqual(meta["items"], 2)
+
+    def test_cross_window_unknown_window(self):
+        now = int(time.time())
+        self._msg(now - 60, "aiocqhttp:GroupMessage:123", "某句话")
+        block, meta = build_cross_window(self.store, ["u1"], "import", minutes=30)
+        self.assertEqual(block, "")
+        self.assertEqual(meta["reason"], "target_unknown")
+
+    # ---- 注入包集成 ---------------------------------------------------
+
+    def test_pack_carries_profile_and_cross_window(self):
+        result = RetrievalResult(
+            query="q", route="long_term", path="basic", cache="miss",
+            hits=[], blocked=[], core=[], related=[], uncertain=[], superseded=[],
+        )
+        pack = build_pack(
+            result,
+            budget=800,
+            profile="【画像】阿U\n称呼：鳄鱼",
+            cross_window="【衔接·同一个人在别处刚说的】\n- 10:00 在群里说过：周末要加班",
+        )
+        self.assertIn("【画像】", pack)
+        self.assertIn("衔接·同一个人在别处刚说的", pack)
+        self.assertIn("savagetype_memory", pack)
+
+    def test_pack_low_info_keeps_profile(self):
+        result = RetrievalResult(
+            query="你好", route="low_info", path="basic", cache="miss",
+            hits=[], blocked=[], core=[], related=[], uncertain=[], superseded=[],
+        )
+        pack = build_pack(result, budget=800, profile="【画像】阿U\n称呼：鳄鱼")
+        self.assertIn("称呼：鳄鱼", pack)
+        self.assertEqual(build_pack(result, budget=800), "")
+
+    def test_pack_respects_profile_budget(self):
+        result = RetrievalResult(
+            query="q", route="long_term", path="basic", cache="miss",
+            hits=[], blocked=[], core=[], related=[], uncertain=[], superseded=[],
+        )
+        pack = build_pack(result, budget=800, profile="画像" * 200, profile_budget=50)
+        self.assertIn("画像", pack)
+        self.assertLess(len(pack), 400)
+
+
+    def test_service_toggles_and_wrappers(self):
+        """Service 层：两个开关能关掉，开了能拿到内容。"""
+        config = {
+            "profile_inject_enabled": True,
+            "profile_max_chars": 300,
+            "cross_window_enabled": True,
+            "cross_window_minutes": 30,
+            "cross_window_max_items": 6,
+            "cross_window_max_chars": 320,
+            "cross_window_private_to_group": False,
+            "cross_window_group_to_group": False,
+            "memory_session_isolation": "strict",
+        }
+        service = SavageTypeService(
+            store=self.store,
+            config=config,
+            llm_generate=lambda *_a, **_k: "",
+            get_provider=lambda *_a, **_k: None,
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, debug=lambda *a, **k: None),
+        )
+        service.apply_config()
+        self._fact(attribute="name", value="鳄鱼", plain="叫我鳄鱼")
+        card, meta = service.profile_card_for("u1")
+        self.assertIn("鳄鱼", card)
+        self.assertTrue(meta["enabled"])
+
+        now = int(time.time())
+        self._msg(now - 200, "aiocqhttp:GroupMessage:123", "群里说的事")
+        block, cross_meta = service.cross_window_for("u1", window_tag="aiocqhttp:FriendMessage:456")
+        self.assertIn("群里说的事", block)
+        self.assertTrue(cross_meta["enabled"])
+
+        config["profile_inject_enabled"] = False
+        config["cross_window_enabled"] = False
+        service.apply_config()
+        card, meta = service.profile_card_for("u1")
+        self.assertEqual(card, "")
+        self.assertFalse(meta["enabled"])
+        block, cross_meta = service.cross_window_for("u1", window_tag="aiocqhttp:FriendMessage:456")
+        self.assertEqual(block, "")
+        self.assertFalse(cross_meta["enabled"])
 
 
 if __name__ == "__main__":

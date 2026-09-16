@@ -117,7 +117,11 @@
   "memory_session_isolation": {
     "description": "会话隐私隔离",
     "type": "string",
-    "options": ["off", "owner", "strict"],
+    "options": [
+      "off",
+      "owner",
+      "strict"
+    ],
     "hint": "off=不隔离；owner=主人记忆只在主人自己的会话注入；strict=在 owner 基础上，私聊来源的记忆不再注入到群聊。推荐 strict。",
     "default": "strict"
   },
@@ -188,7 +192,11 @@
   "retrieval_mode": {
     "description": "检索执行模式",
     "type": "string",
-    "options": ["basic", "auto", "rerank"],
+    "options": [
+      "basic",
+      "auto",
+      "rerank"
+    ],
     "hint": "basic=本地关键词；auto=有 Rerank 就用（推荐先配 Rerank），失败回退本地；rerank=强制尝试。Embedding 是另一路补充，默认关，live 到 2500 才自动用。",
     "default": "auto"
   },
@@ -401,7 +409,10 @@
   "jargon_scope": {
     "description": "黑话统计范围",
     "type": "string",
-    "options": ["all", "owner"],
+    "options": [
+      "all",
+      "owner"
+    ],
     "hint": "all=统计平台/白名单内所有人的消息（默认，能学到群黑话）；owner=只统计主人自己的消息。",
     "default": "all"
   },
@@ -533,5 +544,53 @@
     "type": "string",
     "hint": "留空=不限制。填写群号或 QQ，逗号分隔。填了之后只有名单内的群聊/私聊会采集和注入。",
     "default": ""
+  },
+  "profile_inject_enabled": {
+    "description": "每轮注入跨会话画像",
+    "type": "bool",
+    "hint": "把当前说话人的称呼、身份、偏好、语气锚点做成小卡片，每轮都带上——这样同一个人的私聊和群里表现一致。只读已有事实，不占检索名额。",
+    "default": true
+  },
+  "profile_max_chars": {
+    "description": "画像卡字数上限",
+    "type": "int",
+    "hint": "画像卡最多注入多少字，超出按优先级截断。建议 200–400。",
+    "default": 300
+  },
+  "cross_window_enabled": {
+    "description": "跨会话衔接",
+    "type": "bool",
+    "hint": "同一个人在别的会话刚说过的话，少量带进当前会话，避免「刚在群里说过、私聊就不知道」。只带本人自己的发言，不带群友内容；方向受下面三个开关控制。",
+    "default": true
+  },
+  "cross_window_minutes": {
+    "description": "衔接时间窗口（分钟）",
+    "type": "int",
+    "hint": "只取这段时间内、其它会话里的发言。窗口越小越省、越不容易串话题。",
+    "default": 30
+  },
+  "cross_window_max_items": {
+    "description": "衔接最多条数",
+    "type": "int",
+    "hint": "最多带几条其它会话的发言，建议 4–8。",
+    "default": 6
+  },
+  "cross_window_max_chars": {
+    "description": "衔接字数上限",
+    "type": "int",
+    "hint": "整块衔接提示的字数上限，超出按时间顺序截断。",
+    "default": 320
+  },
+  "cross_window_private_to_group": {
+    "description": "允许 私聊→群聊 衔接",
+    "type": "bool",
+    "hint": "默认关闭：私聊内容不进群，避免把私密话题带到群里。打开前想清楚。",
+    "default": false
+  },
+  "cross_window_group_to_group": {
+    "description": "允许 群聊→群聊 衔接",
+    "type": "bool",
+    "hint": "默认关闭：A 群说的话不进 B 群，避免跨群泄漏。只在自己明确需要时打开。",
+    "default": false
   }
 }

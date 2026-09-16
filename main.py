@@ -65,7 +65,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "4.4.1",
+    "4.5.0",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -397,6 +397,47 @@ class SavageTypePlugin(Star):
             yield event.plain_result(f"{sid} 还没有短档案（需要至少一条 live 事实）。")
             return
         yield event.plain_result(card["card"])
+
+    @stype.command("profile")
+    async def cmd_profile(self, event: AstrMessageEvent):
+        """看自己的跨会话画像（私聊/群里同一份）"""
+        ident = await self._ident(event)
+        card, meta = self.service.profile_card_for(
+            ident["speaker_id"],
+            persona_id=ident.get("persona_id") or "",
+        )
+        if not meta.get("enabled", True):
+            yield event.plain_result("跨会话画像已在配置里关闭。")
+            return
+        if not card:
+            yield event.plain_result("还没有画像（需要至少一条已整理的稳定事实）。")
+            return
+        yield event.plain_result(
+            f"{card}\n\n（{meta.get('facts', 0)} 条事实 · {meta.get('chars', 0)} 字"
+            f" · 语气条目 {meta.get('tone', 0)}）"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @stype.command("cross")
+    async def cmd_cross(self, event: AstrMessageEvent):
+        """预览跨会话衔接块（当前会话视角）"""
+        ident = await self._ident(event)
+        block, meta = self.service.cross_window_for(
+            ident["speaker_id"],
+            window_tag=ident.get("window_tag") or "",
+            persona_id=ident.get("persona_id") or "",
+        )
+        if not meta.get("enabled", True):
+            yield event.plain_result("跨会话衔接已在配置里关闭。")
+            return
+        detail = (
+            f"目标会话 {meta.get('target') or '-'} · 条数 {meta.get('items', 0)} · "
+            f"字数 {meta.get('chars', 0)} · 因方向被跳过 {meta.get('skipped_direction', 0)}"
+        )
+        if not block:
+            yield event.plain_result(f"没有可衔接内容。\n{detail}")
+            return
+        yield event.plain_result(f"{block}\n\n（{detail}）")
 
     @stype.command("explain")
     async def cmd_explain(self, event: AstrMessageEvent):

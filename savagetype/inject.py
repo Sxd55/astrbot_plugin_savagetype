@@ -192,6 +192,10 @@ def build_pack(
     history_current: dict[int, str] | None = None,
     history_label: str = "",
     history_limit: int = 6,
+    profile: str = "",
+    cross_window: str = "",
+    profile_budget: int = 300,
+    cross_budget: int = 320,
 ) -> str:
     learning = learning or LearningPack()
     bot_facts = list(bot_facts or [])[:4]
@@ -206,7 +210,14 @@ def build_pack(
                 if term_in_query(str(j.get("term") or ""), result.query or "")
             ]
         )
-        if not core and not learning.jargon and not dossier and not bot_facts:
+        if (
+            not core
+            and not learning.jargon
+            and not dossier
+            and not bot_facts
+            and not profile
+            and not cross_window
+        ):
             return ""
 
     related = [f for f in result.related if f.id not in bot_ids]
@@ -246,6 +257,16 @@ def build_pack(
             push(0, block)
     if dossier and _append_if_fits(kept, dossier, budget):
         push(1, dossier)
+    if profile:
+        # 跨会话画像：稳定锚点，排在前排，保证「同一个人在任何会话里都一样」。
+        block = clip(profile, profile_budget) if profile_budget > 0 else profile
+        if _append_if_fits(kept, block, budget):
+            push(1, block)
+    if cross_window:
+        # 跨窗口衔接：最近的，只在话题延续时用。
+        block = clip(cross_window, cross_budget) if cross_budget > 0 else cross_window
+        if _append_if_fits(kept, block, budget):
+            push(4, block)
     if history:
         limit = max(1, int(history_limit or 1))
         label = (history_label or "当时").strip()

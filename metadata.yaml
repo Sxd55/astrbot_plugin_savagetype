@@ -2,7 +2,7 @@ name: astrbot_plugin_savagetype
 display_name: Savage Type
 short_desc: 全局人格记忆中枢：事实、改口、黑话释义、表达样本，审查后注入。
 desc: 独立记忆中枢。身份源是 AstrBot 当前人格。采集时间线、沉淀事实、有护栏的矛盾覆盖；审查后的黑话释义与表达样本；支持聊天文本导入与 JSONL 换机备份。不改写人格文件。
-version: v4.4.1
+version: v4.5.0
 author: Sxd55
 repo: https://github.com/Sxd55/astrbot_plugin_savagetype
 logo: logo.png

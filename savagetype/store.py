@@ -579,6 +579,30 @@ class Store:
             rows = self.query("SELECT * FROM timeline ORDER BY id DESC LIMIT ?", (limit,))
         return [self._timeline(r) for r in rows]
 
+    def timeline_in_windows(
+        self,
+        speaker_ids: list[str],
+        exclude_window: str = "",
+        since_ts: int = 0,
+        limit: int = 40,
+    ) -> list[TimelineEvent]:
+        """取这些说话人在「其它会话」里的用户消息（跨窗口衔接用），最新在前。"""
+        ids = [str(item) for item in (speaker_ids or []) if str(item).strip()]
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        params: list[Any] = [*ids, since_ts]
+        sql = (
+            "SELECT * FROM timeline WHERE role='user'"
+            f" AND speaker_id IN ({placeholders}) AND ts>=?"
+        )
+        if exclude_window:
+            sql += " AND window_tag!=?"
+            params.append(exclude_window)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        return [self._timeline(r) for r in self.query(sql, params)]
+
     def counts(self) -> dict[str, int]:
         def n(sql: str, params: Iterable[Any] = ()) -> int:
             try:

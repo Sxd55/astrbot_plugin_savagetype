@@ -28,10 +28,12 @@ from .archive import (
 from . import tokenize as tokenizer_mod
 from .coexistence import Coexistence
 from .contradiction import ContradictionEngine
+from .crosswin import build_cross_window
 from .events import EventPipeline
 from .extract import Extractor
 from .inject import build_pack
 from .learn import LearningEngine
+from .profile import build_profile_card
 from .llm import (
     BudgetGuard,
     LLMBudgetExceeded,
@@ -1058,6 +1060,54 @@ class SavageTypeService:
                 out.append(card)
         return out
 
+    def profile_card_for(self, speaker_id: str, persona_id: str = "") -> tuple[str, dict[str, Any]]:
+        """跨会话画像卡（A 层）：同一个人在任何会话里的称呼/身份/偏好/语气锚点。"""
+        if not bool(self._cfg_value("profile_inject_enabled", True)):
+            return "", {"enabled": False, "chars": 0}
+        try:
+            max_chars = max(0, int(self._cfg_value("profile_max_chars", 300)))
+        except (TypeError, ValueError):
+            max_chars = 300
+        card, meta = build_profile_card(
+            self.store,
+            speaker_id,
+            persona_id=persona_id,
+            max_chars=max_chars,
+        )
+        meta["enabled"] = True
+        return card, meta
+
+    def cross_window_for(
+        self,
+        speaker_id: str,
+        window_tag: str = "",
+        persona_id: str = "",
+    ) -> tuple[str, dict[str, Any]]:
+        """跨窗口衔接（B 层）：默认只允许 私聊→私聊、群聊→私聊。"""
+        if not bool(self._cfg_value("cross_window_enabled", True)):
+            return "", {"enabled": False, "items": 0, "chars": 0}
+        try:
+            minutes = max(1, int(self._cfg_value("cross_window_minutes", 30)))
+            max_items = max(1, int(self._cfg_value("cross_window_max_items", 6)))
+            max_chars = max(0, int(self._cfg_value("cross_window_max_chars", 320)))
+        except (TypeError, ValueError):
+            minutes, max_items, max_chars = 30, 6, 320
+        canonical = self.store.resolve_speaker(speaker_id)
+        ids = self.store.speaker_ids_for(canonical)
+        block, meta = build_cross_window(
+            self.store,
+            ids,
+            window_tag,
+            minutes=minutes,
+            max_items=max_items,
+            max_chars=max_chars,
+            persona_id=persona_id,
+            private_to_group=bool(self._cfg_value("cross_window_private_to_group", False)),
+            group_to_group=bool(self._cfg_value("cross_window_group_to_group", False)),
+        )
+        meta["enabled"] = True
+        return block, meta
+
     async def build_injection(
         self,
         query: str,
@@ -1085,6 +1135,12 @@ class SavageTypeService:
             isolation=self.session_isolation_mode(),
         )
         card = dossier.get("card") or ""
+        profile_card, profile_meta = self.profile_card_for(speaker_id, persona_id=persona_id)
+        cross_block, cross_meta = self.cross_window_for(
+            speaker_id,
+            window_tag=window_tag,
+            persona_id=persona_id,
+        )
         shown_ids = (
             {f.id for f in result.core}
             | {f.id for f in result.related}
@@ -1125,6 +1181,10 @@ class SavageTypeService:
             history_current=dict(getattr(result, "history_current", None) or {}),
             history_label=str(getattr(result, "history_label", "") or ""),
             history_limit=max(1, int(self._cfg_value("history_max_facts", 6))),
+            profile=profile_card,
+            cross_window=cross_block,
+            profile_budget=int(self._cfg_value("profile_max_chars", 300)),
+            cross_budget=int(self._cfg_value("cross_window_max_chars", 320)),
         )
         if pack:
             # 只有真的进了包的事实/事件才算「最近注入过」；被预算裁掉/未触发的都不占名额。
@@ -1166,6 +1226,8 @@ class SavageTypeService:
             "fewshots": len(learning.fewshots or []),
             "persona_draft": bool(learning.persona_draft),
             "dossier": bool(card),
+            "profile": profile_meta,
+            "cross_window": cross_meta,
             "injected": bool(pack),
             "dedup": len(skip_ids),
         }

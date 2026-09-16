@@ -2,7 +2,7 @@
 
 **Savage Type** 是面向 AstrBot 的全局人格记忆中枢。Savage 只是插件名：身份和语气永远读 AstrBot 当前人格，本插件只负责**记住事实、处理改口、在需要时把少量相关记忆注入本轮对话**。不改写人格文件，不做日程和主动陪伴。
 
-当前版本 `v4.4.1`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
+当前版本 `v4.5.0`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
 要求 AstrBot `>= 4.22.0`；运行依赖只有 `jieba`（可选，BM25 分词用，装不上自动回退）；离线测试只需 Python 3.11+ 标准库。
 
 ---
@@ -163,7 +163,7 @@
 - **事件**：经历/聊过的事件列表（当前 / 待审 / 已归档 / 置顶筛选），看原文（这一段消息）、编辑标题/摘要/要点/重要度、确认写入、置顶、删除与恢复。
 - **人物档案**：搜索、点选查看，改昵称/备注，条目增删改、置顶。
 - **诊断**：注入显微镜（路由、命中、过滤原因、`chars≈tokens`）、聊天导入、回收站（归档+被覆盖恢复，槽位冲突阻止）、原始 JSON 诊断、清空并重建（先自动备份）。
-- **设置**：89 项配置按左右分栏展示（左侧导航、右侧只显示选中的一组，未保存的输入切组不丢；保存按钮固定在右下；窄屏导航变为顶部横向条）——总开关与采集 / 抽取与整理 / 检索与注入 / 重要性与维护 / 学习与人格草稿 / 图片 / Embedding 与 Rerank / 外观。
+- **设置**：97 项配置按左右分栏展示（左侧导航、右侧只显示选中的一组，未保存的输入切组不丢；保存按钮固定在右下；窄屏导航变为顶部横向条）——总开关与采集 / 抽取与整理 / 检索与注入 / 重要性与维护 / 学习与人格草稿 / 图片 / Embedding 与 Rerank / 外观。
 - **外观**：Shader Gradient 风格——近黑底上跑真实 WebGL 片元着色器流动渐变（fbm 域扭曲），内容在磨砂玻璃面板上；5 组主题预设（极光 / 碧金 / 暮霞 / 午夜 / 森林）+ 三色取色器；**动态颜色**开关按固定顺序循环渐变（停 1 秒 / 过渡 5 秒），手动点预设自动关闭。
 - 动效降级：devicePixelRatio 封顶 2、离屏暂停、`prefers-reduced-motion` 单帧、WebGL 不可用或上下文丢失时回退静态 CSS 渐变。
 
@@ -190,6 +190,8 @@
 | `/stype reviews [kind]` | 待审学习项（管理员） |
 | `/stype approve <id>` / `/stype reject <id>` | 批准 / 驳回学习草稿（管理员） |
 | `/stype dossier [QQ]` | 当前说话人或指定 QQ 的短档案（查别人需管理员/主人） |
+| `/stype profile` | 查看自己的跨会话画像（私聊/群里同一份） |
+| `/stype cross` | 预览跨会话衔接块：条数、方向拦截（管理员） |
 | `/stype export` | 导出 JSONL 到数据目录（管理员） |
 | `/stype import 预览\|确认 <路径>` | 预览或导入 JSONL（确认前备份） |
 | `/stype alias <旧id> <主id>` | 说话人归并（管理员） |
@@ -290,6 +292,9 @@ pages/console/           面板：index.html / app.js / style.css / shader.js(We
 | `event_merge_minutes` / `event_max_per_run` / `event_provider_id` | 续聊合并窗口、单轮最多整理段数、事件摘要模型（默认回退整理模型） |
 | `event_budget_chars` / `event_max_inject` / `event_archive_days` | 事件注入预算、每轮最多注入条数、事件归档最短天数 |
 | `memory_session_isolation` | 会话隐私隔离：`off` / `owner` / `strict`（默认 strict） |
+| `profile_inject_enabled` / `profile_max_chars` | 每轮注入跨会话画像卡（称呼/身份/偏好/语气），默认 开、上限 300 字 |
+| `cross_window_enabled` / `cross_window_minutes` / `cross_window_max_items` / `cross_window_max_chars` | 跨会话衔接：默认 开、窗口 30 分钟、最多 6 条、上限 320 字 |
+| `cross_window_private_to_group` / `cross_window_group_to_group` | 衔接方向：私聊→群、群→群 默认 关（私→私、群→私 恒开） |
 | `entity_linking_enabled` / `entity_boost_weight` | 实体链接开关与命中加成分（默认 0.2） |
 | `history_enabled` / `history_max_facts` | 时序查询开关与历史块条数上限（默认 6） |
 | `importance_weight` / `importance_half_life_days` / `importance_reinforce_factor` / `importance_max_half_life_multiplier` / `importance_prune_threshold` | 重要性、半衰期、强化、归档阈值 |
@@ -318,7 +323,7 @@ python tests/test_core.py -v
 python tests/test_soak.py -v
 ```
 
-151 + 14 个测试，只用 Python 3.11+ 标准库，不联网。`test_soak.py` 偏慢，专门压异常模型输出、并发写入、几千条规模、老库迁移和全链路。`tests/verify_readme.py` 核查文档里的命令、配置、默认值、面板路由与版本号是否和代码一致。前端可做静态检查：把 `pages/console/app.js` / `shader.js` 复制为 `.mjs` 后 `node --check`。
+170 + 14 个测试，只用 Python 3.11+ 标准库，不联网。`test_soak.py` 偏慢，专门压异常模型输出、并发写入、几千条规模、老库迁移和全链路。`tests/verify_readme.py` 核查文档里的命令、配置、默认值、面板路由与版本号是否和代码一致。前端可做静态检查：把 `pages/console/app.js` / `shader.js` 复制为 `.mjs` 后 `node --check`。
 
 集成测试（24 个，真实 AstrBot 框架 + 假 Context/假事件/脚本化假模型，覆盖插件加载、采集钩子、注入、全部命令、LLM 工具、全部面板接口，以及任务分档、Token 预算闸、拒答重试）：
 
