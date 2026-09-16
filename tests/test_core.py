@@ -905,6 +905,7 @@ class FakeEvent:
         bot_id: str = "bot",
         role: str = "member",
         message_text: str = "",
+        message: list | None = None,
     ):
         self._sender = sender
         self._name = name
@@ -915,7 +916,7 @@ class FakeEvent:
         self.message_obj = SimpleNamespace(
             self_id=bot_id,
             sender=SimpleNamespace(user_id=sender),
-            message=[SimpleNamespace(text=message_text)],
+            message=message if message is not None else [SimpleNamespace(text=message_text)],
         )
 
     def get_sender_id(self) -> str:
@@ -3685,6 +3686,187 @@ class SpeakTest(unittest.TestCase):
         service = self._service(owner_qq="owner1")
         self.assertIsNone(asyncio.run(service.handle_speak_request(self._owner_event(), "去群里说：测试")))
         self.assertEqual(self.sends, [])
+
+
+class AddresseeTest(unittest.TestCase):
+    """谁对谁说：组件解析、存储编码、渲染。"""
+
+    def test_parse_and_render(self):
+        from savagetype.addressee import (
+            decode,
+            encode,
+            from_components,
+            has_bot_mention,
+            parse_components,
+            render_addressee,
+        )
+
+        class At:
+            def __init__(self, qq, name=""):
+                self.qq = qq
+                self.name = name
+
+        class AtAll:
+            qq = "all"
+
+        class Reply:
+            def __init__(self, sender_id, nickname=""):
+                self.sender_id = sender_id
+                self.sender_nickname = nickname
+
+        components = [At("10001", "小明"), Reply("10002", "阿May"), AtAll()]
+        items = parse_components(components)
+        self.assertEqual([item["kind"] for item in items], ["at", "reply", "at"])
+        raw = from_components(components)
+        self.assertEqual(raw, "at:10001|小明,reply:10002|阿May,at:all|")
+        self.assertEqual(len(decode(raw)), 3)
+        self.assertEqual(encode(items), raw)
+        self.assertEqual(render_addressee("at:10001|小明", self_id="10001"), "你")
+        self.assertEqual(render_addressee("at:all|", self_id="10001"), "全体")
+        self.assertTrue(has_bot_mention("at:10001|小明", "10001"))
+        self.assertFalse(has_bot_mention("at:10001|小明", "999"))
+        self.assertEqual(render_addressee("", self_id="1"), "")
+
+    def test_flow_renders_arrow(self):
+        from savagetype.windowflow import build_window_flow
+
+        tmp = tempfile.TemporaryDirectory()
+        store = Store(Path(tmp.name) / "arrow.db")
+        now = now_ts()
+        store.add_timeline(
+            {
+                "ts": now - 10,
+                "speaker_id": "u2",
+                "speaker_name": "阿强",
+                "bot_id": "bot1",
+                "window_tag": "aiocqhttp:GroupMessage:1",
+                "role": "user",
+                "content": "小明你看下这个",
+                "persona_id": "",
+                "addressee": "at:10001|小明,at:bot1|",
+                "fingerprint": "arrow-1",
+            }
+        )
+        block, _meta = build_window_flow(store, "aiocqhttp:FriendMessage:9")
+        self.assertIn("阿强 → 小明、你", block)
+        store.close()
+        tmp.cleanup()
+
+
+class DebounceHeuristicTest(unittest.TestCase):
+    """防抖启发式判断。"""
+
+    def test_incomplete_detection(self):
+        from savagetype.debounce import is_probably_incomplete
+
+        for text, expected in (
+            ("在吗", True),
+            ("在吗？", False),
+            ("今天那个", True),
+            ("我觉得", True),
+            ("然后", True),
+            ("帮我看看", True),
+            ("这条消息足够长所以直接放行不用等", False),
+            ("好的。", False),
+            ("这是一条比较长的消息超过阈值了", False),
+            ("", False),
+        ):
+            self.assertEqual(is_probably_incomplete(text, short_chars=8), expected, text)
+
+    def test_merge(self):
+        from savagetype.debounce import merge_fragments
+
+        self.assertEqual(merge_fragments(["在吗", "那个", "帮我看下"]), "在吗那个帮我看下")
+        self.assertEqual(merge_fragments(["hello", "world"]), "hello world")
+        self.assertEqual(merge_fragments(["你好，", "在吗"]), "你好，在吗")
+        self.assertEqual(merge_fragments(["", "  ", "只有这个"]), "只有这个")
+        self.assertLessEqual(len(merge_fragments(["啊" * 100], max_chars=30)), 30)
+
+
+class BlankMentionTest(unittest.TestCase):
+    """空 @ 上下文提醒。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "blank.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _service(self, **config):
+        from savagetype.service import SavageTypeService
+
+        service = SavageTypeService(
+            store=self.store,
+            config=config,
+            llm_generate=lambda *_a, **_k: "",
+            get_provider=lambda *_a, **_k: None,
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, debug=lambda *a, **k: None),
+        )
+        service.apply_config()
+        return service
+
+    def _event(self, *, sender: str = "u2", text: str = "", at_bot: bool = True, window: str = "aiocqhttp:GroupMessage:100"):
+        class At:
+            def __init__(self, qq, name=""):
+                self.qq = qq
+                self.name = name
+
+        components = [At("bot1")] if at_bot else []
+        if text:
+            components.append(SimpleNamespace(text=text))
+        return FakeEvent(sender=sender, window=window, message_text=text, message=components, bot_id="bot1")
+
+    def test_hint_for_same_user(self):
+        service = self._service(owner_qq="owner1")
+        service.note_reply_target(
+            self._event(sender="u2", text="在的"),
+            {"window_tag": "aiocqhttp:GroupMessage:100", "speaker_id": "u2", "speaker_name": "阿U"},
+        )
+        hint = service.blank_mention_hint(self._event(sender="u2"), {"window_tag": "aiocqhttp:GroupMessage:100"})
+        self.assertIn("单独 @ 提醒", hint)
+        self.assertIn("很可能想接着刚才的话题", hint)
+
+    def test_hint_for_other_user_and_ttl(self):
+        service = self._service(owner_qq="owner1", blank_mention_hint_ttl_minutes=1)
+        self.store.set_meta(
+            "reply_target:aiocqhttp:GroupMessage:100",
+            json.dumps({"id": "u3", "name": "小张", "ts": now_ts() - 600}, ensure_ascii=False),
+        )
+        hint = service.blank_mention_hint(self._event(sender="u2"), {"window_tag": "aiocqhttp:GroupMessage:100"})
+        self.assertEqual(hint, "")  # 超过 TTL
+        self.store.set_meta(
+            "reply_target:aiocqhttp:GroupMessage:100",
+            json.dumps({"id": "u3", "name": "小张", "ts": now_ts() - 30}, ensure_ascii=False),
+        )
+        hint2 = service.blank_mention_hint(self._event(sender="u2"), {"window_tag": "aiocqhttp:GroupMessage:100"})
+        self.assertIn("小张", hint2)
+        self.assertIn("不一定还是 ta", hint2)
+
+    def test_no_hint_when_disabled_or_has_text_or_private(self):
+        service = self._service(owner_qq="owner1", blank_mention_hint_enabled=False)
+        self.store.set_meta(
+            "reply_target:aiocqhttp:GroupMessage:100",
+            json.dumps({"id": "u2", "name": "阿U", "ts": now_ts()}, ensure_ascii=False),
+        )
+        self.assertEqual(
+            service.blank_mention_hint(self._event(sender="u2"), {"window_tag": "aiocqhttp:GroupMessage:100"}),
+            "",
+        )
+        enabled = self._service(owner_qq="owner1")
+        self.assertEqual(
+            enabled.blank_mention_hint(self._event(sender="u2", text="在吗"), {"window_tag": "aiocqhttp:GroupMessage:100"}),
+            "",
+        )
+        self.assertEqual(
+            enabled.blank_mention_hint(self._event(sender="u2"), {"window_tag": "aiocqhttp:FriendMessage:100"}),
+            "",
+        )
+        self.assertEqual(
+            enabled.blank_mention_hint(self._event(sender="u2", at_bot=False), {"window_tag": "aiocqhttp:GroupMessage:100"}),
+            "",
+        )
 
 
 if __name__ == "__main__":

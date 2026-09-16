@@ -368,6 +368,74 @@ class IntegrationTest(unittest.TestCase):
         rows = self.store.timeline_recent(limit=5)
         self.assertTrue([r for r in rows if r.role == "assistant" and "你好呀" in r.content])
 
+    # -- v4.9.0 谁对谁说 / 空@提醒 / 防抖 ------------------------------------
+
+    def test_addressee_captured(self):
+        from astrbot.api.message_components import At
+
+        event = make_event("小明看下这个", sid="u2", name="阿强", group="1")
+        event.message_obj.message = [At(qq="10001", name="小明"), Plain("小明看下这个")]
+        asyncio.run(self.plugin.on_message(event))
+        rows = self.store.timeline_recent(limit=3)
+        target = [row for row in rows if "小明看下这个" in row.content]
+        self.assertTrue(target)
+        self.assertIn("at:10001", target[0].addressee)
+
+    def test_blank_mention_hint_injected(self):
+        from astrbot.api.message_components import At
+        from astrbot.api.provider import ProviderRequest
+
+        self.service.note_reply_target(
+            make_event("在的", sid="u2", name="阿U", group="1"),
+            {"window_tag": "aiocqhttp:GroupMessage:1", "speaker_id": "u2", "speaker_name": "阿U"},
+        )
+        event = make_event("", sid="u2", name="阿U", group="1")
+        event.message_obj.message = [At(qq="bot1")]
+        req = ProviderRequest(prompt="", session_id="x")
+        asyncio.run(self.plugin.on_llm_request(event, req))
+        texts = [getattr(part, "text", "") for part in (req.extra_user_content_parts or [])]
+        self.assertTrue(any("单独 @ 提醒" in text for text in texts), texts)
+
+    def test_debounce_hold_and_flush(self):
+        self._reload_service(debounce_enabled=True, debounce_window_seconds=30, debounce_scope="both")
+        flushed: dict[str, str] = {}
+
+        async def fake_reinject(_event, text):
+            flushed["text"] = text
+
+        self.plugin._debounce_reinject = fake_reinject
+        first = make_event("在吗", sid="u1", name="阿U", group="1")
+        asyncio.run(self.plugin.debounce_collect(first))
+        self.assertTrue(first.is_stopped())
+        key = self.plugin._debounce_key(first)
+        self.assertIn(key, self.plugin._debounce_hold)
+
+        second = make_event("那个", sid="u1", name="阿U", group="1")
+        asyncio.run(self.plugin.debounce_collect(second))
+        self.assertTrue(second.is_stopped())
+        self.assertEqual(self.plugin._debounce_hold[key]["count"], 2)
+
+        asyncio.run(self.plugin._debounce_flush(key))
+        self.assertEqual(flushed.get("text"), "在吗那个")
+        self.assertNotIn(key, self.plugin._debounce_hold)
+
+    def test_debounce_skips_at_and_long_text(self):
+        from astrbot.api.message_components import At
+
+        self._reload_service(debounce_enabled=True, debounce_window_seconds=30)
+        at_event = make_event("在吗", sid="u1", name="阿U", group="1")
+        at_event.message_obj.message = [At(qq="bot1"), Plain("在吗")]
+        asyncio.run(self.plugin.debounce_collect(at_event))
+        self.assertFalse(at_event.is_stopped())
+        long_text = make_event("这是一条很长的消息不应该被防抖挂起", sid="u1", name="阿U", group="1")
+        asyncio.run(self.plugin.debounce_collect(long_text))
+        self.assertFalse(long_text.is_stopped())
+        # 私聊短消息（AstrBot 里 is_at_or_wake_command 恒为 True）仍应被防抖
+        private_event = make_event("在吗", sid="u1", name="阿U", group="")
+        private_event.is_at_or_wake_command = True
+        asyncio.run(self.plugin.debounce_collect(private_event))
+        self.assertTrue(private_event.is_stopped())
+
     # -- commands ----------------------------------------------------------
 
     def test_command_status_search_recent(self):

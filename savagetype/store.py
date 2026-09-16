@@ -276,6 +276,8 @@ class Store:
         tl_cols = self._table_cols("timeline")
         if "persona_id" not in tl_cols:
             self.execute("ALTER TABLE timeline ADD COLUMN persona_id TEXT NOT NULL DEFAULT ''")
+        if "addressee" not in tl_cols:
+            self.execute("ALTER TABLE timeline ADD COLUMN addressee TEXT NOT NULL DEFAULT ''")
         self.execute(
             "CREATE TABLE IF NOT EXISTS speaker_aliases ("
             "alias TEXT NOT NULL, "
@@ -524,8 +526,8 @@ class Store:
         if exists:
             return None
         cur = self.execute(
-            """INSERT INTO timeline(ts, speaker_id, speaker_name, bot_id, window_tag, role, content, summarized, fingerprint, persona_id)
-               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO timeline(ts, speaker_id, speaker_name, bot_id, window_tag, role, content, summarized, fingerprint, persona_id, addressee)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 event["ts"],
                 event["speaker_id"],
@@ -537,6 +539,7 @@ class Store:
                 0,
                 fp,
                 event.get("persona_id", ""),
+                event.get("addressee", ""),
             ),
         )
         return int(cur.lastrowid)
@@ -1662,6 +1665,7 @@ class Store:
             content=row["content"],
             summarized=row["summarized"],
             persona_id=row["persona_id"] if "persona_id" in keys else "",
+            addressee=row["addressee"] if "addressee" in keys else "",
         )
 
     def _fact(self, row: sqlite3.Row) -> Fact:

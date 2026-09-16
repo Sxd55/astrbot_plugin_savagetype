@@ -2,7 +2,7 @@
 
 **Savage Type** 是面向 AstrBot 的全局人格记忆中枢。Savage 只是插件名：身份和语气永远读 AstrBot 当前人格，本插件只负责**记住事实、处理改口、在需要时把少量相关记忆注入本轮对话**。不改写人格文件，不做日程和主动陪伴。
 
-当前版本 `v4.8.0`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
+当前版本 `v4.9.1`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
 要求 AstrBot `>= 4.22.0`；运行依赖只有 `jieba`（可选，BM25 分词用，装不上自动回退）；离线测试只需 Python 3.11+ 标准库。
 
 ---
@@ -111,6 +111,9 @@
 | `/stype default <群号\|序号>` | 设置默认群（指派发言的默认目标；`clear` 清除） |
 - **免@主动接话（v4.7.0）**：群聊里没 @ 机器人时，插件按 `reply_gate_mode` 判定是否主动接话——probability 按概率、keyword 命中词表、memory 只在「这条消息命中了记忆（核心/相关事实/事件）」时才接；判定命中后把事件标记为已唤醒，走 AstrBot 默认 LLM 通路（人格 / 记忆注入 / 分段 / TTS 全部照旧）。另有同群冷却（`reply_gate_cooldown_seconds`）、每群每日上限（`reply_gate_daily_limit`）、群白名单（`reply_gate_groups`）、最小字数与跳过命令（`reply_gate_min_chars` / `reply_gate_skip_commands`）。建议与 AstrBot 内置「主动回复」（配置→扩展功能→群聊上下文感知）**二选一**，避免重复接话；判定过程记录在 `/stype diagnostics` 的 `reply_gate` 项。
 - **指派发言（v4.8.0）**：主人在私聊说「去群里说：晚上八点开黑」「跟群友说 明天休息」「去 2 群说：我下课了」「去 987654321 群说：到家了」，Bot 就会把这句发到目标群（默认群或指定群），并回执「已发到群 X」。目标群从插件见过的群窗口里解析（`/stype groups` 查看编号，`/stype default` 设默认群）；发言会计入目标群时间线（`speak_record_to_target`）保证记忆一致；另有每分钟限流、最大字数与群名单（`speak_groups`）约束。发送走 `context.send_message`，需要平台支持主动消息（QQ/NapCat 支持）。
+- **谁对谁说（v4.9.0）**：消息捕获时解析 @ 与引用组件，窗口全流的每条记录升级为「谁 → 谁: 内容」（`timeline.addressee` 列，老数据为空不影响）。
+- **空@上下文提醒（v4.9.0）**：群里有人只 @ 机器人、不带正文时，注入「上次明确和你对话的人是 X（N 秒前、隔了 M 条）」的提醒，并给出「同一人可能在续话题；拿不准就自然问一句」的引导。开关与有效期见 `blank_mention_hint_*`。
+- **消息防抖（v4.9.0，启发式）**：用户短时间连发几条短消息时，插件先把消息挂起，在「最后一条之后等 `debounce_window_seconds`」或达到 `debounce_max_fragments` 后合并成一条重新提交（走完整的人格/记忆流程）。纯启发式判断（句末标点/连接词/长度），无模型依赖；@/唤醒消息默认直接回复。判定与合并记录在 `/stype diagnostics` 的 `debounce` 项。（v4.9.1 修复：命令回复如 `/stype flow` 的回执不再被当成 Bot 发言写入记忆。）
 - **新颖度过滤**：用户当前消息里已经说到的事实（值 ≥2 字）不重复注入。
 - **跨轮去重**：同一会话刚注入过的事实，在 `inject_dedup_window_seconds`（默认 600 秒）内不重复；「还记得 / 上次」类问题豁免；去重记录落库，重载插件不丢。
 - **预算**：`inject_budget_chars`（默认 800，0=不限）；超预算时事实按行尽量塞，黑话 / few-shot / 草稿整块丢；只有真的进了包的事实才占去重名额。
@@ -168,7 +171,7 @@
 - **事件**：经历/聊过的事件列表（当前 / 待审 / 已归档 / 置顶筛选），看原文（这一段消息）、编辑标题/摘要/要点/重要度、确认写入、置顶、删除与恢复。
 - **人物档案**：搜索、点选查看，改昵称/备注，条目增删改、置顶。
 - **诊断**：注入显微镜（路由、命中、过滤原因、`chars≈tokens`）、聊天导入、回收站（归档+被覆盖恢复，槽位冲突阻止）、原始 JSON 诊断、清空并重建（先自动备份）。
-- **设置**：126 项配置按左右分栏展示（左侧导航、右侧只显示选中的一组，未保存的输入切组不丢；保存按钮固定在右下；窄屏导航变为顶部横向条）——总开关与采集 / 抽取与整理 / 检索与注入 / 重要性与维护 / 学习与人格草稿 / 图片 / Embedding 与 Rerank / 外观。
+- **设置**：137 项配置按左右分栏展示（左侧导航、右侧只显示选中的一组，未保存的输入切组不丢；保存按钮固定在右下；窄屏导航变为顶部横向条）——总开关与采集 / 抽取与整理 / 检索与注入 / 重要性与维护 / 学习与人格草稿 / 图片 / Embedding 与 Rerank / 外观。
 - **外观**：Shader Gradient 风格——近黑底上跑真实 WebGL 片元着色器流动渐变（fbm 域扭曲），内容在磨砂玻璃面板上；5 组主题预设（极光 / 碧金 / 暮霞 / 午夜 / 森林）+ 三色取色器；**动态颜色**开关按固定顺序循环渐变（停 1 秒 / 过渡 5 秒），手动点预设自动关闭。
 - 动效降级：devicePixelRatio 封顶 2、离屏暂停、`prefers-reduced-motion` 单帧、WebGL 不可用或上下文丢失时回退静态 CSS 渐变。
 
@@ -313,6 +316,10 @@ pages/console/           面板：index.html / app.js / style.css / shader.js(We
 | `speak_groups` / `speak_require_owner` | 允许发言的群名单（留空=不额外限制）、是否仅主人可指派 |
 | `speak_rate_limit_per_min` / `speak_max_chars` | 每分钟上限（5）、单条最大字数（300） |
 | `speak_reply_receipt` / `speak_record_to_target` | 发送后私聊回执、是否记入目标群时间线 |
+| `blank_mention_hint_enabled` / `blank_mention_hint_ttl_minutes` / `blank_mention_hint_gap_messages` | 空@上下文提醒：开关、有效期（30 分钟）、间隔条数（12） |
+| `debounce_enabled` / `debounce_scope` | 消息防抖（启发式）：开关、范围（both/group/private） |
+| `debounce_window_seconds` / `debounce_max_seconds` / `debounce_max_fragments` | 防抖等待窗口（2.5 秒）、最长等待（8 秒）、最多合并条数（4） |
+| `debounce_short_chars` / `debounce_skip_wake` / `debounce_max_chars` | 只防抖短消息（12 字）、@/唤醒消息直接回复、合并上限（600 字） |
 | `entity_linking_enabled` / `entity_boost_weight` | 实体链接开关与命中加成分（默认 0.2） |
 | `history_enabled` / `history_max_facts` | 时序查询开关与历史块条数上限（默认 6） |
 | `importance_weight` / `importance_half_life_days` / `importance_reinforce_factor` / `importance_max_half_life_multiplier` / `importance_prune_threshold` | 重要性、半衰期、强化、归档阈值 |

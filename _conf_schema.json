@@ -766,5 +766,71 @@
     "type": "bool",
     "hint": "开启后这次主动发言会写进目标群的时间线，保持记忆与上下文一致。",
     "default": true
+  },
+  "blank_mention_hint_enabled": {
+    "description": "空@上下文提醒",
+    "type": "bool",
+    "hint": "群里有人只 @ 机器人、不带正文时，注入「上次和谁在聊、隔了多久」的提醒，帮它判断是续话题还是只是叫人。",
+    "default": true
+  },
+  "blank_mention_hint_ttl_minutes": {
+    "description": "空@提醒有效期（分钟）",
+    "type": "int",
+    "hint": "超过这个时间就不再提「上次的对话对象」。",
+    "default": 30
+  },
+  "blank_mention_hint_gap_messages": {
+    "description": "空@提醒的间隔条数",
+    "type": "int",
+    "hint": "上次回复之后群里又聊了几条；超过这个条数就只提醒「不一定还是 ta」。",
+    "default": 12
+  },
+  "debounce_enabled": {
+    "description": "消息防抖（启发式）",
+    "type": "bool",
+    "hint": "用户短时间连发几条短消息时，等说完再一次性回复；纯启发式判断，无模型依赖。",
+    "default": false
+  },
+  "debounce_scope": {
+    "description": "防抖范围",
+    "type": "string",
+    "hint": "both=群聊和私聊；group=仅群聊；private=仅私聊。",
+    "default": "both"
+  },
+  "debounce_window_seconds": {
+    "description": "防抖等待窗口（秒）",
+    "type": "float",
+    "hint": "最后一条消息之后等多久就合并发送。建议 1.5~3。",
+    "default": 2.5
+  },
+  "debounce_max_seconds": {
+    "description": "防抖最长等待（秒）",
+    "type": "int",
+    "hint": "从第一条碎片算起最多等多久，超过就强制发送。",
+    "default": 8
+  },
+  "debounce_max_fragments": {
+    "description": "防抖最多合并条数",
+    "type": "int",
+    "hint": "达到条数立即合并发送。",
+    "default": 4
+  },
+  "debounce_short_chars": {
+    "description": "防抖只处理短消息",
+    "type": "int",
+    "hint": "超过这个字数的消息直接放行，不等待。",
+    "default": 12
+  },
+  "debounce_skip_wake": {
+    "description": "防抖跳过@/唤醒消息",
+    "type": "bool",
+    "hint": "被 @ 或唤醒词触发的消息立即回复，不进入防抖。",
+    "default": true
+  },
+  "debounce_max_chars": {
+    "description": "防抖合并上限字数",
+    "type": "int",
+    "hint": "合并后的消息超过这个字数会截断。",
+    "default": 600
   }
 }

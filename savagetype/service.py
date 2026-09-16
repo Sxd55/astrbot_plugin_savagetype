@@ -34,6 +34,11 @@ from .events import EventPipeline
 from .extract import Extractor
 from .inject import build_pack
 from .learn import LearningEngine
+from .addressee import (
+    from_components as addressee_from_components,
+    has_bot_mention,
+    render_addressee,
+)
 from .profile import build_profile_card
 from .speak import (
     allowed_target,
@@ -629,12 +634,108 @@ class SavageTypeService:
                 "role": ROLE_USER,
                 "content": clip(text, 2000),
                 "fingerprint": fingerprint(ident.get("persona_id"), ident["speaker_id"], ROLE_USER, ts, text),
+                "addressee": self.addressee_from_event(event),
                 **ident,
             }
         )
         if event_id:
             self._clear_capture_skip()
         return event_id
+
+    def addressee_from_event(self, event: Any) -> str:
+        """解析当前消息的收件人（@ 谁 / 回复谁），失败返回空串。"""
+        try:
+            components = getattr(getattr(event, "message_obj", None), "message", None) or []
+            return addressee_from_components(components)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def note_reply_target(self, event: Any, ident: dict[str, str]) -> None:
+        """记录「Bot 最近一次明确回复的人」，供空 @ 提示使用。"""
+        window = str(ident.get("window_tag") or "")
+        if not window:
+            return
+        try:
+            payload = {
+                "id": str(ident.get("speaker_id") or ""),
+                "name": str(ident.get("speaker_name") or ""),
+                "ts": now_ts(),
+            }
+            self.store.set_meta(f"reply_target:{window}", json.dumps(payload, ensure_ascii=False))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def last_reply_target(self, window_tag: str) -> dict[str, Any]:
+        window = str(window_tag or "")
+        if not window:
+            return {}
+        raw = self.store.get_meta(f"reply_target:{window}")
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def blank_mention_hint(self, event: Any, ident: dict[str, str]) -> str:
+        """空 @（只有 @、没有正文）时给的上下文提醒。"""
+        if not bool(self._cfg_value("blank_mention_hint_enabled", True)):
+            return ""
+        try:
+            window = str(ident.get("window_tag") or "")
+            if window_kind(window) != "group":
+                return ""
+            components = getattr(getattr(event, "message_obj", None), "message", None) or []
+            raw_addressee = addressee_from_components(components)
+            self_id = ""
+            try:
+                self_id = str(event.message_obj.self_id or "")
+            except Exception:  # noqa: BLE001
+                self_id = ""
+            if not has_bot_mention(raw_addressee, self_id):
+                return ""
+            text = str(getattr(event, "message_str", "") or "").strip()
+            if len(text) > 1:
+                return ""
+            target = self.last_reply_target(window)
+            if not target:
+                return ""
+            speaker = str(getattr(event, "message_str", "") or "")
+            try:
+                sender_id = str(event.get_sender_id() or "")
+            except Exception:  # noqa: BLE001
+                sender_id = ""
+            ttl_minutes = max(1, int(self._cfg_value("blank_mention_hint_ttl_minutes", 30)))
+            age = now_ts() - int(target.get("ts") or 0)
+            if age > ttl_minutes * 60:
+                return ""
+            same_user = bool(sender_id) and str(target.get("id") or "") == sender_id
+            name = str(target.get("name") or target.get("id") or "对方")
+            gap = max(0, int(self._cfg_value("blank_mention_hint_gap_messages", 12)))
+            recent = self.store.query(
+                "SELECT COUNT(*) FROM timeline WHERE window_tag=? AND ts>?",
+                (window, int(target.get("ts") or 0)),
+            )
+            since = int(recent[0][0] or 0) if recent else 0
+            lines = ["【单独 @ 提醒】这条消息只有 @，没有正文。"]
+            if same_user and age <= 600 and since <= gap:
+                lines.append(
+                    f"上次明确和你对话的人就是 ta（{age} 秒前、之后隔了 {since} 条消息），"
+                    "很可能想接着刚才的话题：参考最近上下文自然续；"
+                )
+            else:
+                lines.append(
+                    f"你上次明确回复的人是 {name}（{age} 秒前、之后隔了 {since} 条消息），"
+                    "但这次 @ 你的不一定还是 ta；"
+                )
+            lines.append("拿不准时别强行续话，自然回一句「怎么了」「？」之类即可。")
+            block = "\n".join(lines)
+            self.store.add_diag("blank_mention", {"window": window, "same_user": same_user, "age": age})
+            return block
+        except Exception as exc:  # noqa: BLE001
+            self.store.add_diag("blank_mention_fail", {"error": str(exc)[:160]})
+            return ""
 
     def capture_bot(self, event: Any, text: str) -> int | None:
         ident = self._ident_from_event(event)

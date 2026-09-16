@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 from .crosswin import window_kind
+from .addressee import render_addressee
 from .util import ROLE_ASSISTANT, ROLE_USER, clip, fmt_ts, now_ts
 
 HEADER = (
@@ -59,10 +60,14 @@ def _who(event: Any) -> str:
     if role == ROLE_ASSISTANT:
         return "我(Bot)"
     name = str(getattr(event, "speaker_name", "") or "").strip()
-    if name:
-        return name
-    speaker = str(getattr(event, "speaker_id", "") or "").strip()
-    return speaker or "某人"
+    if not name:
+        name = str(getattr(event, "speaker_id", "") or "").strip() or "某人"
+    target = render_addressee(
+        str(getattr(event, "addressee", "") or ""),
+        self_id=str(getattr(event, "bot_id", "") or ""),
+        bot_label="你",
+    )
+    return f"{name} → {target}" if target else name
 
 
 def build_window_flow(

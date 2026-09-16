@@ -18,6 +18,7 @@ class TimelineEvent:
     content: str
     summarized: int = 0
     persona_id: str = ""
+    addressee: str = ""
 
 
 @dataclass

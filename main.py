@@ -4,6 +4,7 @@ import base64
 import json
 import mimetypes
 import re
+import time
 import urllib.parse
 
 from astrbot.api import AstrBotConfig, logger
@@ -18,6 +19,9 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path, get_astrbot_p
 try:
     from .savagetype import __version__ as PLUGIN_VERSION
     from .savagetype.service import SavageTypeService
+    from .savagetype.addressee import has_bot_mention
+    from .savagetype.debounce import is_probably_incomplete, merge_fragments
+    from .savagetype.crosswin import window_kind
     from .savagetype.slots import apply_slot
     from .savagetype.speak import group_label
     from .savagetype.store import Store
@@ -34,6 +38,9 @@ try:
 except ImportError:
     from savagetype import __version__ as PLUGIN_VERSION
     from savagetype.service import SavageTypeService
+    from savagetype.addressee import has_bot_mention
+    from savagetype.debounce import is_probably_incomplete, merge_fragments
+    from savagetype.crosswin import window_kind
     from savagetype.slots import apply_slot
     from savagetype.speak import group_label
     from savagetype.store import Store
@@ -67,7 +74,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "4.8.0",
+    "4.9.1",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -85,6 +92,8 @@ class SavageTypePlugin(Star):
             send_message=self._send_message,
         )
         self._register_pages()
+        self._debounce_hold: dict[str, dict] = {}
+        self._debounce_skip: set[str] = set()
         logger.info("Savage Type loaded, db=%s", self.store.db_path)
 
     async def initialize(self):
@@ -262,6 +271,10 @@ class SavageTypePlugin(Star):
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         try:
+            if event.get_extra("_stype_debounce_merge"):
+                # 防抖：这条碎片已经并入待发送的消息，本次不回复。
+                event.stop_event()
+                return
             self.service.refresh_coexistence(self.context.get_all_stars())
             if not self.service.inject_ok(event):
                 return
@@ -271,31 +284,37 @@ class SavageTypePlugin(Star):
             except Exception:
                 cached_text = ""
             query = (cached_text or event.message_str or req.prompt or "").strip()
-            if not query:
-                return
             persona_id = await self._persona_id(event)
             ident = self.service.identity_from_event(event, persona_id=persona_id)
             event.set_extra("_stype_ident", ident)
-            pack, result, snapshot = await self.service.build_injection(
-                query,
-                ident["speaker_id"],
-                persona_id=persona_id,
-                window_tag=ident.get("window_tag") or "",
-            )
-            flow_block, flow_meta = self.service.window_flow_for(
-                query,
-                window_tag=ident.get("window_tag") or "",
-                persona_id=persona_id,
-            )
-            if not pack and not flow_block:
+            mention_hint = self.service.blank_mention_hint(event, ident)
+            pack = ""
+            flow_block = ""
+            snapshot: dict = {}
+            flow_meta: dict = {}
+            if query:
+                pack, result, snapshot = await self.service.build_injection(
+                    query,
+                    ident["speaker_id"],
+                    persona_id=persona_id,
+                    window_tag=ident.get("window_tag") or "",
+                )
+                flow_block, flow_meta = self.service.window_flow_for(
+                    query,
+                    window_tag=ident.get("window_tag") or "",
+                    persona_id=persona_id,
+                )
+            if not pack and not flow_block and not mention_hint:
                 return
             if pack:
                 self._append_pack(req, pack)
             if flow_block:
                 self._append_pack(req, flow_block)
+            if mention_hint:
+                self._append_pack(req, mention_hint)
             if self.config.get("debug_log_injection"):
                 logger.info(
-                    "Savage Type inject route=%s path=%s cache=%s core=%s related=%s chars=%s window_flow=%s",
+                    "Savage Type inject route=%s path=%s cache=%s core=%s related=%s chars=%s window_flow=%s blank_mention=%s",
                     snapshot.get("route"),
                     snapshot.get("path"),
                     snapshot.get("cache"),
@@ -303,9 +322,154 @@ class SavageTypePlugin(Star):
                     snapshot.get("related"),
                     snapshot.get("pack_chars"),
                     flow_meta.get("items"),
+                    bool(mention_hint),
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Savage Type inject failed: %s", exc)
+
+    @filter.on_waiting_llm_request()
+    async def debounce_collect(self, event: AstrMessageEvent):
+        """防抖：短时间连发的短消息合并成一条再提交（启发式，无模型依赖）。"""
+        try:
+            if not self.config.get("debounce_enabled"):
+                return
+            message_id = ""
+            try:
+                message_id = str(event.message_obj.message_id or "")
+            except Exception:
+                message_id = ""
+            if message_id and message_id in self._debounce_skip:
+                self._debounce_skip.discard(message_id)
+                return
+            if event.get_extra("_stype_debounce_merge"):
+                event.stop_event()
+                return
+            if not self._debounce_qualifies(event):
+                return
+            key = self._debounce_key(event)
+            text = str(event.message_str or "").strip()
+            now = time.time()
+            window = max(0.5, float(self.config.get("debounce_window_seconds", 2.5) or 2.5))
+            max_seconds = max(1.0, float(self.config.get("debounce_max_seconds", 8) or 8))
+            max_fragments = max(2, int(self.config.get("debounce_max_fragments", 4) or 4))
+            hold = self._debounce_hold.get(key)
+            if hold and str(hold.get("speaker")) == str(event.get_sender_id()):
+                hold["fragments"].append(text)
+                hold["count"] = int(hold.get("count", 1)) + 1
+                hold["deadline"] = min(now + window, float(hold.get("start", now)) + max_seconds)
+                if hold.get("task"):
+                    hold["task"].cancel()
+                if hold["count"] >= max_fragments:
+                    await self._debounce_flush(key)
+                    event.stop_event()
+                    return
+                hold["task"] = asyncio.create_task(self._debounce_timer(key, hold["deadline"] - now))
+                event.stop_event()
+                return
+            if hold:
+                # 换人或超时：先把之前合并的放出去（异步），本条按正常流程走。
+                asyncio.create_task(self._debounce_flush(key))
+            hold = {
+                "speaker": str(event.get_sender_id()),
+                "fragments": [text],
+                "count": 1,
+                "start": now,
+                "deadline": now + window,
+                "event": event,
+            }
+            hold["task"] = asyncio.create_task(self._debounce_timer(key, window))
+            self._debounce_hold[key] = hold
+            event.stop_event()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Savage Type debounce failed: %s", exc)
+
+    async def _debounce_timer(self, key: str, delay: float) -> None:
+        try:
+            await asyncio.sleep(max(0.2, float(delay)))
+            await self._debounce_flush(key)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Savage Type debounce timer failed: %s", exc)
+
+    async def _debounce_flush(self, key: str) -> None:
+        hold = self._debounce_hold.pop(key, None)
+        if not hold:
+            return
+        task = hold.get("task")
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        merged = merge_fragments(
+            [str(item) for item in (hold.get("fragments") or [])],
+            max_chars=max(60, int(self.config.get("debounce_max_chars", 600) or 600)),
+        )
+        event = hold.get("event")
+        if not merged or event is None:
+            return
+        self.store.add_diag("debounce", {"chars": len(merged), "fragments": int(hold.get("count", 1))})
+        await self._debounce_reinject(event, merged)
+
+    async def _debounce_reinject(self, event: AstrMessageEvent, text: str) -> None:
+        """把合并后的消息重新提交进 AstrBot 管道（走完整的人格/记忆流程）。"""
+        from astrbot.core.message.components import Plain
+        from astrbot.core.star.star_tools import StarTools
+
+        components = [c for c in (event.message_obj.message or []) if not isinstance(c, Plain)]
+        components.insert(0, Plain(text))
+        message = await StarTools.create_message(
+            type=str(event.message_obj.type.value),
+            self_id=event.get_self_id(),
+            session_id=event.session_id,
+            sender=event.message_obj.sender,
+            message=components,
+            message_str=text,
+            group_id=event.get_group_id() or "",
+            message_id=event.message_obj.message_id,
+        )
+        try:
+            self._debounce_skip.add(str(message.message_id))
+        except Exception:  # noqa: BLE001
+            pass
+        await StarTools.create_event(
+            abm=message,
+            platform=event.get_platform_name(),
+            is_wake=True,
+        )
+        if self.config.get("debug_log_injection"):
+            logger.info("Savage Type debounce flushed: %s", text[:60])
+
+    def _debounce_key(self, event: AstrMessageEvent) -> str:
+        try:
+            return f"{event.get_platform_name()}:{event.session_id}"
+        except Exception:  # noqa: BLE001
+            return str(event.unified_msg_origin or "unknown")
+
+    def _debounce_qualifies(self, event: AstrMessageEvent) -> bool:
+        scope = str(self.config.get("debounce_scope", "both") or "both").strip().lower()
+        is_private = window_kind(event.unified_msg_origin) == "private"
+        if scope == "group" and is_private:
+            return False
+        if scope == "private" and not is_private:
+            return False
+        if bool(self.config.get("debounce_skip_wake", True)):
+            try:
+                self_id = str(getattr(event.message_obj, "self_id", "") or "")
+            except Exception:  # noqa: BLE001
+                self_id = ""
+            if self_id and has_bot_mention(self.service.addressee_from_event(event), self_id):
+                # 明确 @ 机器人的消息立即回复，不等待。
+                return False
+        text = str(event.message_str or "").strip()
+        if not text or text.startswith(("/", "／", "!")):
+            return False
+        if self._has_image(event):
+            return False
+        try:
+            short_chars = max(2, int(self.config.get("debounce_short_chars", 12) or 12))
+        except (TypeError, ValueError):
+            short_chars = 12
+        return is_probably_incomplete(text, short_chars=short_chars)
+
 
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
@@ -313,6 +477,10 @@ class SavageTypePlugin(Star):
             text = getattr(resp, "completion_text", "") or ""
             self.service.capture_bot(event, text)
             event.set_extra("_stype_bot_captured", True)
+            ident = event.get_extra("_stype_ident")
+            if not ident:
+                ident = self.service.identity_from_event(event)
+            self.service.note_reply_target(event, ident)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Savage Type bot capture failed: %s", exc)
 
@@ -321,6 +489,9 @@ class SavageTypePlugin(Star):
         # Bot 正文以 on_llm_response 为准，这里只补无 LLM 的主动发送。
         try:
             if event.get_extra("_stype_bot_captured"):
+                return
+            if self.service.is_command_text(str(event.message_str or ""), event):
+                # 命令回复（/stype flow 等）是人给插件的指令回执，不是 Bot 的聊天发言。
                 return
             result = event.get_result()
             if result is None:
