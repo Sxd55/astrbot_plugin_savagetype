@@ -21,6 +21,13 @@
 
 （v5.0.0 追加）免@接话 v2 验证：
 
+（v5.1.0 追加）疑问句命中验证：
+
+1. 面板写一条备注类事实：属性 `note`、值填短话题词（如「闺蜜」）、内容写完整叙述（如「她俩大一社团认识，闺蜜叫小美」）；
+2. 聊天里问「你闺蜜是谁」→ 确认 Bot 直接答得出来（不再需要"查一下"）；`/stype diagnostics` 的 `inject` 里该条不应再是 `query_mentioned`；
+3. 聊天里陈述「我闺蜜是小美」→ 确认仍然不会重复注入（防重复行为未破坏）。
+
+
 1. 配置 `reply_gate_enabled=true`、`reply_gate_mode=judge`、阈值 0.6、`reply_gate_min_interval_seconds=0`；
 2. 群里发一条开放话轮的消息（不@任何人），确认 Bot 按判定接话，`/stype diagnostics` 里 `reply_gate` 的 `reason=judge_pass`；
 3. 发一条 `@某人 你看下` 的消息，确认 Bot **不接**（`reason=turn_not_open`）；

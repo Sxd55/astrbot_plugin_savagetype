@@ -4023,5 +4023,49 @@ class ReplyGateV2Test(unittest.TestCase):
         self.assertFalse(ok3)
 
 
+
+    def test_question_query_not_blocked_by_novelty_filter(self):
+        """v5.1.0：问「你闺蜜是谁」时，value=闺蜜 的事实不该被 query_mentioned 挡掉。"""
+        from savagetype.service import SavageTypeService
+
+        self.store.add_fact(
+            {
+                "subject": "self",
+                "attribute": "note",
+                "value": "闺蜜",
+                "plain": "闺蜜是小美",
+                "content": "她俩是大一社团认识的，因为都爱摄影，闺蜜叫小美",
+                "speaker_id": "u1",
+                "speaker_name": "阿U",
+                "status": "live",
+                "confidence": 0.9,
+                "first_person": 1,
+            }
+        )
+        service = SavageTypeService(
+            store=self.store,
+            config={"inject_novelty_filter": True, "memory_session_isolation": "off"},
+            llm_generate=lambda *_a, **_k: "",
+            get_provider=lambda *_a, **_k: None,
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, debug=lambda *a, **k: None),
+        )
+        service.apply_config()
+
+        pack, result, _snapshot = asyncio.run(
+            service.build_injection("你闺蜜是谁？", "u1", window_tag="w1")
+        )
+        self.assertIn("小美", pack)
+        reasons = [h.filter_reason for h in result.blocked]
+        self.assertNotIn("query_mentioned", reasons)
+
+        # 陈述句仍然保持过滤：用户自己说了“闺蜜是小美”，不必重复注入。
+        pack2, result2, _snap2 = asyncio.run(
+            service.build_injection("我闺蜜是小美", "u1", window_tag="w1")
+        )
+        reasons2 = [h.filter_reason for h in result2.blocked]
+        self.assertNotIn("小美", pack2)
+        self.assertTrue(reasons2)  # 陈述句场景仍被挡（去重或已提及，取决于注入窗口）
+
+
 if __name__ == "__main__":
     unittest.main()

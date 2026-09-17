@@ -10,6 +10,7 @@ from . import tokenize as tokenizer_mod
 from .bm25 import BM25Index, event_text
 from .models import Event, Fact, RetrievalHit, RetrievalResult
 from .store import Store
+from .replygate import question_like
 from .util import (
     HISTORY_RE,
     LOW_INFO_RE,
@@ -241,10 +242,19 @@ class Retriever:
         query_norm = normalize_slot(query)
         mentioned_ids: set[int] = set()
         if skip_query_mentions and query_norm:
+            # 疑问句豁免：问「你闺蜜是谁」时，value 里的「闺蜜」必然出现在问句里，
+            # 但用户是在“问这个”，不是在“说这个”——此时不当作已提及，
+            # 只要 content 比 value 更完整（名字、原因在里面）就照常注入。
+            asking = question_like(query)
             for hit in hits:
                 value_norm = normalize_slot(hit.fact.value or "")
-                if len(value_norm) >= 2 and value_norm in query_norm:
-                    mentioned_ids.add(hit.fact.id)
+                if len(value_norm) < 2 or value_norm not in query_norm:
+                    continue
+                content = str(getattr(hit.fact, "content", "") or "").strip()
+                value = str(getattr(hit.fact, "value", "") or "").strip()
+                if asking and len(content) > len(value) + 4:
+                    continue
+                mentioned_ids.add(hit.fact.id)
 
         if skip_ids or mentioned_ids:
             filtered: list[RetrievalHit] = []
@@ -255,7 +265,7 @@ class Retriever:
                         RetrievalHit(fact=fact, score=0, source="filter", filter_reason="recently_injected")
                     )
                     continue
-                if fact.id in mentioned_ids:
+                if fact.id in mentioned_ids and not int(getattr(fact, "pinned", 0)):
                     blocked.append(
                         RetrievalHit(fact=fact, score=0, source="filter", filter_reason="query_mentioned")
                     )

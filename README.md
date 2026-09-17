@@ -2,7 +2,7 @@
 
 **Savage Type** 是面向 AstrBot 的全局人格记忆中枢。Savage 只是插件名：身份和语气永远读 AstrBot 当前人格，本插件只负责**记住事实、处理改口、在需要时把少量相关记忆注入本轮对话**。不改写人格文件，不做日程和主动陪伴。
 
-当前版本 `v5.0.0`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
+当前版本 `v5.1.0`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
 要求 AstrBot `>= 4.22.0`；运行依赖只有 `jieba`（可选，BM25 分词用，装不上自动回退）；离线测试只需 Python 3.11+ 标准库。
 
 ---
@@ -110,6 +110,7 @@
 | `/stype groups` | 列出已知群与编号（指派发言选目标用） |
 | `/stype default <群号\|序号>` | 设置默认群（指派发言的默认目标；`clear` 清除） |
 - **免@主动接话（v4.7.0）**：群聊里没 @ 机器人时，插件按 `reply_gate_mode` 判定是否主动接话——probability 按概率、keyword 命中词表、memory 只在「这条消息命中了记忆（核心/相关事实/事件）」时才接；判定命中后把事件标记为已唤醒，走 AstrBot 默认 LLM 通路（人格 / 记忆注入 / 分段 / TTS 全部照旧）。另有同群冷却（`reply_gate_cooldown_seconds`）、每群每日上限（`reply_gate_daily_limit`）、群白名单（`reply_gate_groups`）、最小字数与跳过命令（`reply_gate_min_chars` / `reply_gate_skip_commands`）。建议与 AstrBot 内置「主动回复」（配置→扩展功能→群聊上下文感知）**二选一**，避免重复接话；判定过程记录在 `/stype diagnostics` 的 `reply_gate` 项。
+- **疑问句不再误伤（v5.1.0）**：`query_mentioned` 过滤此前会把「你闺蜜是谁」这类问句里出现的短 value 当作「用户已经说过」而整条挡掉，导致 Bot 明明有记录却答不上来（要查一下才知道）。现在**疑问句 + content 比 value 更完整**时不再过滤，正常注入完整内容；陈述句（「我闺蜜是小美」）与置顶条目行为不变。
 - **免@接话 v2（v5.0.0）**：把「一次掷骰子」换成**分层漏斗**——①规则预筛（长度/命令/白名单/冷却/硬间隔/日限）→ ②**称呼命中必接**（话里叫到 Bot 名字，不@也接）→ ③**话轮判断**（消息 @/引用了别人就不插嘴，只有开放话轮才可能接）→ ④模式判定（`probability` / `keyword` / `memory` / **`judge` 读空气**：四维打分 相关度 0.3 / 意愿 0.25 / 氛围 0.25 / 时机 0.2，过阈值才接）→ ⑤**无人应答检测**（问句发出后等 N 秒没人回应，Bot 再接「没人答我来」）。另有 **免打扰时段**（`reply_gate_quiet_hours`）。每层判定原因都记录在 `/stype diagnostics` 的 `reply_gate` / `reply_gate_delayed` 项。
 - **指派发言（v4.8.0）**：主人在私聊说「去群里说：晚上八点开黑」「跟群友说 明天休息」「去 2 群说：我下课了」「去 987654321 群说：到家了」，Bot 就会把这句发到目标群（默认群或指定群），并回执「已发到群 X」。目标群从插件见过的群窗口里解析（`/stype groups` 查看编号，`/stype default` 设默认群）；发言会计入目标群时间线（`speak_record_to_target`）保证记忆一致；另有每分钟限流、最大字数与群名单（`speak_groups`）约束。发送走 `context.send_message`，需要平台支持主动消息（QQ/NapCat 支持）。
 - **谁对谁说（v4.9.0）**：消息捕获时解析 @ 与引用组件，窗口全流的每条记录升级为「谁 → 谁: 内容」（`timeline.addressee` 列，老数据为空不影响）。

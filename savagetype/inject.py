@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 
 from .learn import term_in_query
+from .replygate import question_like
 from .models import Event, Fact, LearningPack, RetrievalResult
 from .util import SCOPE_OWNER, clip, fmt_date, fmt_ts, normalize_slot
 
@@ -147,8 +148,13 @@ def _append_core_lines(
     return block
 
 
-def _mentions_query(fact: Fact, query_norm: str) -> bool:
+def _mentions_query(fact: Fact, query_norm: str, asking: bool = False) -> bool:
     if not query_norm:
+        return False
+    content = str(getattr(fact, "content", "") or "").strip()
+    value = str(getattr(fact, "value", "") or "").strip()
+    if asking and len(content) > len(value) + 4:
+        # 疑问句里出现话题词不算“已经说过”，让完整内容能被注入。
         return False
     texts = [fact.value or ""]
     texts.extend(str(k) for k in (getattr(fact, "keywords", None) or []))
@@ -165,6 +171,7 @@ def _warm_needed(
     facts: list[Fact],
     triggers: re.Pattern[str],
     routes: set[str],
+    asking: bool = False,
 ) -> bool:
     if not facts:
         return False
@@ -172,7 +179,7 @@ def _warm_needed(
         return True
     if triggers.search(query_norm):
         return True
-    return any(_mentions_query(f, query_norm) for f in facts)
+    return any(_mentions_query(f, query_norm, asking=asking) for f in facts)
 
 
 def build_pack(
@@ -230,9 +237,17 @@ def build_pack(
     route = result.route
     query_norm = normalize_slot(result.query or "")
     if warm_triggered:
-        include_promises = _warm_needed(route, query_norm, promises, PROMISE_TRIGGER_RE, {"recall", "time_window"})
+        asking = question_like(str(getattr(result, "query", "") or ""))
+        include_promises = _warm_needed(
+            route, query_norm, promises, PROMISE_TRIGGER_RE, {"recall", "time_window"}, asking=asking
+        )
         include_statuses = _warm_needed(
-            route, query_norm, statuses, STATUS_TRIGGER_RE, {"current_status", "recall", "time_window"}
+            route,
+            query_norm,
+            statuses,
+            STATUS_TRIGGER_RE,
+            {"current_status", "recall", "time_window"},
+            asking=asking,
         )
     else:
         include_promises = bool(promises)
