@@ -403,7 +403,7 @@ class IntegrationTest(unittest.TestCase):
         async def fake_reinject(_event, text):
             flushed["text"] = text
 
-        self.plugin._debounce_reinject = fake_reinject
+        self.plugin._reinject = fake_reinject
         first = make_event("在吗", sid="u1", name="阿U", group="1")
         asyncio.run(self.plugin.debounce_collect(first))
         self.assertTrue(first.is_stopped())
@@ -435,6 +435,153 @@ class IntegrationTest(unittest.TestCase):
         private_event.is_at_or_wake_command = True
         asyncio.run(self.plugin.debounce_collect(private_event))
         self.assertTrue(private_event.is_stopped())
+
+    # -- v5.0.0 免@接话 v2 -------------------------------------------------
+
+    def test_gate_name_hit_and_turn_filter(self):
+        self.plugin.config.update(
+            {
+                "reply_gate_enabled": True,
+                "reply_gate_mode": "probability",
+                "reply_gate_probability": 0.0,
+                "reply_gate_bot_names": "小助手",
+                "reply_gate_min_interval_seconds": 0,
+                "reply_gate_cooldown_seconds": 0,
+            }
+        )
+        self.service.apply_config()
+        event = make_event("小助手帮我看下", sid="u2", name="阿U", group="1")
+        asyncio.run(self.plugin.reply_gate(event))
+        self.assertTrue(event.is_at_or_wake_command)
+        self.assertEqual(event.get_extra("_stype_reply_gate").get("reason"), "name_hit")
+
+        from astrbot.api.message_components import At
+
+        recorded: dict[str, dict] = {}
+        original_for = self.service.reply_gate_for
+
+        async def spy(event, **kwargs):
+            fire, meta = await original_for(event, **kwargs)
+            recorded["meta"] = meta
+            return fire, meta
+
+        self.service.reply_gate_for = spy
+        other = make_event("小明你看", sid="u2", name="阿U", group="1")
+        other.message_obj.message = [At(qq="20002", name="小明"), Plain("小明你看")]
+        asyncio.run(self.plugin.reply_gate(other))
+        self.assertFalse(other.is_at_or_wake_command)
+        self.assertEqual(recorded["meta"].get("reason"), "turn_not_open")
+
+    def test_gate_judge_mode(self):
+        from astrbot.api.provider import ProviderRequest
+        from astrbot.core.agent.message import TextPart
+
+        self.plugin.config.update(
+            {
+                "reply_gate_enabled": True,
+                "reply_gate_mode": "judge",
+                "reply_gate_judge_threshold": 0.6,
+                "reply_gate_min_interval_seconds": 0,
+                "reply_gate_cooldown_seconds": 0,
+            }
+        )
+        self.service.apply_config()
+
+        async def fake_llm(_prompt, _provider):
+            return '{"relevance":9,"willingness":8,"social":9,"timing":8}'
+
+        self.service.llm_generate = fake_llm
+        event = make_event("这个方案大家怎么看", sid="u2", name="阿U", group="1")
+        asyncio.run(self.plugin.reply_gate(event))
+        self.assertTrue(event.is_at_or_wake_command)
+        meta = event.get_extra("_stype_reply_gate")
+        self.assertEqual(meta.get("reason"), "judge_pass")
+        self.assertGreaterEqual(meta.get("judge", {}).get("score", 0), 0.6)
+
+    def test_gate_unanswered_delayed_fire(self):
+        self.plugin.config.update(
+            {
+                "reply_gate_enabled": True,
+                "reply_gate_mode": "probability",
+                "reply_gate_probability": 0.0,
+                "reply_gate_unanswered_enabled": True,
+                "reply_gate_unanswered_seconds": 3,
+                "reply_gate_min_interval_seconds": 0,
+                "reply_gate_cooldown_seconds": 0,
+            }
+        )
+        self.service.apply_config()
+        fired: dict[str, str] = {}
+
+        async def fake_reinject(_event, text):
+            fired["text"] = text
+
+        self.plugin._reinject = fake_reinject
+        event = make_event("这个怎么弄？", sid="u2", name="阿U", group="1")
+        asyncio.run(self.plugin.reply_gate(event))
+        self.assertFalse(event.is_at_or_wake_command)
+        self.assertIn("aiocqhttp:GroupMessage:1", self.plugin._gate_pending)
+
+        import time as _time
+
+        asked_ts = int(_time.time()) - 2
+
+        async def run_check():
+            await self.plugin._unanswered_check(
+                "aiocqhttp:GroupMessage:1", "这个怎么弄？", "u2", {}, 1, event, asked_ts
+            )
+
+        asyncio.run(run_check())
+        self.assertEqual(fired.get("text"), "这个怎么弄？")
+
+    def test_gate_unanswered_skips_when_answered(self):
+        self.plugin.config.update(
+            {
+                "reply_gate_enabled": True,
+                "reply_gate_mode": "probability",
+                "reply_gate_probability": 0.0,
+                "reply_gate_unanswered_enabled": True,
+                "reply_gate_unanswered_seconds": 3,
+                "reply_gate_min_interval_seconds": 0,
+                "reply_gate_cooldown_seconds": 0,
+            }
+        )
+        self.service.apply_config()
+        fired: dict[str, str] = {}
+
+        async def fake_reinject(_event, text):
+            fired["text"] = text
+
+        self.plugin._reinject = fake_reinject
+        event = make_event("这个怎么弄？", sid="u2", name="阿U", group="1")
+        asyncio.run(self.plugin.reply_gate(event))
+        window = "aiocqhttp:GroupMessage:1"
+        self.assertIn(window, self.plugin._gate_pending)
+        from savagetype.util import now_ts as _now_ts
+
+        self.store.add_timeline(
+            {
+                "ts": _now_ts(),
+                "speaker_id": "u3",
+                "speaker_name": "小张",
+                "bot_id": "b",
+                "window_tag": window,
+                "role": "user",
+                "content": "我知道，是这样",
+                "persona_id": "",
+                "fingerprint": "answered-1",
+            }
+        )
+
+        import time as _time
+
+        asked_ts = int(_time.time()) - 2
+
+        async def run_check():
+            await self.plugin._unanswered_check(window, "这个怎么弄？", "u2", {}, 1, event, asked_ts)
+
+        asyncio.run(run_check())
+        self.assertEqual(fired, {})
 
     # -- commands ----------------------------------------------------------
 

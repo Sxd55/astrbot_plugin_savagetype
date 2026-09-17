@@ -3461,6 +3461,7 @@ class ReplyGateTest(unittest.TestCase):
             reply_gate_mode="probability",
             reply_gate_probability=1.0,
             reply_gate_cooldown_seconds=3600,
+            reply_gate_min_interval_seconds=0,
         )
         fire, meta = asyncio.run(service.reply_gate_for(self._event()))
         self.assertTrue(fire)
@@ -3476,6 +3477,7 @@ class ReplyGateTest(unittest.TestCase):
             reply_gate_probability=1.0,
             reply_gate_cooldown_seconds=0,
             reply_gate_daily_limit=1,
+            reply_gate_min_interval_seconds=0,
         )
         first, _meta = asyncio.run(service.reply_gate_for(self._event("第一句")))
         self.assertTrue(first)
@@ -3867,6 +3869,158 @@ class BlankMentionTest(unittest.TestCase):
             enabled.blank_mention_hint(self._event(sender="u2", at_bot=False), {"window_tag": "aiocqhttp:GroupMessage:100"}),
             "",
         )
+
+
+class ReplyGateV2Test(unittest.TestCase):
+    """免@接话 v2：话轮 / 点名 / 免打扰 / 读空气 / 无人应答。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "gate2.db")
+        self.llm_reply = '{"relevance":9,"willingness":7,"social":8,"timing":6}'
+        self.llm_calls = 0
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _service(self, **config):
+        from savagetype.service import SavageTypeService
+
+        async def fake_llm(_prompt: str, _provider: str) -> str:
+            self.llm_calls += 1
+            return self.llm_reply
+
+        service = SavageTypeService(
+            store=self.store,
+            config=config,
+            llm_generate=fake_llm,
+            get_provider=lambda *_a, **_k: None,
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, debug=lambda *a, **k: None),
+        )
+        service.apply_config()
+        return service
+
+    def _event(self, text="大家觉得怎么样", *, window="aiocqhttp:GroupMessage:100", sender="u2",
+               message=None, bot_id="bot1"):
+        return FakeEvent(sender=sender, window=window, message_text=text, message=message, bot_id=bot_id)
+
+    def _at(self, qq, name=""):
+        class At:
+            def __init__(self, q, n):
+                self.qq = q
+                self.name = n
+
+        return At(qq, name)
+
+    # ---- 纯函数 ----
+
+    def test_pure_helpers(self):
+        from savagetype.replygate import (
+            judge_parse,
+            name_hit,
+            parse_quiet_ranges,
+            question_like,
+            quiet_now,
+            turn_is_open,
+        )
+
+        self.assertEqual(turn_is_open("", "bot1")[0], True)
+        self.assertEqual(turn_is_open("at:20002|小明", "bot1"), (False, "turn_taken:20002"))
+        self.assertEqual(turn_is_open("at:bot1|", "bot1")[0], True)
+        self.assertEqual(name_hit("小鳄鱼在吗", ["小鳄鱼"]), (True, "name:小鳄鱼"))
+        self.assertEqual(name_hit("在吗", ["小鳄鱼"])[0], False)
+        self.assertTrue(question_like("这个怎么弄？"))
+        self.assertFalse(question_like("今天天气不错"))
+        ranges = parse_quiet_ranges("1:00-7:00;13-14")
+        self.assertEqual(ranges, [(60, 420), (780, 840)])
+        import datetime as dt
+
+        self.assertTrue(quiet_now("1:00-7:00", dt.datetime(2026, 9, 17, 3, 0))[0])
+        self.assertTrue(quiet_now("23:00-7:00", dt.datetime(2026, 9, 17, 2, 0))[0])
+        self.assertFalse(quiet_now("1:00-7:00", dt.datetime(2026, 9, 17, 12, 0))[0])
+        score, reason = judge_parse('{"relevance":10,"willingness":10,"social":10,"timing":10}')
+        self.assertEqual((score, reason), (1.0, "judged"))
+        self.assertEqual(judge_parse("看不懂")[1], "judge_unparsed")
+
+    # ---- 服务层 ----
+
+    def test_turn_filter_blocks_reply_to_others(self):
+        service = self._service(reply_gate_enabled=True, reply_gate_mode="probability",
+                                reply_gate_probability=1.0, reply_gate_min_interval_seconds=0,
+                                reply_gate_cooldown_seconds=0)
+        event = self._event(message=[self._at("20002", "小明")])
+        fire, meta = asyncio.run(service.reply_gate_for(event))
+        self.assertFalse(fire)
+        self.assertEqual(meta["reason"], "turn_not_open")
+        self.assertIn("turn_taken", meta["turn"])
+
+    def test_name_hit_fires_without_at(self):
+        service = self._service(reply_gate_enabled=True, reply_gate_mode="probability",
+                                reply_gate_probability=0.0, reply_gate_min_interval_seconds=0,
+                                reply_gate_cooldown_seconds=0, reply_gate_bot_names="小鳄鱼")
+        event = self._event("小鳄鱼帮我看下")
+        fire, meta = asyncio.run(service.reply_gate_for(event))
+        self.assertTrue(fire)
+        self.assertEqual(meta["reason"], "name_hit")
+
+    def test_quiet_hours_block_everything(self):
+        service = self._service(reply_gate_enabled=True, reply_gate_mode="probability",
+                                reply_gate_probability=1.0, reply_gate_min_interval_seconds=0,
+                                reply_gate_cooldown_seconds=0, reply_gate_bot_names="小鳄鱼",
+                                reply_gate_quiet_hours="0:00-23:59")
+        fire, meta = asyncio.run(service.reply_gate_for(self._event("小鳄鱼在吗")))
+        self.assertFalse(fire)
+        self.assertEqual(meta["reason"], "quiet_hours")
+
+    def test_judge_mode(self):
+        service = self._service(reply_gate_enabled=True, reply_gate_mode="judge",
+                                reply_gate_judge_threshold=0.6, reply_gate_min_interval_seconds=0,
+                                reply_gate_cooldown_seconds=0)
+        fire, meta = asyncio.run(service.reply_gate_for(self._event("这个方案大家怎么看")))
+        self.assertTrue(fire)
+        self.assertEqual(meta["mode"], "judge")
+        self.assertGreaterEqual(meta["judge"]["score"], 0.6)
+        self.assertEqual(self.llm_calls, 1)
+        self.assertNotIn("judge", meta["judge"])  # 结构检查：只应有分数信息
+        self.llm_reply = '{"relevance":2,"willingness":1,"social":2,"timing":1}'
+        fire2, meta2 = asyncio.run(service.reply_gate_for(self._event("随便说说")))
+        self.assertFalse(fire2)
+        self.assertEqual(meta2["reason"], "judge_below")
+
+    def test_delayed_eligibility_and_unanswered(self):
+        service = self._service(reply_gate_enabled=True, reply_gate_mode="probability",
+                                reply_gate_probability=0.0, reply_gate_min_interval_seconds=0,
+                                reply_gate_cooldown_seconds=0)
+        now = now_ts()
+        event = self._event("这个怎么弄？")
+        fire, meta = asyncio.run(service.reply_gate_for(event))
+        self.assertFalse(fire)
+        self.assertTrue(service.reply_gate_delayed_eligible(meta))
+
+        # 无人回应 → 可以接
+        ok, reason = service.reply_gate_delayed_ok("aiocqhttp:GroupMessage:100", now, "u2")
+        self.assertTrue(ok)
+        self.assertEqual(reason, "unanswered")
+
+        # 别人回应过 → 不能再接
+        self.store.add_timeline({
+            "ts": now + 5, "speaker_id": "u3", "speaker_name": "小张", "bot_id": "b",
+            "window_tag": "aiocqhttp:GroupMessage:100", "role": "user", "content": "我知道",
+            "persona_id": "", "fingerprint": "ans-1",
+        })
+        ok2, reason2 = service.reply_gate_delayed_ok("aiocqhttp:GroupMessage:100", now, "u2")
+        self.assertFalse(ok2)
+        self.assertEqual(reason2, "answered")
+
+        # Bot 自己回过了 → 不能再接
+        self.store.add_timeline({
+            "ts": now + 6, "speaker_id": "bot_self", "speaker_name": "bot", "bot_id": "b",
+            "window_tag": "aiocqhttp:GroupMessage:100", "role": "assistant", "content": "我来",
+            "persona_id": "", "fingerprint": "ans-2",
+        })
+        ok3, _reason3 = service.reply_gate_delayed_ok("aiocqhttp:GroupMessage:100", now, "u2")
+        self.assertFalse(ok3)
 
 
 if __name__ == "__main__":

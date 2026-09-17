@@ -572,11 +572,26 @@ class Store:
         rows = self.query(f"SELECT * FROM timeline WHERE id IN ({q}) ORDER BY ts ASC, id ASC", ids)
         return [self._timeline(r) for r in rows]
 
-    def timeline_recent(self, limit: int = 20, speaker_id: str | None = None) -> list[TimelineEvent]:
-        if speaker_id:
+    def timeline_recent(
+        self,
+        limit: int = 20,
+        speaker_id: str | None = None,
+        window_tag: str = "",
+    ) -> list[TimelineEvent]:
+        if speaker_id and window_tag:
+            rows = self.query(
+                "SELECT * FROM timeline WHERE speaker_id=? AND window_tag=? ORDER BY id DESC LIMIT ?",
+                (speaker_id, window_tag, limit),
+            )
+        elif speaker_id:
             rows = self.query(
                 "SELECT * FROM timeline WHERE speaker_id=? ORDER BY id DESC LIMIT ?",
                 (speaker_id, limit),
+            )
+        elif window_tag:
+            rows = self.query(
+                "SELECT * FROM timeline WHERE window_tag=? ORDER BY id DESC LIMIT ?",
+                (window_tag, limit),
             )
         else:
             rows = self.query("SELECT * FROM timeline ORDER BY id DESC LIMIT ?", (limit,))

@@ -674,8 +674,14 @@
   "reply_gate_mode": {
     "description": "接话判定方式",
     "type": "string",
-    "hint": "probability=按概率；keyword=命中关键词；memory=这条消息命中了记忆（核心/相关事实/事件）才接话。",
-    "default": "probability"
+    "hint": "probability=按概率；keyword=命中关键词；memory=这条消息命中了记忆（核心/相关事实/事件）才接话；judge=用模型读空气（四维打分过阈值才接，最稳但每次判定花一次模型调用）。",
+    "default": "probability",
+    "options": [
+      "probability",
+      "keyword",
+      "memory",
+      "judge"
+    ]
   },
   "reply_gate_probability": {
     "description": "接话概率",
@@ -832,5 +838,66 @@
     "type": "int",
     "hint": "合并后的消息超过这个字数会截断。",
     "default": 600
+  },
+  "reply_gate_judge_provider_id": {
+    "description": "读空气判定模型（judge 模式）",
+    "type": "string",
+    "hint": "用来给消息打分的模型；留空=当前会话模型。建议用便宜档模型。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "reply_gate_judge_threshold": {
+    "description": "读空气阈值",
+    "type": "float",
+    "hint": "四维加权分（相关度 0.3 / 意愿 0.25 / 氛围 0.25 / 时机 0.2，各维 0-10 归一化）达到这个值才接话。0.6 稳妥，0.5 更活跃。",
+    "default": 0.6
+  },
+  "reply_gate_judge_context_messages": {
+    "description": "读空气参考的最近消息数",
+    "type": "int",
+    "hint": "判定时附带的最近群消息条数，0=不带。",
+    "default": 6
+  },
+  "reply_gate_turn_filter_enabled": {
+    "description": "话轮判断",
+    "type": "bool",
+    "hint": "消息 @/引用了别人（说明是别人之间的对话）就不插嘴；只有无人称/对全体的开放话轮才可能接话。",
+    "default": true
+  },
+  "reply_gate_unanswered_enabled": {
+    "description": "无人应答检测",
+    "type": "bool",
+    "hint": "问句发出后等待一段时间，如果群里没人回应，Bot 再接话（「没人答我来」）。",
+    "default": true
+  },
+  "reply_gate_unanswered_seconds": {
+    "description": "无人应答等待（秒）",
+    "type": "int",
+    "hint": "问句发出后等多久判定「没人应答」。建议 15-30 秒。",
+    "default": 20
+  },
+  "reply_gate_quiet_hours": {
+    "description": "免打扰时段",
+    "type": "string",
+    "hint": "不接话的时段，如 1:00-7:00；多个时段用分号隔开。支持跨零点（23:00-7:00）。留空=不启用。",
+    "default": ""
+  },
+  "reply_gate_name_hit_enabled": {
+    "description": "称呼命中必接",
+    "type": "bool",
+    "hint": "不@、但话里叫到了 Bot 的名字/昵称（取自下方名单 + Bot 设定事实）→ 直接接话。",
+    "default": true
+  },
+  "reply_gate_bot_names": {
+    "description": "Bot 的称呼名单",
+    "type": "string",
+    "hint": "逗号分隔，如：小助手,阿S；会和 Bot 设定事实里的名字/别名合并。",
+    "default": ""
+  },
+  "reply_gate_min_interval_seconds": {
+    "description": "接话最小间隔（秒）",
+    "type": "int",
+    "hint": "同一个群两次主动接话的硬间隔（防连续刷屏），0=不限制；比冷却更硬，建议 30-60。",
+    "default": 60
   }
 }

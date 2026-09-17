@@ -21,6 +21,7 @@ try:
     from .savagetype.service import SavageTypeService
     from .savagetype.addressee import has_bot_mention
     from .savagetype.debounce import is_probably_incomplete, merge_fragments
+    from .savagetype.replygate import question_like as savagetype_question_like
     from .savagetype.crosswin import window_kind
     from .savagetype.slots import apply_slot
     from .savagetype.speak import group_label
@@ -40,6 +41,7 @@ except ImportError:
     from savagetype.service import SavageTypeService
     from savagetype.addressee import has_bot_mention
     from savagetype.debounce import is_probably_incomplete, merge_fragments
+    from savagetype.replygate import question_like as savagetype_question_like
     from savagetype.crosswin import window_kind
     from savagetype.slots import apply_slot
     from savagetype.speak import group_label
@@ -74,7 +76,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "4.9.1",
+    "5.0.0",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -94,6 +96,7 @@ class SavageTypePlugin(Star):
         self._register_pages()
         self._debounce_hold: dict[str, dict] = {}
         self._debounce_skip: set[str] = set()
+        self._gate_pending: dict[str, dict] = {}
         logger.info("Savage Type loaded, db=%s", self.store.db_path)
 
     async def initialize(self):
@@ -407,10 +410,10 @@ class SavageTypePlugin(Star):
         if not merged or event is None:
             return
         self.store.add_diag("debounce", {"chars": len(merged), "fragments": int(hold.get("count", 1))})
-        await self._debounce_reinject(event, merged)
+        await self._reinject(event, merged)
 
-    async def _debounce_reinject(self, event: AstrMessageEvent, text: str) -> None:
-        """把合并后的消息重新提交进 AstrBot 管道（走完整的人格/记忆流程）。"""
+    async def _reinject(self, event: AstrMessageEvent, text: str) -> None:
+        """把文本重新提交进 AstrBot 管道（走完整的人格/记忆流程）。防抖合并与延迟接话共用。"""
         from astrbot.core.message.components import Plain
         from astrbot.core.star.star_tools import StarTools
 
@@ -437,6 +440,62 @@ class SavageTypePlugin(Star):
         )
         if self.config.get("debug_log_injection"):
             logger.info("Savage Type debounce flushed: %s", text[:60])
+
+    def _schedule_unanswered_check(self, event: AstrMessageEvent, meta: dict) -> None:
+        """(d) 问句发出后 N 秒没人应答 → Bot 再接话（延迟任务，同群只留一个）。"""
+        try:
+            window = str(event.unified_msg_origin or "")
+            if not window:
+                return
+            text = str(event.message_str or "").strip()
+            if not savagetype_question_like(text):
+                return
+            old = self._gate_pending.pop(window, None)
+            if old and old.get("task"):
+                old["task"].cancel()
+            try:
+                delay = max(3, int(self.config.get("reply_gate_unanswered_seconds", 20) or 20))
+            except (TypeError, ValueError):
+                delay = 20
+            try:
+                asker = str(event.get_sender_id() or "")
+            except Exception:  # noqa: BLE001
+                asker = ""
+            asked_ts = int(time.time()) - 1
+            task = asyncio.create_task(
+                self._unanswered_check(window, text, asker, meta, delay, event, asked_ts)
+            )
+            self._gate_pending[window] = {"task": task, "ts": asked_ts}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Savage Type unanswered schedule failed: %s", exc)
+
+    async def _unanswered_check(
+        self,
+        window: str,
+        text: str,
+        asker: str,
+        meta: dict,
+        delay: int,
+        event: AstrMessageEvent,
+        asked_ts: int | None = None,
+    ) -> None:
+        try:
+            await asyncio.sleep(delay)
+            self._gate_pending.pop(window, None)
+            since_ts = int(asked_ts) if asked_ts else int(time.time()) - max(1, int(delay))
+            ok, reason = self.service.reply_gate_delayed_ok(window, since_ts, asker)
+            self.store.add_diag("reply_gate_delayed", {"window": window, "ok": ok, "reason": reason})
+            if not ok:
+                return
+            if event is None:
+                return
+            await self._reinject(event, text)
+            if self.config.get("debug_log_injection"):
+                logger.info("Savage Type unanswered gate fired: %s", text[:40])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Savage Type unanswered check failed: %s", exc)
 
     def _debounce_key(self, event: AstrMessageEvent) -> str:
         try:
@@ -539,6 +598,9 @@ class SavageTypePlugin(Star):
                         meta.get("reason"),
                         event.unified_msg_origin,
                     )
+                return
+            if self.service.reply_gate_delayed_eligible(meta):
+                self._schedule_unanswered_check(event, meta)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Savage Type reply gate failed: %s", exc)
 

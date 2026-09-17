@@ -19,6 +19,16 @@
 
 （v4.9.0 追加）谁对谁说 / 空@提醒 / 防抖验证：
 
+（v5.0.0 追加）免@接话 v2 验证：
+
+1. 配置 `reply_gate_enabled=true`、`reply_gate_mode=judge`、阈值 0.6、`reply_gate_min_interval_seconds=0`；
+2. 群里发一条开放话轮的消息（不@任何人），确认 Bot 按判定接话，`/stype diagnostics` 里 `reply_gate` 的 `reason=judge_pass`；
+3. 发一条 `@某人 你看下` 的消息，确认 Bot **不接**（`reason=turn_not_open`）；
+4. 在消息里直接叫 Bot 的名字（不@），确认必接（`reason=name_hit`）；
+5. 发一条问句后不管它，等 `reply_gate_unanswered_seconds` 秒，确认 Bot 主动接（`reply_gate_delayed.reason=unanswered`）；发问句后让其他人先回，确认 Bot 不接（`reason=answered`）；
+6. 配置 `reply_gate_quiet_hours` 覆盖当前时间，确认不接话（`reason=quiet_hours`）。
+
+
 1. 群里发一条带 @ 的消息（如「@甲 看下这个」），私聊发 `/stype flow`，确认窗口全流里显示「谁 → 甲」；
 2. 群里先与 bot 正常对话一次，随后只 @ bot 不发正文，确认回复能接上刚才的话题（日志 `blank_mention` 有记录）；
 3. 私聊连发三条短消息（如「在吗」「那个」「帮我看下」），开启 `debounce_enabled` 后确认 bot 只回一次、且内容对得上三条合并；

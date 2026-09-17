@@ -49,13 +49,18 @@ from .speak import (
     resolve_target,
 )
 from .replygate import (
-    evaluate as reply_gate_evaluate,
+    evaluate_v2,
     in_targets,
+    judge_parse,
+    judge_prompt as reply_gate_judge_prompt,
     keyword_hit,
     memory_hit,
+    name_hit,
     normalize_mode,
     parse_targets,
     probability_hit,
+    quiet_now,
+    turn_is_open,
 )
 from .windowflow import build_window_flow
 from .llm import (
@@ -1426,6 +1431,129 @@ class SavageTypeService:
         day = datetime.now().strftime("%Y%m%d")
         return f"reply_gate_{kind}:{day}:{window_tag}"
 
+    def reply_gate_bot_names(self) -> list[str]:
+        """Bot 的称呼白名单：手填的 + Bot 设定事实里的名字/别名。"""
+        names = [str(item).strip() for item in parse_csv(str(self._cfg_value("reply_gate_bot_names", "") or ""))]
+        try:
+            for fact in self.store.person_facts(ROLE_BOT_ID, limit=12):
+                attribute = str(getattr(fact, "attribute", "") or "").strip().lower()
+                if attribute in {"name", "alias", "aka", "nickname", "昵称", "称呼"}:
+                    value = str(getattr(fact, "value", "") or "").strip()
+                    if value:
+                        names.append(value)
+        except Exception:  # noqa: BLE001
+            pass
+        seen: list[str] = []
+        for name in names:
+            if name and name not in seen:
+                seen.append(name)
+        return seen
+
+    async def reply_gate_judge(self, window_tag: str, text: str, bot_name: str) -> tuple[bool, str, dict[str, Any]]:
+        """读空气判定（④）：用配置的模型给四个维度打分，过阈值才接。"""
+        provider_id = str(self._cfg_value("reply_gate_judge_provider_id", "") or "").strip()
+        try:
+            threshold = float(self._cfg_value("reply_gate_judge_threshold", 0.6))
+        except (TypeError, ValueError):
+            threshold = 0.6
+        try:
+            context_n = max(0, int(self._cfg_value("reply_gate_judge_context_messages", 6)))
+        except (TypeError, ValueError):
+            context_n = 6
+        recent: list[str] = []
+        if context_n > 0 and window_tag:
+            rows = self.store.timeline_recent(limit=context_n * 2, window_tag=window_tag)
+            for row in rows[-context_n:]:
+                who = "我" if getattr(row, "role", "") == ROLE_ASSISTANT else (getattr(row, "speaker_name", "") or "某人")
+                recent.append(f"{who}: {clip(str(getattr(row, 'content', '') or ''), 80)}")
+        prompt = reply_gate_judge_prompt(bot_name, recent, text)
+        try:
+            raw = self.llm_generate(prompt, provider_id)
+            if asyncio.iscoroutine(raw):
+                raw = await raw
+        except Exception as exc:  # noqa: BLE001
+            return False, "judge_error", {"error": str(exc)[:160]}
+        score, reason = judge_parse(raw or "")
+        meta = {"score": round(score, 3), "threshold": threshold, "reason": reason}
+        if score < 0:
+            return False, "judge_unparsed", meta
+        return score >= threshold, ("judge_pass" if score >= threshold else "judge_below"), meta
+
+    def reply_gate_unanswered(self, window_tag: str, since_ts: int, asker_id: str) -> bool:
+        """无人应答检测（d）：这条消息之后，群里没有别人（含 Bot）回复过。"""
+        if not window_tag or since_ts <= 0:
+            return False
+        rows = self.store.query(
+            "SELECT speaker_id, role FROM timeline WHERE window_tag=? AND ts>? AND role IN ('user','assistant')"
+            " ORDER BY id DESC LIMIT 20",
+            (window_tag, int(since_ts)),
+        )
+        for speaker_id, role in rows:
+            speaker = str(speaker_id or "")
+            if speaker in {ROLE_BOT_ID, "", "bot"}:
+                return False
+            if speaker == str(asker_id or ""):
+                return False
+            if role == ROLE_ASSISTANT:
+                return False
+            return False
+        return True
+
+    def reply_gate_delayed_eligible(self, meta: dict[str, Any]) -> bool:
+        """(d) 是否需要安排「无人应答」延迟检查：只看内容层否决，规则层否决直接放弃。"""
+        if not bool(self._cfg_value("reply_gate_unanswered_enabled", True)):
+            return False
+        if not meta.get("enabled") or meta.get("fire"):
+            return False
+        reason = str(meta.get("reason") or "")
+        return reason in {
+            "turn_not_open",
+            "probability_miss",
+            "keyword_miss",
+            "low_info",
+            "memory_miss",
+            "judge_below",
+            "judge_unparsed",
+            "mode_miss",
+        }
+
+    def reply_gate_delayed_ok(self, window_tag: str, since_ts: int, asker_id: str) -> tuple[bool, str]:
+        """延迟检查：安静时段 / 冷却 / 间隔 / 日限都过，且确实没人回应 → 可以接。"""
+        if not self.reply_gate_enabled():
+            return False, "disabled"
+        if window_kind(window_tag) != "group":
+            return False, "not_group"
+        if not in_targets(window_tag, parse_targets(self._cfg_value("reply_gate_groups", ""))):
+            return False, "group_not_allowed"
+        quiet, quiet_reason = quiet_now(str(self._cfg_value("reply_gate_quiet_hours", "") or ""))
+        if quiet:
+            return False, quiet_reason
+        try:
+            cooldown = max(0, int(self._cfg_value("reply_gate_cooldown_seconds", 90)))
+            daily_limit = max(0, int(self._cfg_value("reply_gate_daily_limit", 30)))
+            min_interval = max(0, int(self._cfg_value("reply_gate_min_interval_seconds", 60)))
+        except (TypeError, ValueError):
+            cooldown, daily_limit, min_interval = 90, 30, 60
+        now = now_ts()
+        try:
+            last_ts = int(self.store.get_meta(f"reply_gate_last:{window_tag}") or 0)
+        except (TypeError, ValueError):
+            last_ts = 0
+        if cooldown and (now - last_ts) < cooldown:
+            return False, "cooldown"
+        if min_interval and (now - last_ts) < min_interval:
+            return False, "min_interval"
+        if daily_limit:
+            try:
+                today = int(self.store.get_meta(self._reply_gate_counter_key("day", window_tag)) or 0)
+            except (TypeError, ValueError):
+                today = 0
+            if today >= daily_limit:
+                return False, "daily_limit"
+        if not self.reply_gate_unanswered(window_tag, int(since_ts), asker_id):
+            return False, "answered"
+        return True, "unanswered"
+
     async def reply_gate_for(
         self,
         event: Any,
@@ -1433,7 +1561,7 @@ class SavageTypeService:
         handled: bool = False,
         persona_id: str = "",
     ) -> tuple[bool, dict[str, Any]]:
-        """免@主动接话判定：命中时由主插件把事件标为唤醒，走默认 LLM 通路。"""
+        """免@主动接话 v2：规则预筛 → 点名必接 → 话轮判断 → 模式判定（含读空气）。"""
         meta: dict[str, Any] = {"enabled": self.reply_gate_enabled()}
         if not meta["enabled"]:
             return False, meta
@@ -1444,13 +1572,18 @@ class SavageTypeService:
                 is_self = str(event.get_self_id()) == str(event.get_sender_id())
             except Exception:  # noqa: BLE001
                 is_self = False
+            try:
+                bot_id = str(event.get_self_id() or "")
+            except Exception:  # noqa: BLE001
+                bot_id = ""
             mode = normalize_mode(str(self._cfg_value("reply_gate_mode", "probability")))
             try:
                 min_chars = max(1, int(self._cfg_value("reply_gate_min_chars", 2)))
                 cooldown = max(0, int(self._cfg_value("reply_gate_cooldown_seconds", 90)))
                 daily_limit = max(0, int(self._cfg_value("reply_gate_daily_limit", 30)))
+                min_interval = max(0, int(self._cfg_value("reply_gate_min_interval_seconds", 60)))
             except (TypeError, ValueError):
-                min_chars, cooldown, daily_limit = 2, 90, 30
+                min_chars, cooldown, daily_limit, min_interval = 2, 90, 30, 60
             targets = parse_targets(self._cfg_value("reply_gate_groups", ""))
             now = now_ts()
             last_ts = 0
@@ -1467,9 +1600,19 @@ class SavageTypeService:
                 except (TypeError, ValueError):
                     today_count = 0
             cooldown_ok = cooldown <= 0 or (now - last_ts) >= cooldown
+            min_interval_ok = min_interval <= 0 or (now - last_ts) >= min_interval
             daily_ok = daily_limit <= 0 or today_count < daily_limit
+            quiet, quiet_reason = quiet_now(str(self._cfg_value("reply_gate_quiet_hours", "") or ""))
+            if bool(self._cfg_value("reply_gate_turn_filter_enabled", True)):
+                addressee_raw = self.addressee_from_event(event)
+                turn_open, turn_reason = turn_is_open(addressee_raw, bot_id)
+            else:
+                turn_open, turn_reason = True, "turn_filter_off"
+            names = self.reply_gate_bot_names() if bool(self._cfg_value("reply_gate_name_hit_enabled", True)) else []
+            name_fired, name_reason = name_hit(text, names)
             mode_hit = False
             mode_reason = ""
+            judge_meta: dict[str, Any] = {}
             if mode == "keyword":
                 mode_hit, mode_reason = keyword_hit(
                     text, parse_targets(self._cfg_value("reply_gate_keywords", ""))
@@ -1492,6 +1635,10 @@ class SavageTypeService:
                     )
                     mode_hit, mode_reason = memory_hit(result)
                     meta["route"] = getattr(result, "route", "")
+            elif mode == "judge":
+                mode_hit, mode_reason, judge_meta = await self.reply_gate_judge(
+                    window_tag, text, names[0] if names else ""
+                )
             else:
                 try:
                     probability = float(self._cfg_value("reply_gate_probability", 0.05))
@@ -1499,7 +1646,7 @@ class SavageTypeService:
                     probability = 0.05
                 mode_hit = probability_hit(probability)
                 mode_reason = "probability" if mode_hit else "probability_miss"
-            fire, reason = reply_gate_evaluate(
+            fire, reason = evaluate_v2(
                 enabled=True,
                 is_group=window_kind(window_tag) == "group",
                 already_handled=bool(handled),
@@ -1509,8 +1656,12 @@ class SavageTypeService:
                 text=text,
                 min_chars=min_chars,
                 skip_commands=bool(self._cfg_value("reply_gate_skip_commands", True)),
+                quiet=quiet,
                 cooldown_ok=cooldown_ok,
+                min_interval_ok=min_interval_ok,
                 daily_ok=daily_ok,
+                turn_open=turn_open,
+                name_fired=name_fired and bool(turn_open or True),
                 mode_hit=mode_hit,
                 mode_reason=mode_reason,
             )
@@ -1520,11 +1671,17 @@ class SavageTypeService:
                     "reason": reason,
                     "mode": mode,
                     "cooldown_ok": cooldown_ok,
+                    "min_interval_ok": min_interval_ok,
                     "daily_ok": daily_ok,
                     "today": today_count,
                     "chars": len(text.strip()),
+                    "quiet": quiet_reason,
+                    "turn": turn_reason,
+                    "name": name_reason,
                 }
             )
+            if judge_meta:
+                meta["judge"] = judge_meta
             if fire and window_tag:
                 self.store.set_meta(f"reply_gate_last:{window_tag}", str(now))
                 self.store.set_meta(
