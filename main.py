@@ -23,6 +23,12 @@ try:
     from .savagetype.debounce import is_probably_incomplete, merge_fragments
     from .savagetype.replygate import question_like as savagetype_question_like
     from .savagetype.crosswin import window_kind
+    from .savagetype.presets import (
+        diff_preset,
+        format_preset_diff_text,
+        SUPPORTED_PRESETS,
+        PRESET_NAMES,
+    )
     from .savagetype.slots import apply_slot
     from .savagetype.speak import group_label, parse_intent
     from .savagetype.store import Store
@@ -43,6 +49,12 @@ except ImportError:
     from savagetype.debounce import is_probably_incomplete, merge_fragments
     from savagetype.replygate import question_like as savagetype_question_like
     from savagetype.crosswin import window_kind
+    from savagetype.presets import (
+        diff_preset,
+        format_preset_diff_text,
+        SUPPORTED_PRESETS,
+        PRESET_NAMES,
+    )
     from savagetype.slots import apply_slot
     from savagetype.speak import group_label, parse_intent
     from savagetype.store import Store
@@ -96,7 +108,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "5.4.1",
+    "5.5.0",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -743,8 +755,11 @@ class SavageTypePlugin(Star):
         skipped = sum(int(row.get("skipped") or 0) for row in (tk.get("by_task") or []))
         skip = ov["config"].get("capture_skip") or {}
         skip_line = f"{skip.get('reason')}（{skip.get('platform') or '?'}）" if skip else "无"
+        preset_name = str(self.config.get("config_preset", "daily") or "daily")
+        preset_label = PRESET_NAMES.get(preset_name, preset_name)
         yield event.plain_result(
             f"Savage Type 状态 v{PLUGIN_VERSION}\n"
+            f"预设档位 {preset_label}（/stype preset 查看/切换）\n"
             f"时间线 {c['timeline']} / 未总结 {c['unsummarized']}\n"
             f"live {c['facts_live']} / superseded {c['facts_superseded']} / 覆盖待确认 {c['pending']}\n"
             f"事件 {c.get('events', 0)} / 事件待审 {c.get('events_needs_review', 0)}\n"
@@ -758,6 +773,80 @@ class SavageTypePlugin(Star):
             f"检索 {ov['config']['retrieval_mode']} bm25 {'开' if ov['config'].get('bm25') else '关'}({ov['config'].get('tokenizer') or 'builtin'}) embedding {ov['config']['embedding_enabled']}\n"
             f"降级 {', '.join(co['reasons']) or '无'}"
         )
+
+    @stype.command("preset")
+    async def cmd_preset(self, event: AstrMessageEvent):
+        """场景预设管理：/stype preset [diff|preview|apply] <档位>"""
+        rest = self._rest_after(event, "preset").strip()
+        parts = [p.strip() for p in rest.split() if p.strip()]
+
+        current_preset = str(self.config.get("config_preset", "daily") or "daily").strip().lower()
+
+        # 1. 无参数：查看当前预设与受控参数状态
+        if not parts:
+            diffs = diff_preset(self.config, current_preset)
+            cur_name = PRESET_NAMES.get(current_preset, current_preset)
+            lines = [
+                f"SavageType 场景预设：当前生效为 [{cur_name}]",
+                "─────────────────────────────",
+            ]
+            for idx, d in enumerate(diffs, 1):
+                lines.append(f"{idx:2d}. {d['name']} ({d['key']}): {d['current_display']}")
+            lines.append("─────────────────────────────")
+            lines.append("可选档位：")
+            for p_key, p_name in PRESET_NAMES.items():
+                mark = " ← 当前" if p_key == current_preset else ""
+                lines.append(f"• {p_key}: {p_name}{mark}")
+            lines.append("─────────────────────────────")
+            lines.append("💡 指令用法：")
+            lines.append("• 预览变更清单：/stype preset diff <档位>（或 preview）")
+            lines.append("• 确认切换档位：/stype preset apply <档位>（或直接 /stype preset <档位>）")
+            lines.append("• 恢复手动微调：/stype preset apply custom")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        action = parts[0].lower()
+        target = parts[1].lower() if len(parts) > 1 else ""
+
+        # 2. 预览 diff 变更清单：/stype preset diff <档位> 或 /stype preset preview <档位>
+        if action in ("diff", "preview"):
+            if not target:
+                yield event.plain_result(f"用法：/stype preset diff <{'|'.join(SUPPORTED_PRESETS)}>")
+                return
+            if target not in SUPPORTED_PRESETS:
+                yield event.plain_result(f"未知预设档位 '{target}'。支持的档位有：{', '.join(SUPPORTED_PRESETS)}")
+                return
+            diffs = diff_preset(self.config, target)
+            text = format_preset_diff_text(current_preset, target, diffs, is_applied=False)
+            yield event.plain_result(text)
+            return
+
+        # 3. 执行切换：/stype preset apply <档位> 或 /stype preset <档位>
+        target_to_apply = target if action == "apply" else action
+        if target_to_apply not in SUPPORTED_PRESETS:
+            yield event.plain_result(
+                f"未知预设档位 '{target_to_apply}'。\n"
+                f"支持的档位：{', '.join(SUPPORTED_PRESETS)}\n"
+                "提示：可先用 /stype preset diff <档位> 预览变动清单。"
+            )
+            return
+
+        if not self._privileged(event):
+            yield event.plain_result("权限不足：仅管理员或主人能切换场景预设。")
+            return
+
+        # 计算切换前后的 diff
+        diffs = diff_preset(self.config, target_to_apply)
+
+        # 写入配置并持久化
+        self.config["config_preset"] = target_to_apply
+        if hasattr(self.config, "save_config"):
+            self.config.save_config()
+        self.service.apply_config()
+
+        # 生成带有变更清单的回执文本
+        text = format_preset_diff_text(current_preset, target_to_apply, diffs, is_applied=True)
+        yield event.plain_result(text)
 
     def _rest_after(self, event: AstrMessageEvent, token: str) -> str:
         msg = event.message_str or ""

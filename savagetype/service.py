@@ -1144,9 +1144,9 @@ class SavageTypeService:
         return await self.retriever.retrieve(
             query=query,
             speaker_id=canonical,
-            top_k=int(self.config.get("top_k") or 16),
-            related_limit=int(self.config.get("related_fact_limit") or 6),
-            core_limit=int(self.config.get("core_fact_limit") or 4),
+            top_k=self._cfg_int("top_k", 16),
+            related_limit=self._cfg_int("related_fact_limit", 6),
+            core_limit=self._cfg_int("core_fact_limit", 4),
             ask_other_id=ask_other,
             persona_id=persona_id,
             speaker_ids=ids,
@@ -1187,9 +1187,9 @@ class SavageTypeService:
         await self.retriever.warm(
             query=query,
             speaker_id=canonical,
-            top_k=int(self.config.get("top_k") or 16),
-            related_limit=int(self.config.get("related_fact_limit") or 6),
-            core_limit=int(self.config.get("core_fact_limit") or 4),
+            top_k=self._cfg_int("top_k", 16),
+            related_limit=self._cfg_int("related_fact_limit", 6),
+            core_limit=self._cfg_int("core_fact_limit", 4),
             ask_other_id=ask_other,
             persona_id=persona_id,
             speaker_ids=ids,
@@ -1199,7 +1199,7 @@ class SavageTypeService:
             owner_ids=set(self._owner_ids),
             entity_weight=self.entity_boost_weight(),
             history_limit=self.history_limit(),
-            event_limit=max(1, int(self.config.get("event_max_inject") or 2)),
+            event_limit=max(1, self._cfg_int("event_max_inject", 2)),
         )
 
     def dossier_for(
@@ -2183,6 +2183,10 @@ class SavageTypeService:
             "data_dir": str(self.store.db_path.parent),
             "embedding": self.embedding_status(),
             "tokens": self.tokens_status(),
+            "preset": {
+                "name": str(self.config.get("config_preset", "daily") or "daily"),
+                "is_custom": str(self.config.get("config_preset", "daily") or "daily") == "custom",
+            },
             "providers": {
                 "normalize": self._provider_for("normalize"),
                 "verify": self._provider_for("verify"),
