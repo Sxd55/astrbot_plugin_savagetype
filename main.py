@@ -70,6 +70,18 @@ def _safe_int(value, default: int = 0) -> int:
         return default
 
 
+def _on_waiting_llm_request():
+    """兼容保护：部分 AstrBot 版本未提供 on_waiting_llm_request 装饰器。"""
+    hook = getattr(filter, "on_waiting_llm_request", None)
+    if callable(hook):
+        return hook()
+
+    def noop(func):
+        return func
+
+    return noop
+
+
 def _data_dir() -> Path:
     try:
         root = Path(get_astrbot_plugin_data_path())
@@ -134,6 +146,20 @@ class SavageTypePlugin(Star):
         task = getattr(self.service, "_learn_task", None)
         if task and not task.done():
             task.cancel()
+        for hold in list(self._debounce_hold.values()):
+            t = hold.get("task")
+            if t and not t.done():
+                t.cancel()
+        self._debounce_hold.clear()
+        for pending in list(self._gate_pending.values()):
+            t = pending.get("task")
+            if t and not t.done():
+                t.cancel()
+        self._gate_pending.clear()
+        try:
+            await asyncio.sleep(0)
+        except Exception:
+            pass
         try:
             self.store.close()
         except Exception:
@@ -346,7 +372,7 @@ class SavageTypePlugin(Star):
         except Exception as exc:  # noqa: BLE001
             logger.warning("Savage Type inject failed: %s", exc)
 
-    @filter.on_waiting_llm_request()
+    @_on_waiting_llm_request()
     async def debounce_collect(self, event: AstrMessageEvent):
         """防抖：短时间连发的短消息合并成一条再提交（启发式，无模型依赖）。"""
         try:
@@ -481,8 +507,8 @@ class SavageTypePlugin(Star):
             message_id=event.message_obj.message_id,
         )
         try:
-            if len(self._debounce_skip) > 2000:
-                self._debounce_skip.clear()
+            while len(self._debounce_skip) > 1000:
+                self._debounce_skip.pop()
             self._debounce_skip.add(str(message.message_id))
         except Exception:  # noqa: BLE001
             pass

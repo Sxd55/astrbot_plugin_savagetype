@@ -4273,6 +4273,32 @@ class ReplyGateV2Test(unittest.TestCase):
         )
         self.assertFalse(service.reply_gate_unanswered(window, now - 31, "asker"))
 
+    def test_rrf_scoring_recency_and_pinned(self):
+        """测试 RRF 排序在合并候选时融入了 recency 与 pinned 加权。"""
+        from savagetype.retrieve import Retriever
+
+        r = Retriever(self.store, mode="rrf", bm25=False)
+        now = int(now_ts())
+        f_old = self.store.add_fact(
+            {
+                "subject": "self", "attribute": "爱好", "value": "摄影",
+                "content": "我喜欢摄影拍摄风景", "speaker_id": "u_rrf", "speaker_name": "摄影老哥",
+                "confidence": 0.9, "pinned": 0, "created_at": now - 365 * 86400, "updated_at": now - 365 * 86400,
+            }
+        )
+        f_fresh_pinned = self.store.add_fact(
+            {
+                "subject": "self", "attribute": "爱好", "value": "摄影",
+                "content": "我喜欢摄影拍摄人文", "speaker_id": "u_rrf", "speaker_name": "摄影老哥",
+                "confidence": 0.9, "pinned": 1, "created_at": now, "updated_at": now,
+            }
+        )
+        result = asyncio.run(r.retrieve("摄影", speaker_id="u_rrf", top_k=2))
+        hit_ids = [h.fact.id for h in result.hits]
+        self.assertIn(f_fresh_pinned, hit_ids)
+        scores = {h.fact.id: h.score for h in result.hits}
+        self.assertGreater(scores[f_fresh_pinned], scores[f_old])
+
 
 if __name__ == "__main__":
     unittest.main()

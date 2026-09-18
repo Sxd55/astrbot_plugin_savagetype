@@ -1059,6 +1059,30 @@ class IntegrationTest(unittest.TestCase):
             "拒答那次也要计入跳过统计",
         )
 
+    def test_terminate_cleans_up_all_tasks(self):
+        # 验证 terminate 正确取消 debounce_hold 与 gate_pending 中的活跃任务
+        async def _test():
+            dummy_task1 = asyncio.create_task(asyncio.sleep(100))
+            dummy_task2 = asyncio.create_task(asyncio.sleep(100))
+            self.plugin._debounce_hold["test_key"] = {"task": dummy_task1}
+            self.plugin._gate_pending["test_win"] = {"task": dummy_task2}
+            await self.plugin.terminate()
+            c1 = getattr(dummy_task1, "cancelling", lambda: 0)()
+            c2 = getattr(dummy_task2, "cancelling", lambda: 0)()
+            self.assertTrue(dummy_task1.cancelled() or dummy_task1.done() or c1 > 0)
+            self.assertTrue(dummy_task2.cancelled() or dummy_task2.done() or c2 > 0)
+            self.assertEqual(len(self.plugin._debounce_hold), 0)
+            self.assertEqual(len(self.plugin._gate_pending), 0)
+        asyncio.run(_test())
+
+    def test_on_waiting_llm_request_fallback(self):
+        # 验证兼容装饰器：无论环境是否支持 filter.on_waiting_llm_request 都能正常工作
+        dec = plugin_main._on_waiting_llm_request()
+        @dec
+        def dummy():
+            return 123
+        self.assertEqual(dummy(), 123)
+
 
 if __name__ == "__main__":
     unittest.main()

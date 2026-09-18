@@ -600,9 +600,15 @@ class Retriever:
                 if bm25_scores is not None
                 else keyword_score(query, fact)
             )
-            score = rrf + 0.15 * keyword_part + 0.1 * embed_map.get(fid, 0)
+            age_days = max(0, (now_ts() - (fact.updated_at or now_ts())) / 86400)
+            recency = 1.0 / (1.0 + age_days / 14)
+            score = rrf + 0.15 * keyword_part + 0.1 * embed_map.get(fid, 0) + 0.05 * recency
+            if int(getattr(fact, "pinned", 0) or 0):
+                score += 0.05
             if fact.speaker_id in ids:
                 score += 0.08
+            if route == "current_status" and age_days > 2:
+                score -= 0.1
             hits.append(RetrievalHit(fact=fact, score=score, source="rrf"))
 
         use_rerank = (self.mode == "rerank" or (self.mode == "auto" and self.rerank)) and self.rerank
