@@ -5,7 +5,7 @@ import pathlib
 import re
 import sys
 
-ROOT = pathlib.Path(r"C:\Users\24122\Desktop\astrbot_plugin_savagetype")
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 SCHEMA = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
 MAIN = (ROOT / "main.py").read_text(encoding="utf-8")
