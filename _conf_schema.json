@@ -1,4 +1,10 @@
 {
+  "config_preset": {
+    "description": "【场景预设】一键场景优化档位",
+    "type": "string",
+    "hint": "开箱即用推荐档位：daily（日常陪伴/默认）、frugal（极致省Token）、assistant（群聊助手/精准知识）、rpg（沉浸扮演/跑团）、custom（专家自定义微调）。",
+    "default": "daily"
+  },
   "enabled": {
     "description": "总开关",
     "type": "bool",

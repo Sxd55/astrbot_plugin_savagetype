@@ -31,6 +31,8 @@ from .coexistence import Coexistence
 from .contradiction import ContradictionEngine
 from .crosswin import build_cross_window, window_kind
 from .events import EventPipeline
+from .presets import resolve_effective_config
+
 from .extract import Extractor
 from .inject import build_pack, wrap_untrusted
 from .learn import LearningEngine
@@ -778,8 +780,7 @@ class SavageTypeService:
         return event_id
 
     def _cfg_value(self, key: str, default: Any) -> Any:
-        raw = self.config.get(key)
-        return default if raw is None else raw
+        return resolve_effective_config(self.config, key, default)
 
     def _cfg_int(self, key: str, default: int = 0) -> int:
         """读整数配置：None/空串/非法值回退默认，不抛异常（显式 0 会保留）。"""
@@ -1369,6 +1370,8 @@ class SavageTypeService:
         return wrap_untrusted(block), meta
 
     def reply_gate_enabled(self) -> bool:
+        if getattr(self, "coexistence", None) and self.coexistence.skip_reply_gate:
+            return False
         return bool(self._cfg_value("reply_gate_enabled", False))
 
     # ---- 指派发言（私聊让 Bot 去群里说话） ---------------------------------

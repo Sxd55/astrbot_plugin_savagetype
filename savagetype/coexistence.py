@@ -17,6 +17,10 @@ KNOWN_CAPTURE = {
     "astrbot_plugin_livingmemory",
     "livingmemory",
 }
+KNOWN_ACTIVE_GATES = {
+    "astrbot_plugin_savagereply",
+    "savagereply",
+}
 
 
 def _norm(name: str | None) -> str:
@@ -29,6 +33,7 @@ class Coexistence:
         self.skip_inject = False
         self.skip_capture = False
         self.skip_style = False
+        self.skip_reply_gate = False
         self.reasons: list[str] = []
         self.detected: list[str] = []
 
@@ -36,6 +41,7 @@ class Coexistence:
         self.skip_inject = False
         self.skip_capture = False
         self.skip_style = False
+        self.skip_reply_gate = False
         self.reasons = []
         self.detected = []
         if not self.enabled:
@@ -67,9 +73,27 @@ class Coexistence:
                     self.detected.append(n)
                     self.skip_style = True
                     self.reasons.append("style/jargon left to self_learning")
+                if n in {_norm(x) for x in KNOWN_ACTIVE_GATES} or "savagereply" in n:
+                    cfg = getattr(star, "config", None) or {}
+                    if isinstance(cfg, dict) and bool(cfg.get("active_reply_enabled", False)):
+                        self.skip_reply_gate = True
+                        if n not in self.detected:
+                            self.detected.append(n)
+                        self.reasons.append("active reply yielded to savagereply")
 
         self.detected = sorted(set(self.detected))
         self.reasons = sorted(set(self.reasons))
+
+    def should_skip_reply_gate(self, event: Any = None) -> bool:
+        if self.skip_reply_gate:
+            return True
+        if event is not None:
+            try:
+                if bool(event.get_extra("_savage_active_reply")):
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+        return False
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -77,6 +101,7 @@ class Coexistence:
             "skip_inject": self.skip_inject,
             "skip_capture": self.skip_capture,
             "skip_style": self.skip_style,
+            "skip_reply_gate": self.skip_reply_gate,
             "detected": self.detected,
             "reasons": self.reasons,
         }

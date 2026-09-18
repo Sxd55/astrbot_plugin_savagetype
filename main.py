@@ -658,6 +658,8 @@ class SavageTypePlugin(Star):
         后续完全走 AstrBot 默认 LLM 通路：人格、记忆注入、分段、TTS 全部照旧。
         """
         try:
+            if self.service.coexistence.should_skip_reply_gate(event):
+                return
             if not self.service.reply_gate_enabled():
                 return
             if getattr(event, "is_at_or_wake_command", False) or event.is_wake_up():
