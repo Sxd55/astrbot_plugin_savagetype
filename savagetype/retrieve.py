@@ -244,7 +244,7 @@ class Retriever:
         if skip_query_mentions and query_norm:
             # 疑问句豁免：问「你闺蜜是谁」时，value 里的「闺蜜」必然出现在问句里，
             # 但用户是在“问这个”，不是在“说这个”——此时不当作已提及，
-            # 只要 content 比 value 更完整（名字、原因在里面）就照常注入。
+            # 只要 content 比 value 更长（名字、原因在里面）就照常注入。
             asking = question_like(query)
             for hit in hits:
                 value_norm = normalize_slot(hit.fact.value or "")
@@ -252,7 +252,7 @@ class Retriever:
                     continue
                 content = str(getattr(hit.fact, "content", "") or "").strip()
                 value = str(getattr(hit.fact, "value", "") or "").strip()
-                if asking and len(content) > len(value) + 4:
+                if asking and len(content) > len(value):
                     continue
                 mentioned_ids.add(hit.fact.id)
 
@@ -260,12 +260,12 @@ class Retriever:
             filtered: list[RetrievalHit] = []
             for hit in hits:
                 fact = hit.fact
-                if dedup_route and fact.id in skip_ids and not int(getattr(fact, "pinned", 0)):
+                if dedup_route and fact.id in skip_ids and not int(getattr(fact, "pinned", 0) or 0):
                     blocked.append(
                         RetrievalHit(fact=fact, score=0, source="filter", filter_reason="recently_injected")
                     )
                     continue
-                if fact.id in mentioned_ids and not int(getattr(fact, "pinned", 0)):
+                if fact.id in mentioned_ids and not int(getattr(fact, "pinned", 0) or 0):
                     blocked.append(
                         RetrievalHit(fact=fact, score=0, source="filter", filter_reason="query_mentioned")
                     )
@@ -276,24 +276,27 @@ class Retriever:
         core, related, uncertain = self._slot(
             hits, bundle["ids"], core_limit, related_limit, route
         )
-        for fact in core + related:
-            # 原子自增，避免用缓存里的旧 access_count 回写。
-            self.store.bump_access(fact.id)
+        # 访问计数原子自增，避免用缓存里的旧 access_count 回写；批量一次提交。
+        self.store.bump_access_many([fact.id for fact in core + related])
 
+        asking_now = bool(skip_query_mentions and query_norm) and question_like(query)
         events = self._filter_events(
             list(bundle.get("events") or []),
             query_norm,
             skip_query_mentions=skip_query_mentions,
             event_skip_ids=event_skip_ids or set(),
             limit=max(1, int(event_limit or 1) * 2),
+            asking=asking_now,
         )
         history = self._filter_history(bundle.get("history") or [], skip_ids)
         if skip_query_mentions and query_norm:
+            asking = question_like(query)
             history = [
                 fact
                 for fact in history
-                if int(getattr(fact, "pinned", 0))
+                if int(getattr(fact, "pinned", 0) or 0)
                 or not self._history_mentioned(fact, query_norm)
+                or (asking and self._content_richer(fact))
             ]
 
         return RetrievalResult(
@@ -321,6 +324,13 @@ class Retriever:
         return [fact for fact in history if fact.id not in skip_ids or int(fact.pinned or 0)]
 
     @staticmethod
+    def _content_richer(fact) -> bool:
+        """content 比 value 更长：问句场景下值得注入完整内容（与事实豁免同口径）。"""
+        content = str(getattr(fact, "content", "") or "").strip()
+        value = str(getattr(fact, "value", "") or "").strip()
+        return len(content) > len(value)
+
+    @staticmethod
     def _history_mentioned(fact: Fact, query_norm: str) -> bool:
         if not query_norm:
             return False
@@ -340,6 +350,7 @@ class Retriever:
         skip_query_mentions: bool,
         event_skip_ids: set[int],
         limit: int,
+        asking: bool = False,
     ) -> list[Event]:
         out: list[Event] = []
         for event in events:
@@ -351,9 +362,13 @@ class Retriever:
             if skip_query_mentions and query_norm:
                 title = normalize_slot(event.title or "")
                 if len(title) >= 2 and title in query_norm:
-                    continue
+                    summary = str(event.summary or "").strip()
+                    if asking and len(summary) > len((event.title or "").strip()):
+                        pass
+                    else:
+                        continue
             out.append(event)
-            if len(out) >= limit:
+            if limit > 0 and len(out) >= limit:
                 break
         return out
 
@@ -503,21 +518,25 @@ class Retriever:
             except Exception:  # noqa: BLE001
                 bm25_scores = None
 
-        try:
-            events, event_blocked = self._rank_events(
-                query,
-                speaker_id,
-                ids,
-                persona_id,
-                route,
-                window_tag,
-                isolation,
-                owner_ids,
-                max(2, event_limit * 2),
-                entity_event_ids,
-                entity_weight,
-            )
-        except Exception:  # noqa: BLE001
+        if event_limit > 0:
+            try:
+                events, event_blocked = self._rank_events(
+                    query,
+                    speaker_id,
+                    ids,
+                    persona_id,
+                    route,
+                    window_tag,
+                    isolation,
+                    owner_ids,
+                    max(2, event_limit * 2),
+                    entity_event_ids,
+                    entity_weight,
+                )
+            except Exception:  # noqa: BLE001
+                events, event_blocked = [], []
+        else:
+            # event_limit=0：关闭事件召回，连查都不查。
             events, event_blocked = [], []
 
         history: list[Fact] = []
@@ -527,17 +546,20 @@ class Retriever:
             hist_ids = list(ids)
             if ask_other_id:
                 hist_ids = list({*hist_ids, *self.store.speaker_ids_for(ask_other_id)})
-            history, history_current, history_label = self._collect_history(
-                query,
-                hist_ids,
-                persona_id,
-                isolation,
-                owner_ids,
-                window_tag,
-                entity_fact_ids,
-                entity_weight,
-                max(2, history_limit * 2),
-            )
+            try:
+                history, history_current, history_label = self._collect_history(
+                    query,
+                    hist_ids,
+                    persona_id,
+                    isolation,
+                    owner_ids,
+                    window_tag,
+                    entity_fact_ids,
+                    entity_weight,
+                    max(2, history_limit * 2),
+                )
+            except Exception:  # noqa: BLE001
+                history, history_current, history_label = [], {}, ""
 
         local_ranked = sorted(
             visible,
@@ -932,7 +954,7 @@ class Retriever:
                     reinforce_factor=float(importance_cfg.get("reinforce_factor") or 0.5),
                     max_multiplier=float(importance_cfg.get("max_multiplier") or 3),
                 )
-        if int(getattr(fact, "pinned", 0)):
+        if int(getattr(fact, "pinned", 0) or 0):
             score += 0.2
         if route == "current_status" and age_days > 2:
             score -= 0.5
@@ -1013,7 +1035,7 @@ class Retriever:
                 (
                     fact.speaker_id in ids
                     or getattr(fact, "scope", "") == SCOPE_OWNER
-                    or int(getattr(fact, "pinned", 0))
+                    or int(getattr(fact, "pinned", 0) or 0)
                 )
                 and fact.confidence >= 0.7
                 and fact.attribute in {"likes", "dislikes", "name", "identity", "habit", "promise"}

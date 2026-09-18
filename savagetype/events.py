@@ -505,6 +505,16 @@ class EventPipeline:
 
     def _fallback_summary(self, episode: list[TimelineEvent]) -> dict[str, Any]:
         """No model / model output unusable: keep a deterministic recap, mark for review."""
+        if not episode:
+            return {
+                "kind": "chat",
+                "title": "一段对话",
+                "summary": "一段对话",
+                "highlights": [],
+                "keywords": [],
+                "importance": 0.5,
+                "confidence": 0.3,
+            }
         users = [e for e in episode if e.role == ROLE_USER and e.speaker_id != ROLE_BOT_ID]
         title = clip((users[0].content if users else episode[0].content) or "一段对话", 20)
         parts = [clip(e.content or "", 80) for e in users[-4:]]

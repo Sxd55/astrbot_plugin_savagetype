@@ -23,7 +23,7 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
         "index",
     ),
     (
-        re.compile(r"^(?:帮我|麻烦)?\s*去\s*(?P<value>\d{5,})\s*群(?:里)?说\s*[:：,，]?\s*(?P<content>.+)$"),
+        re.compile(r"^(?:帮我|麻烦)?\s*去\s*(?P<value>\d{4,})\s*群(?:里)?说\s*[:：,，]?\s*(?P<content>.+)$"),
         "number",
     ),
     (
@@ -63,13 +63,20 @@ def clip_content(text: str, limit: int = MAX_CONTENT_CHARS) -> str:
 
 
 def resolve_number(value: str, groups: Iterable[str]) -> str:
-    """group 编号（群号）匹配：umo 里包含该群号即可。"""
+    """group 编号（群号）匹配：精确优先（相等或以 :群号 结尾），再退化为子串。
+
+    子串匹配在「12345 与 123456 并存」时会误伤，所以精确匹配先行。
+    """
     needle = str(value or "").strip()
     if not needle:
         return ""
-    for window in groups:
-        if needle in str(window):
-            return str(window)
+    windows = [str(window) for window in groups]
+    for window in windows:
+        if window == needle or window.endswith(":" + needle):
+            return window
+    for window in windows:
+        if needle in window:
+            return window
     return ""
 
 

@@ -24,6 +24,20 @@ INJECT_PREFIX = """<savagetype_memory>
 
 INJECT_SUFFIX = "</savagetype_memory>"
 
+
+def wrap_untrusted(block: str) -> str:
+    """把非记忆包的注入块（窗口全流 / 空@提醒）也包进不可信声明。
+
+    这些块带的是他人原话，比记忆摘要更容易夹带指令，必须同样声明为
+    不可信数据，防止被模型当指令执行。
+    """
+    body = (block or "").strip()
+    if not body:
+        return ""
+    if body.startswith("<savagetype_memory>"):
+        return body
+    return f"{INJECT_PREFIX.strip()}\n{body}\n{INJECT_SUFFIX}"
+
 PROMISE_TRIGGER_RE = re.compile(
     r"(约定|说好|答应|约好|计划|提醒|别忘了|记得|上次说|办了吗|完成了吗)"
 )
@@ -153,7 +167,7 @@ def _mentions_query(fact: Fact, query_norm: str, asking: bool = False) -> bool:
         return False
     content = str(getattr(fact, "content", "") or "").strip()
     value = str(getattr(fact, "value", "") or "").strip()
-    if asking and len(content) > len(value) + 4:
+    if asking and len(content) > len(value):
         # 疑问句里出现话题词不算“已经说过”，让完整内容能被注入。
         return False
     texts = [fact.value or ""]
@@ -282,8 +296,8 @@ def build_pack(
         block = clip(cross_window, cross_budget) if cross_budget > 0 else cross_window
         if _append_if_fits(kept, block, budget):
             push(4, block)
-    if history:
-        limit = max(1, int(history_limit or 1))
+    if history and history_limit > 0:
+        limit = max(0, int(history_limit if history_limit is not None else 6))
         label = (history_label or "当时").strip()
         lines = [f"【当时】{label} 的状态；这是过去，可能已被更新，不要当现状说。"]
         kept_history: list[Fact] = []
@@ -298,8 +312,8 @@ def build_pack(
             push(4, block)
             if out_ids is not None:
                 out_ids.extend(f.id for f in kept_history)
-    if events:
-        limit = max(1, int(event_limit or 1))
+    if events and event_limit > 0:
+        limit = max(0, int(event_limit if event_limit is not None else 2))
         lines = ["【事件】按时间回忆用；可能不完整，不要当逐字记录。"]
         kept_events: list[Event] = []
         used = 0

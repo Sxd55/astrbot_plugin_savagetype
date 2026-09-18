@@ -213,6 +213,8 @@ class Store:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._closed = False
+        # 实体名缓存：entities_in_text 每轮检索都查，实体变化慢，缓存 60 秒。
+        self._entity_names_cache: dict[str, Any] = {"ts": 0, "all": [], "person": []}
         self._connect()
         self._migrate()
         if self.get_meta("revision") is None:
@@ -236,48 +238,56 @@ class Store:
             self._connect()
 
     def _table_cols(self, table: str) -> set[str]:
-        rows = self.query(f"PRAGMA table_info({table})")
+        name = str(table or "")
+        if not name or not name[0].isalpha() or not name.replace("_", "").isalnum():
+            raise ValueError(f"bad table name: {table!r}")
+        rows = self.query(f"PRAGMA table_info({name})")
         return {r["name"] for r in rows}
 
+    def _checked_assignments(self, table: str, fields: dict[str, Any]) -> str:
+        """UPDATE 列名白名单：调用方固定键，但 Store 内再卡一道，防未来误传。"""
+        allowed = self._table_cols(table)
+        unknown = [key for key in fields if key not in allowed]
+        if unknown:
+            raise ValueError(f"unknown columns for {table}: {unknown}")
+        return ", ".join(f"{key}=?" for key in fields)
+
+    def _add_column(self, table: str, ddl: str) -> None:
+        """幂等加列：先查列是否存在；双实例并发同时 ALTER 时吞掉 duplicate column。"""
+        column = ddl.strip().split()[0].strip('"[]`')
+        try:
+            if column in self._table_cols(table):
+                return
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            self.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+
     def _migrate(self) -> None:
-        fact_cols = self._table_cols("facts")
-        if "persona_id" not in fact_cols:
-            self.execute("ALTER TABLE facts ADD COLUMN persona_id TEXT NOT NULL DEFAULT ''")
-        if "slot_key" not in fact_cols:
-            self.execute("ALTER TABLE facts ADD COLUMN slot_key TEXT NOT NULL DEFAULT ''")
-        if "expires_at" not in fact_cols:
-            self.execute("ALTER TABLE facts ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0")
-        if "write_op" not in fact_cols:
-            self.execute("ALTER TABLE facts ADD COLUMN write_op TEXT NOT NULL DEFAULT ''")
-        if "scope" not in fact_cols:
-            self.execute("ALTER TABLE facts ADD COLUMN scope TEXT NOT NULL DEFAULT ''")
-        if "plain" not in fact_cols:
-            self.execute("ALTER TABLE facts ADD COLUMN plain TEXT NOT NULL DEFAULT ''")
-        if "keywords" not in fact_cols:
-            self.execute("ALTER TABLE facts ADD COLUMN keywords TEXT NOT NULL DEFAULT ''")
-        if "source_event_id" not in fact_cols:
-            self.execute("ALTER TABLE facts ADD COLUMN source_event_id INTEGER NOT NULL DEFAULT 0")
-        if "review_status" not in fact_cols:
-            self.execute("ALTER TABLE facts ADD COLUMN review_status TEXT NOT NULL DEFAULT ''")
-        if "origin" not in fact_cols:
-            self.execute("ALTER TABLE facts ADD COLUMN origin TEXT NOT NULL DEFAULT ''")
-        if "edited_at" not in fact_cols:
-            self.execute("ALTER TABLE facts ADD COLUMN edited_at INTEGER NOT NULL DEFAULT 0")
-        if "edited_by" not in fact_cols:
-            self.execute("ALTER TABLE facts ADD COLUMN edited_by TEXT NOT NULL DEFAULT ''")
-        if "importance" not in fact_cols:
-            self.execute("ALTER TABLE facts ADD COLUMN importance REAL NOT NULL DEFAULT 0")
-        if "kind" not in fact_cols:
-            self.execute("ALTER TABLE facts ADD COLUMN kind TEXT NOT NULL DEFAULT ''")
-        if "pinned" not in fact_cols:
-            self.execute("ALTER TABLE facts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
-        if "topic" not in fact_cols:
-            self.execute("ALTER TABLE facts ADD COLUMN topic TEXT NOT NULL DEFAULT ''")
-        tl_cols = self._table_cols("timeline")
-        if "persona_id" not in tl_cols:
-            self.execute("ALTER TABLE timeline ADD COLUMN persona_id TEXT NOT NULL DEFAULT ''")
-        if "addressee" not in tl_cols:
-            self.execute("ALTER TABLE timeline ADD COLUMN addressee TEXT NOT NULL DEFAULT ''")
+        for ddl in (
+            "persona_id TEXT NOT NULL DEFAULT ''",
+            "slot_key TEXT NOT NULL DEFAULT ''",
+            "expires_at INTEGER NOT NULL DEFAULT 0",
+            "write_op TEXT NOT NULL DEFAULT ''",
+            "scope TEXT NOT NULL DEFAULT ''",
+            "plain TEXT NOT NULL DEFAULT ''",
+            "keywords TEXT NOT NULL DEFAULT ''",
+            "source_event_id INTEGER NOT NULL DEFAULT 0",
+            "review_status TEXT NOT NULL DEFAULT ''",
+            "origin TEXT NOT NULL DEFAULT ''",
+            "edited_at INTEGER NOT NULL DEFAULT 0",
+            "edited_by TEXT NOT NULL DEFAULT ''",
+            "importance REAL NOT NULL DEFAULT 0",
+            "kind TEXT NOT NULL DEFAULT ''",
+            "pinned INTEGER NOT NULL DEFAULT 0",
+            "topic TEXT NOT NULL DEFAULT ''",
+        ):
+            self._add_column("facts", ddl)
+        self._add_column("timeline", "persona_id TEXT NOT NULL DEFAULT ''")
+        self._add_column("timeline", "addressee TEXT NOT NULL DEFAULT ''")
         self.execute(
             "CREATE TABLE IF NOT EXISTS speaker_aliases ("
             "alias TEXT NOT NULL, "
@@ -446,22 +456,6 @@ class Store:
     def _keyword_list(self, keywords_json: str) -> list[str]:
         items = loads(keywords_json, [])
         return [str(k) for k in (items or []) if k]
-        rows = self.query("SELECT id, subject, attribute, speaker_id, speaker_name, persona_id FROM facts WHERE slot_key='' OR slot_key IS NULL")
-        for row in rows:
-            payload = apply_slot(
-                {
-                    "subject": row["subject"],
-                    "attribute": row["attribute"],
-                    "speaker_id": row["speaker_id"],
-                    "speaker_name": row["speaker_name"] if "speaker_name" in row.keys() else "",
-                }
-            )
-            persona = row["persona_id"] if "persona_id" in row.keys() else ""
-            key = make_slot_key(persona or "", row["speaker_id"], payload["subject"], payload["attribute"])
-            self.execute(
-                "UPDATE facts SET subject=?, attribute=?, slot_key=?, persona_id=? WHERE id=?",
-                (payload["subject"], payload["attribute"], key, persona or "", row["id"]),
-            )
 
     def backup_to(self, dest: Path) -> None:
         """Consistent snapshot via SQLite online backup (WAL-safe, unlike file copy)."""
@@ -508,6 +502,18 @@ class Store:
             (key, value),
         )
 
+    def prune_speak_rate(self, keep_minutes: int = 10) -> None:
+        """清理过期的指派限流计数（key 形如 speak_rate:<owner>:<YYYYmmddHHMM>）。"""
+        import datetime as _dt
+
+        cutoff = (_dt.datetime.now() - _dt.timedelta(minutes=max(1, int(keep_minutes)))).strftime(
+            "%Y%m%d%H%M"
+        )
+        self.execute(
+            "DELETE FROM meta WHERE key LIKE 'speak_rate:%' AND substr(key, -12) < ?",
+            (cutoff,),
+        )
+
     def bump_revision(self) -> int:
         current = int(self.get_meta("revision") or "1")
         nxt = current + 1
@@ -519,9 +525,15 @@ class Store:
 
     def add_timeline(self, event: dict[str, Any]) -> int | None:
         fp = event.get("fingerprint") or ""
+        speaker = str(event.get("speaker_id") or "")
+        ts = event.get("ts")
+        try:
+            ts = int(ts)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            ts = now_ts()
         exists = self.query(
             "SELECT id FROM timeline WHERE fingerprint=? AND speaker_id=? AND ts=?",
-            (fp, event["speaker_id"], event["ts"]),
+            (fp, speaker, ts),
         )
         if exists:
             return None
@@ -529,13 +541,13 @@ class Store:
             """INSERT INTO timeline(ts, speaker_id, speaker_name, bot_id, window_tag, role, content, summarized, fingerprint, persona_id, addressee)
                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                event["ts"],
-                event["speaker_id"],
+                ts,
+                speaker,
                 event.get("speaker_name", ""),
                 event.get("bot_id", ""),
                 event.get("window_tag", ""),
-                event["role"],
-                event["content"],
+                event.get("role", "user"),
+                event.get("content", ""),
                 0,
                 fp,
                 event.get("persona_id", ""),
@@ -770,7 +782,7 @@ class Store:
             fields["embedding"] = dumps(fields["embedding"])
         if "keywords" in fields and not isinstance(fields["keywords"], str):
             fields["keywords"] = dumps(fields["keywords"])
-        assignments = ", ".join(f"{k}=?" for k in fields)
+        assignments = self._checked_assignments("facts", fields)
         self.execute(f"UPDATE facts SET {assignments} WHERE id=?", (*fields.values(), fact_id))
         if bump:
             self.bump_revision()
@@ -897,6 +909,17 @@ class Store:
         self.execute(
             "UPDATE facts SET access_count=access_count+1, last_accessed=? WHERE id=?",
             (now_ts(), int(fact_id)),
+        )
+
+    def bump_access_many(self, fact_ids: list[int]) -> None:
+        """批量访问计数：一条语句 + 一次提交，避免每轮 ~10 次同步写。"""
+        ids = [int(fact_id) for fact_id in (fact_ids or [])]
+        if not ids:
+            return
+        marks = ",".join("?" * len(ids))
+        self.execute(
+            f"UPDATE facts SET access_count=access_count+1, last_accessed=? WHERE id IN ({marks})",
+            (now_ts(), *ids),
         )
 
     def set_pinned(self, fact_id: int, pinned: bool) -> bool:
@@ -1506,7 +1529,9 @@ class Store:
         )
         return {int(r["fact_id"]) for r in rows}
 
-    def add_recall(self, window_tag: str, fact_ids: list[int], ts: int) -> None:
+    def add_recall(
+        self, window_tag: str, fact_ids: list[int], ts: int, keep_seconds: int = 7 * 86400
+    ) -> None:
         if not window_tag or not fact_ids:
             return
         for fid in fact_ids:
@@ -1515,8 +1540,9 @@ class Store:
                 "ON CONFLICT(window_tag, fact_id) DO UPDATE SET ts=excluded.ts",
                 (window_tag, int(fid), int(ts)),
             )
-        # 去重窗口允许设得很长，日志保留 7 天，避免窗口未到就被清掉。
-        self.execute("DELETE FROM recall_log WHERE ts < ?", (int(ts) - 7 * 86400,))
+        # 去重窗口允许设得很长：日志保留 max(7天, 去重窗口+1天)，避免窗口未到就被清掉。
+        keep = max(7 * 86400, int(keep_seconds or 0))
+        self.execute("DELETE FROM recall_log WHERE ts < ?", (int(ts) - keep,))
 
     def add_usage(
         self,
@@ -1992,7 +2018,7 @@ class Store:
             fields["payload"] = dumps(fields["payload"])
         if "trace" in fields and not isinstance(fields["trace"], str):
             fields["trace"] = dumps(fields["trace"])
-        assignments = ", ".join(f"{k}=?" for k in fields)
+        assignments = self._checked_assignments("memory_reviews", fields)
         self.execute(f"UPDATE memory_reviews SET {assignments} WHERE id=?", (*fields.values(), review_id))
         self.bump_revision()
 
@@ -2107,7 +2133,7 @@ class Store:
         for key in ("participants", "speaker_ids", "highlights", "keywords", "evidence"):
             if key in fields and not isinstance(fields[key], str):
                 fields[key] = dumps(fields[key])
-        assignments = ", ".join(f"{k}=?" for k in fields)
+        assignments = self._checked_assignments("events", fields)
         self.execute(f"UPDATE events SET {assignments} WHERE id=?", (*fields.values(), event_id))
         if bump:
             self.bump_revision()
@@ -2284,12 +2310,29 @@ class Store:
                 touched += 1
         return touched
 
+    def _entity_names(self, kind: str = "") -> list[str]:
+        """实体名列表（60 秒缓存）：检索每轮都用，全表拉回太贵，实体本身变化慢。"""
+        now = now_ts()
+        cache = self._entity_names_cache
+        if now - int(cache.get("ts") or 0) < 60 and (cache.get("all") or cache.get("person")):
+            return list(cache.get("person") if kind == "person" else cache.get("all") or [])
+        with self._lock:
+            self._ensure_conn()
+            all_rows = self._conn.execute("SELECT DISTINCT name FROM entities LIMIT 5000").fetchall()
+            person_rows = self._conn.execute(
+                "SELECT DISTINCT name FROM entities WHERE kind='person' LIMIT 2000"
+            ).fetchall()
+            self._conn.commit()
+        cache["all"] = [str(r["name"]) for r in all_rows]
+        cache["person"] = [str(r["name"]) for r in person_rows]
+        cache["ts"] = now
+        return list(cache["person"] if kind == "person" else cache["all"])
+
     def entities_in_text(self, text: str, limit: int = 8) -> list[str]:
         norm = normalize_slot(text or "")
         if len(norm) < 2:
             return []
-        rows = self.query("SELECT DISTINCT name FROM entities LIMIT 5000")
-        hits = [str(r["name"]) for r in rows if len(str(r["name"])) >= 2 and str(r["name"]) in norm]
+        hits = [name for name in self._entity_names() if len(name) >= 2 and name in norm]
         hits.sort(key=len, reverse=True)
         return hits[:limit]
 
@@ -2328,8 +2371,7 @@ class Store:
         norm = normalize_slot(text or "")
         if len(norm) < 2:
             return []
-        rows = self.query("SELECT DISTINCT name FROM entities WHERE kind='person' LIMIT 2000")
-        hits = [str(r["name"]) for r in rows if len(str(r["name"])) >= 2 and str(r["name"]) in norm]
+        hits = [name for name in self._entity_names("person") if len(name) >= 2 and name in norm]
         hits.sort(key=len, reverse=True)
         return hits[:limit]
 
@@ -2439,6 +2481,17 @@ class Store:
             (now_ts(), int(event_id)),
         )
 
+    def bump_event_access_many(self, event_ids: list[int]) -> None:
+        """批量事件访问计数：一条语句 + 一次提交。"""
+        ids = [int(event_id) for event_id in (event_ids or [])]
+        if not ids:
+            return
+        marks = ",".join("?" * len(ids))
+        self.execute(
+            f"UPDATE events SET access_count=access_count+1, last_accessed=? WHERE id IN ({marks})",
+            (now_ts(), *ids),
+        )
+
     def set_event_pinned(self, event_id: int, pinned: bool) -> bool:
         if self.get_event(event_id) is None:
             return False
@@ -2482,7 +2535,9 @@ class Store:
         )
         return {int(r["event_id"]) for r in rows}
 
-    def add_event_recall(self, window_tag: str, event_ids: list[int], ts: int) -> None:
+    def add_event_recall(
+        self, window_tag: str, event_ids: list[int], ts: int, keep_seconds: int = 7 * 86400
+    ) -> None:
         if not window_tag or not event_ids:
             return
         with self._lock:
@@ -2492,8 +2547,9 @@ class Store:
                 "ON CONFLICT(window_tag, event_id) DO UPDATE SET ts=excluded.ts",
                 [(window_tag, int(eid), int(ts)) for eid in event_ids],
             )
+            keep = max(7 * 86400, int(keep_seconds or 0))
             self._conn.execute(
-                "DELETE FROM event_recall_log WHERE ts < ?", (int(ts) - 7 * 86400,)
+                "DELETE FROM event_recall_log WHERE ts < ?", (int(ts) - keep,)
             )
             self._conn.commit()
 

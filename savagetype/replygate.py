@@ -9,9 +9,14 @@
 
 判定顺序（任一不通过即不接话，并记录原因）：
 
-1. 开关、群聊、非空文本、非命令、非 bot 自己、目标群白名单；
-2. 冷却（同群两次主动回复的最小间隔）与每日上限；
-3. 模式判定：probability 概率 / keyword 关键词 / memory 记忆命中。
+1. 开关、群聊、非空文本、非命令、非 bot 自己；
+2. 免打扰时段（quiet：连点名/关键词必回也拦）；
+3. 群白名单、最小字数/命令检查、冷却、硬间隔、每日上限
+   （这些规则层同样拦截点名/关键词必回）；
+4. 点名必接（name_hit）、关键词必回（keyword_force）：命中直接放行，
+   越过下面的话轮判断；
+5. 话轮判断（@ / 引用了别人就不插嘴）；
+6. 模式判定：probability 概率 / keyword 关键词 / memory 记忆命中 / judge 读空气。
 """
 
 from __future__ import annotations
@@ -27,7 +32,9 @@ from .addressee import decode as decode_addressee
 MODES = ("probability", "keyword", "memory", "judge")
 MIN_TEXT_CHARS = 2
 COMMAND_PREFIXES = ("/", "／", "!", "！")
-QUESTION_MARKERS = ("？", "?", "吗", "呢", "怎么", "为什么", "为啥", "能不能", "可不可以", "是否", "啥", "多少", "几点", "谁", "哪里", "哪儿", "如何")
+# 注意：「呢」是语气词（「我闺蜜是小美呢」是陈述），不算疑问标记；
+# 真疑问句一般以 ?/？结尾或带 谁/怎么/为什么/吗 等标记。
+QUESTION_MARKERS = ("？", "?", "吗", "怎么", "为什么", "为啥", "能不能", "可不可以", "是否", "啥", "多少", "几点", "谁", "哪里", "哪儿", "如何")
 BOT_NAME_KEYS = ("name", "alias", "aka", "nickname", "昵称", "称呼")
 JUDGE_WEIGHTS = {"relevance": 0.3, "willingness": 0.25, "social": 0.25, "timing": 0.2}
 
@@ -161,17 +168,21 @@ def turn_is_open(addressee_raw: str, bot_id: str) -> tuple[bool, str]:
     ]
     if others:
         return False, f"turn_taken:{others[0].get('id')}"
-    return True, "addressed_to_bot"
+    return True, "open_all" if any(str(item.get("id") or "") == "all" for item in items) else "addressed_to_bot"
 
 
 def name_hit(text: str, names: Iterable[str]) -> tuple[bool, str]:
-    """称呼白名单（j）：不@、但话里叫到了 Bot 的名字 → 必接。"""
+    """称呼白名单（j）：不@、但话里叫到了 Bot 的名字 → 必接。
+
+    大小写不敏感；中文无词边界，按子串匹配（单字名因误伤太多仍要求 ≥2 字）。
+    """
     value = text or ""
     if not value:
         return False, "name_miss"
+    lowered = value.casefold()
     for raw in names:
         name = str(raw or "").strip()
-        if len(name) >= 2 and name in value:
+        if len(name) >= 2 and name.casefold() in lowered:
             return True, f"name:{name}"
     return False, "name_miss"
 
@@ -307,8 +318,13 @@ def evaluate_v2(
     name_fired: bool,
     mode_hit: bool,
     mode_reason: str,
+    keyword_fired: bool = False,
 ) -> tuple[bool, str]:
-    """v2 分层判定：任何一层否决都会带原因返回；点名命中直接放行（quiet 除外）。"""
+    """v2 分层判定：任何一层否决都会带原因返回。
+
+    点名/关键词必回直接放行并越过话轮，但仍受它前面的层拦截：
+    免打扰、群白名单、最小字数/命令检查、冷却、硬间隔、每日上限。
+    """
     if not enabled:
         return False, "disabled"
     if not is_group:
@@ -332,6 +348,8 @@ def evaluate_v2(
         return False, "daily_limit"
     if name_fired:
         return True, "name_hit"
+    if keyword_fired:
+        return True, "keyword_force"
     if not turn_open:
         return False, "turn_not_open"
     if not mode_hit:

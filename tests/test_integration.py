@@ -400,7 +400,7 @@ class IntegrationTest(unittest.TestCase):
         self._reload_service(debounce_enabled=True, debounce_window_seconds=30, debounce_scope="both")
         flushed: dict[str, str] = {}
 
-        async def fake_reinject(_event, text):
+        async def fake_reinject(_event, text, **_kwargs):
             flushed["text"] = text
 
         self.plugin._reinject = fake_reinject
@@ -418,6 +418,58 @@ class IntegrationTest(unittest.TestCase):
         asyncio.run(self.plugin._debounce_flush(key))
         self.assertEqual(flushed.get("text"), "在吗那个")
         self.assertNotIn(key, self.plugin._debounce_hold)
+
+    def test_debounce_speaker_change_flushes_old_hold(self):
+        """换人：旧 hold 同步刷出（不丢消息），新 hold 另起。"""
+        self._reload_service(debounce_enabled=True, debounce_window_seconds=30, debounce_scope="both")
+        flushed: list[str] = []
+
+        async def fake_reinject(_event, text, **_kwargs):
+            flushed.append(text)
+
+        self.plugin._reinject = fake_reinject
+        first = make_event("在吗", sid="u1", name="阿U", group="1")
+        asyncio.run(self.plugin.debounce_collect(first))
+        key = self.plugin._debounce_key(first)
+        self.assertIn(key, self.plugin._debounce_hold)
+
+        other = make_event("我来说", sid="u2", name="小明", group="1")
+        asyncio.run(self.plugin.debounce_collect(other))
+        # 旧 hold 已刷出，新 hold 接管同 key。
+        self.assertEqual(flushed, ["在吗"])
+        self.assertIn(key, self.plugin._debounce_hold)
+        self.assertEqual(self.plugin._debounce_hold[key]["fragments"], ["我来说"])
+
+    def test_debounce_flush_gate_aware_wake(self):
+        """门控开着时群合并消息不强制唤醒（wake=False 交给 gate）；关着时保持唤醒。"""
+        self._reload_service(debounce_enabled=True, debounce_window_seconds=30, debounce_scope="both")
+        calls: list[dict] = []
+
+        async def fake_reinject(_event, text, **kwargs):
+            calls.append(dict(kwargs))
+
+        self.plugin._reinject = fake_reinject
+        asyncio.run(self.plugin.debounce_collect(make_event("在吗", sid="u1", name="阿U", group="1")))
+        key = self.plugin._debounce_key(make_event("x", sid="u1", name="阿U", group="1"))
+        asyncio.run(self.plugin._debounce_flush(key))
+        self.assertTrue(calls)
+        self.assertTrue(calls[-1].get("wake", True))
+
+        self.plugin.config.update(
+            {
+                "reply_gate_enabled": True,
+                "reply_gate_mode": "probability",
+                "reply_gate_probability": 0.0,
+                "reply_gate_min_interval_seconds": 0,
+                "reply_gate_cooldown_seconds": 0,
+            }
+        )
+        self.service.apply_config()
+        calls.clear()
+        asyncio.run(self.plugin.debounce_collect(make_event("在吗", sid="u1", name="阿U", group="1")))
+        asyncio.run(self.plugin._debounce_flush(key))
+        self.assertTrue(calls)
+        self.assertFalse(calls[-1].get("wake", True))
 
     def test_debounce_skips_at_and_long_text(self):
         from astrbot.api.message_components import At
@@ -471,6 +523,27 @@ class IntegrationTest(unittest.TestCase):
         asyncio.run(self.plugin.reply_gate(other))
         self.assertFalse(other.is_at_or_wake_command)
         self.assertEqual(recorded["meta"].get("reason"), "turn_not_open")
+
+    def test_gate_keyword_force_bypasses_turn_filter(self):
+        self.plugin.config.update(
+            {
+                "reply_gate_enabled": True,
+                "reply_gate_mode": "probability",
+                "reply_gate_probability": 0.0,
+                "reply_gate_keywords": "问一下",
+                "reply_gate_keywords_force": True,
+                "reply_gate_min_interval_seconds": 0,
+                "reply_gate_cooldown_seconds": 0,
+            }
+        )
+        self.service.apply_config()
+        from astrbot.api.message_components import At, Plain
+
+        event = make_event("问一下这个怎么弄", sid="u2", name="阿U", group="1")
+        event.message_obj.message = [At(qq="20002", name="小明"), Plain("问一下这个怎么弄")]
+        asyncio.run(self.plugin.reply_gate(event))
+        self.assertTrue(event.is_at_or_wake_command)
+        self.assertEqual(event.get_extra("_stype_reply_gate").get("reason"), "keyword_force")
 
     def test_gate_judge_mode(self):
         from astrbot.api.provider import ProviderRequest
@@ -624,8 +697,12 @@ class IntegrationTest(unittest.TestCase):
     def test_command_microscope_and_diagnostics(self):
         out = _text(asyncio.run(_collect(self.plugin.cmd_microscope(make_event("/stype microscope", group="1"))))[0])
         self.assertIn("注入", out)
-        out = _text(asyncio.run(_collect(self.plugin.cmd_diagnostics(make_event("/stype diagnostics", group="1"))))[0])
+        admin = make_event("/stype diagnostics", group="1")
+        admin.role = "admin"
+        out = _text(asyncio.run(_collect(self.plugin.cmd_diagnostics(admin)))[0])
         self.assertTrue(out)
+        out = _text(asyncio.run(_collect(self.plugin.cmd_diagnostics(make_event("/stype diagnostics", group="1"))))[0])
+        self.assertIn("只有管理员", out)
 
     def test_admin_commands(self):
         admin = make_event("/stype sleep", group="1")
@@ -682,7 +759,9 @@ class IntegrationTest(unittest.TestCase):
             },
             "我改口了",
         )
-        out = _text(asyncio.run(_collect(self.plugin.cmd_rollback(make_event("/stype rollback", group="1"), r2["fact_id"])))[0])
+        admin_rb = make_event("/stype rollback", group="1")
+        admin_rb.role = "admin"
+        out = _text(asyncio.run(_collect(self.plugin.cmd_rollback(admin_rb, r2["fact_id"])))[0])
         self.assertIn("rollback", out)
         pid = self.store.add_pending(
             r1["fact_id"],
@@ -696,6 +775,18 @@ class IntegrationTest(unittest.TestCase):
         admin = make_event("/stype supersede", group="1")
         admin.role = "admin"
         out = _text(asyncio.run(_collect(self.plugin.cmd_supersede(admin, pid)))[0])
+        self.assertTrue(out)
+
+    def test_privileged_commands_reject_non_admin(self):
+        """flow/add/groups/diagnostics/rollback：普通成员拒绝，管理员放行。"""
+        for command in ("cmd_flow", "cmd_add", "cmd_groups", "cmd_diagnostics"):
+            out = _text(
+                asyncio.run(_collect(getattr(self.plugin, command)(make_event("/stype x", group="1"))))[0]
+            )
+            self.assertIn("只有管理员或主人", out, command)
+        admin = make_event("/stype flow", group="1")
+        admin.role = "admin"
+        out = _text(asyncio.run(_collect(self.plugin.cmd_flow(admin)))[0])
         self.assertTrue(out)
 
     # -- llm tools -----------------------------------------------------------

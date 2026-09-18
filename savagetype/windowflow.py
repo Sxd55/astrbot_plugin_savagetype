@@ -8,6 +8,7 @@
   按窗口分组、带说话人与时间，用来看作「整段上下文」。
 
 方向默认双向全通（私聊 <-> 群聊）；可用 exclude_private_users 屏蔽指定用户的私聊窗口。
+strict / owner 隔离下，当前窗口是群聊时强制不带私聊来源（防私聊内容默认流入群聊）。
 """
 
 from __future__ import annotations
@@ -84,8 +85,12 @@ def build_window_flow(
     private_to_group: bool = True,
     exclude_private_users: Iterable[str] = (),
     persona_id: str = "",
+    isolation: str = "",
 ) -> tuple[str, dict[str, Any]]:
     """组装窗口全流块。
+
+    strict/owner 隔离下，当前窗口是群聊时强制不带私聊来源（开关也救不回来），
+    避免私聊内容默认流入群聊。
 
     Returns:
         (block_text, meta)；没有可用内容时 block_text 为空字符串。
@@ -93,6 +98,8 @@ def build_window_flow(
     target_kind = window_kind(current_window)
     if target_kind == "unknown":
         return "", {"enabled": True, "items": 0, "chars": 0, "reason": "target_unknown"}
+    if str(isolation or "").strip().lower() in ("strict", "owner") and target_kind == "group":
+        private_to_group = False
     since = now_ts() - max(1, int(hours)) * 3600
     rows = store.window_flow_events(
         exclude_window=current_window,

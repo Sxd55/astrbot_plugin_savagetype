@@ -265,6 +265,12 @@
     "hint": "只允许一个。留空时回退 AstrBot 管理员判定。非主人的关系自称（如「我是主人」）一律拒绝。",
     "default": ""
   },
+  "webchat_is_owner": {
+    "description": "ChatUI 视同主人",
+    "type": "bool",
+    "hint": "打开后网页 ChatUI 的任何操作都视为主人（默认开， historically 只有管理员能进）。若 ChatUI 暴露在不可信网络，请关闭；关闭后 ChatUI 走主人 QQ 匹配（一般匹配不上=非主人）。",
+    "default": true
+  },
   "notify_umo": {
     "description": "待审通知窗口",
     "type": "string",
@@ -463,6 +469,12 @@
     "hint": "超过后不再注入，避免旧补丁永远占位。默认 14 天。",
     "default": 1209600
   },
+  "learn_window": {
+    "description": "学习回看条数",
+    "type": "int",
+    "hint": "学习（黑话/few-shot/人格草稿）每轮回看的最近时间线条数。默认 40。",
+    "default": 40
+  },
   "inject_jargon_limit": {
     "description": "每轮注入黑话条数上限",
     "type": "int",
@@ -656,7 +668,7 @@
   "window_flow_private_to_group": {
     "description": "方向 私聊→群",
     "type": "bool",
-    "hint": "允许把私聊内容注入群聊（默认开；注意这会把私聊内容带进群，必要时配合排除名单使用）。",
+    "hint": "允许把私聊内容注入群聊（默认开；注意这会把私聊内容带进群，必要时配合排除名单使用）。strict/owner 隔离下群聊窗口强制关闭本方向（开关也救不回来）。",
     "default": true
   },
   "window_flow_exclude_private_users": {
@@ -692,8 +704,14 @@
   "reply_gate_keywords": {
     "description": "接话关键词",
     "type": "string",
-    "hint": "逗号分隔，仅 keyword 模式生效。例：在吗,问一下,bot,小助手",
+    "hint": "逗号分隔。keyword 模式=判定词表；打开「关键词必回」后=任何模式下的必回词表。例：在吗,问一下,bot,小助手",
     "default": ""
+  },
+  "reply_gate_keywords_force": {
+    "description": "关键词必回",
+    "type": "bool",
+    "hint": "打开后，任何模式（含 probability/judge）下消息包含「接话关键词」里任一词就必回，等同于点名（@别人也会回）；免打扰/冷却/日限仍生效。",
+    "default": false
   },
   "reply_gate_groups": {
     "description": "接话群白名单",

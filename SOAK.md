@@ -27,6 +27,20 @@
 2. 聊天里问「你闺蜜是谁」→ 确认 Bot 直接答得出来（不再需要"查一下"）；`/stype diagnostics` 的 `inject` 里该条不应再是 `query_mentioned`；
 3. 聊天里陈述「我闺蜜是小美」→ 确认仍然不会重复注入（防重复行为未破坏）。
 
+（v5.2.0 追加）关键词必回验证：
+
+1. 配置 `reply_gate_enabled=true`、`reply_gate_keywords_force=true`、`reply_gate_keywords=问一下`，冷却/硬间隔先设 0；
+2. 群里发「问一下这个怎么弄」→ 确认 Bot 必回；`/stype diagnostics` 的 `reply_gate` 里 `reason=keyword_force`、`keyword=keyword:问一下`；
+3. 发「@某人 问一下他」→ 确认仍然回（越过话轮）；再把 `reply_gate_keywords_force` 关掉重发 → 变成不回（`reason=turn_not_open`）。
+
+（v5.3.0 追加）审查修补验证：
+
+1. 无人应答：群里发个问句后 20 秒谁都别说话 → 确认 Bot 接「没人答我来」（`reply_gate_delayed.reason=unanswered`）；有人先回则不接；
+2. 防抖换人：A 发「在吗」、1 秒内 B 发「我来说」→ 两条都不丢（A 的合并发出，B 的另起合并）；
+3. 关键词 `问一下` + 开必回：发「@某人 问一下他」→ 回；关必回重发 → 不回；
+4. `/stype flow` 非管理员/主人执行 → 提示无权限；管理员执行正常；
+5. ChatUI 不用时可关 `webchat_is_owner`（默认开保持现状）。
+
 
 1. 配置 `reply_gate_enabled=true`、`reply_gate_mode=judge`、阈值 0.6、`reply_gate_min_interval_seconds=0`；
 2. 群里发一条开放话轮的消息（不@任何人），确认 Bot 按判定接话，`/stype diagnostics` 里 `reply_gate` 的 `reason=judge_pass`；
@@ -164,11 +178,11 @@
 ## 5. 离线回归（不用上机）
 
 ```text
-python tests/test_core.py -v        # 148 passed
+python tests/test_core.py -v        # 219 passed
 python tests/test_soak.py -v        # 14 passed
 ```
 
-有 astrbot / jsdom 时（见 README 第七节）：`tests/test_integration.py` 24 passed、
+有 astrbot / jsdom 时（见 README 第七节）：`tests/test_integration.py` 39 passed、
 `tests/test_panel.mjs` 17 passed、`tests/verify_readme.py` ALL CHECKS PASSED。
 
 ## 判定

@@ -226,7 +226,7 @@ class ContradictionEngine:
             merged = self._merge_same(existing, payload)
             return {"action": "refresh", "fact_id": existing.id, **merged}
 
-        if int(getattr(existing, "pinned", 0)):
+        if int(getattr(existing, "pinned", 0) or 0):
             # 置顶是明确的长期记忆，任何冲突都先人工确认，不自动删除。
             pending_id = self.store.add_pending(existing.id, payload, "pinned_needs_confirm")
             return {

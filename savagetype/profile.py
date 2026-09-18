@@ -102,8 +102,12 @@ def build_profile_card(
     max_chars: int = 300,
     window_tag: str = "",
     isolation: str = "",
+    visible=None,
 ) -> tuple[str, dict[str, Any]]:
     """组装当前说话人的跨会话画像卡。
+
+    visible：可选的事实可见性谓词 `visible(fact) -> bool`，传了就先过滤
+    （service 层传入与档案卡同一套 _visibility，保证画像不比档案卡宽松）。
 
     Returns:
         (card_text, meta)。无内容或关闭时 card_text 为空字符串。
@@ -116,6 +120,8 @@ def build_profile_card(
         speaker_ids=ids,
         limit=60,
     )
+    if visible is not None:
+        facts = [fact for fact in facts if visible(fact)]
     if window_tag and isolation:
         facts = [fact for fact in facts if _window_visible(fact, window_tag, isolation)]
     is_owner = any(getattr(fact, "scope", "") == SCOPE_OWNER for fact in facts)

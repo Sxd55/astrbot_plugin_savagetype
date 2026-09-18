@@ -24,6 +24,7 @@ SKIP_NAMES = {"时间", "内容", "消息", "消息id", "消息 ID", "msgid"}
 
 
 def parse_time(text: str, year_hint: int | None = None) -> int:
+    """解析聊天记录里的时间戳；解析失败返回 0（由调用方决定回退，不要静默当成现在）。"""
     raw = (text or "").strip().replace("T", " ")
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
@@ -36,7 +37,7 @@ def parse_time(text: str, year_hint: int | None = None) -> int:
                 return int(datetime.strptime(f"{year_hint}-{raw}", f"%Y-{fmt}").timestamp())
             except ValueError:
                 continue
-    return now_ts()
+    return 0
 
 
 def parse_transcript(text: str, *, user_names: list[str] | None = None, bot_names: list[str] | None = None, year_hint: int | None = None) -> dict[str, Any]:
@@ -60,6 +61,7 @@ def parse_transcript(text: str, *, user_names: list[str] | None = None, bot_name
         return "user"
 
     i = 0
+    last_ts = 0  # 时间戳解析失败时沿用上一条，保证导入顺序不乱
     while i < len(lines):
         line = lines[i].strip()
         if not line:
@@ -89,7 +91,8 @@ def parse_transcript(text: str, *, user_names: list[str] | None = None, bot_name
             body = "\n".join(body_lines).strip()
             if name and name not in SKIP_NAMES and body:
                 speakers[name] = speakers.get(name, 0) + 1
-                ts = parse_time(ts_text, year)
+                ts = parse_time(ts_text, year) or last_ts or now_ts()
+                last_ts = ts
                 events.append(_event(name, body, ts, role_for(name)))
             continue
         head = HEAD_RE.match(line)
@@ -98,7 +101,8 @@ def parse_transcript(text: str, *, user_names: list[str] | None = None, bot_name
             if name in SKIP_NAMES:
                 i += 1
                 continue
-            ts = parse_time(head.group("time"), year)
+            ts = parse_time(head.group("time"), year) or last_ts or now_ts()
+            last_ts = ts
             body_lines = []
             i += 1
             while i < len(lines):
@@ -148,7 +152,7 @@ def preview_jsonl(path: Path, limit: int = 8) -> dict[str, Any]:
     samples: list[dict[str, Any]] = []
     errors = 0
     total = 0
-    with path.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -198,7 +202,7 @@ def import_jsonl(store: Store, path: Path) -> dict[str, Any]:
         "skipped": 0,
         "errors": 0,
     }
-    with path.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -359,7 +363,7 @@ def archive_decayed(
     live = store.live_oldest(limit=max(limit * 3, 300))
     n = 0
     for fact in live:
-        if int(getattr(fact, "pinned", 0)):
+        if int(getattr(fact, "pinned", 0) or 0):
             continue
         if int(fact.updated_at or 0) >= cutoff:
             continue
@@ -486,7 +490,7 @@ def fold_preference_slots(store: Store) -> int:
         like_items = [f for f in items if f.attribute == "likes"]
         extras = [f for f in items if f.attribute in {"dislikes", "note"}]
         for extra in extras:
-            if int(getattr(extra, "pinned", 0)):
+            if int(getattr(extra, "pinned", 0) or 0):
                 continue
             keeper = None
             for like in like_items:

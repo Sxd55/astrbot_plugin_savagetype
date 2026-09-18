@@ -917,15 +917,18 @@ function fieldControl(key, spec, value, providers) {
 }
 
 const SETTING_GROUPS = [
-  { title: "总开关与采集", keys: ["enabled", "capture_enabled", "inject_enabled", "owner_qq", "notify_umo", "memory_source_platforms", "memory_whitelist"] },
-  { title: "抽取与整理（AI 管线）", keys: ["extract_enabled", "pipeline_enabled", "summary_provider_id", "normalize_provider_id", "verify_provider_id", "extract_min_messages", "extract_cooldown_seconds", "extract_fail_cooldown_seconds", "extract_idle_seconds", "pipeline_max_revisions", "pipeline_batch_size", "pipeline_notify_cooldown_seconds"] },
-  { title: "模型档位与 Token 预算", keys: ["quality_provider_id", "fast_provider_id", "fallback_provider_id", "daily_token_limit", "soft_token_limit", "single_call_token_cap"] },
-  { title: "检索与注入", keys: ["retrieval_mode", "retrieval_bm25", "provider_timeout_seconds", "inject_budget_chars", "inject_warm_triggered", "inject_novelty_filter", "top_k", "core_fact_limit", "related_fact_limit", "inject_dedup_window_seconds", "cache_ttl_seconds", "high_evidence_confidence", "debug_log_injection", "coexistence_degrade"] },
+  { title: "总开关与主人", keys: ["enabled", "capture_enabled", "inject_enabled", "owner_qq", "webchat_is_owner", "memory_source_platforms", "memory_whitelist", "notify_umo"] },
+  { title: "免@接话", keys: ["reply_gate_enabled", "reply_gate_mode", "reply_gate_probability", "reply_gate_keywords", "reply_gate_keywords_force", "reply_gate_bot_names", "reply_gate_name_hit_enabled", "reply_gate_groups", "reply_gate_turn_filter_enabled", "reply_gate_cooldown_seconds", "reply_gate_min_interval_seconds", "reply_gate_daily_limit", "reply_gate_min_chars", "reply_gate_skip_commands", "reply_gate_quiet_hours", "reply_gate_judge_provider_id", "reply_gate_judge_threshold", "reply_gate_judge_context_messages", "reply_gate_unanswered_enabled", "reply_gate_unanswered_seconds"] },
+  { title: "指派发言", keys: ["speak_enabled", "speak_require_owner", "speak_default_group", "speak_groups", "speak_rate_limit_per_min", "speak_max_chars", "speak_reply_receipt", "speak_record_to_target"] },
+  { title: "消息防抖", keys: ["debounce_enabled", "debounce_scope", "debounce_skip_wake", "debounce_short_chars", "debounce_window_seconds", "debounce_max_seconds", "debounce_max_fragments", "debounce_max_chars"] },
+  { title: "记忆注入", keys: ["inject_budget_chars", "inject_warm_triggered", "inject_novelty_filter", "inject_dedup_window_seconds", "top_k", "core_fact_limit", "related_fact_limit", "retrieval_mode", "retrieval_bm25", "provider_timeout_seconds", "cache_ttl_seconds", "high_evidence_confidence", "coexistence_degrade", "debug_log_injection"] },
+  { title: "隐私、画像与跨会话", keys: ["memory_session_isolation", "profile_inject_enabled", "profile_max_chars", "cross_window_enabled", "cross_window_minutes", "cross_window_max_items", "cross_window_max_chars", "cross_window_private_to_group", "cross_window_group_to_group", "window_flow_enabled", "window_flow_always", "window_flow_keywords", "window_flow_group_to_private", "window_flow_private_to_group", "window_flow_exclude_private_users", "window_flow_hours", "window_flow_max_items", "window_flow_max_chars", "window_flow_max_windows", "window_flow_msg_chars", "window_flow_include_bot", "blank_mention_hint_enabled", "blank_mention_hint_ttl_minutes", "blank_mention_hint_gap_messages"] },
+  { title: "事件与历史", keys: ["event_enabled", "event_provider_id", "event_min_messages", "event_gap_minutes", "event_merge_minutes", "event_max_hours", "event_max_per_run", "event_budget_chars", "event_max_inject", "event_archive_days", "history_enabled", "history_max_facts", "entity_linking_enabled", "entity_boost_weight"] },
+  { title: "抽取与整理", keys: ["extract_enabled", "extract_min_messages", "extract_idle_seconds", "extract_cooldown_seconds", "extract_fail_cooldown_seconds", "pipeline_enabled", "pipeline_max_revisions", "pipeline_batch_size", "pipeline_notify_cooldown_seconds", "summary_provider_id", "normalize_provider_id", "verify_provider_id"] },
+  { title: "学习与表达", keys: ["learning_enabled", "learn_window", "jargon_enabled", "jargon_scope", "jargon_min_count", "jargon_cooldown_seconds", "fewshot_enabled", "fewshot_min_quality", "fewshot_max_per_run", "fewshot_cooldown_seconds", "persona_draft_enabled", "persona_draft_min_fewshots", "persona_draft_cooldown_seconds", "persona_draft_ttl_seconds", "inject_jargon_limit", "inject_fewshot_limit"] },
   { title: "重要性与维护", keys: ["importance_weight", "importance_half_life_days", "importance_reinforce_factor", "importance_max_half_life_multiplier", "importance_prune_threshold", "sleep_timeline_retain_days", "sleep_low_value_days", "sleep_low_value_confidence", "sleep_superseded_retain_days", "empty_profile_ttl_days"] },
-  { title: "学习与人格草稿", keys: ["learning_enabled", "jargon_enabled", "jargon_scope", "jargon_min_count", "jargon_cooldown_seconds", "fewshot_enabled", "persona_draft_enabled", "persona_draft_min_fewshots", "persona_draft_cooldown_seconds", "persona_draft_ttl_seconds", "inject_jargon_limit", "inject_fewshot_limit"] },
-  { title: "事件记忆与隐私", keys: ["event_enabled", "event_gap_minutes", "event_max_hours", "event_min_messages", "event_merge_minutes", "event_max_per_run", "event_provider_id", "event_budget_chars", "event_max_inject", "event_archive_days", "memory_session_isolation", "entity_linking_enabled", "entity_boost_weight", "history_enabled", "history_max_facts"] },
+  { title: "模型与预算", keys: ["quality_provider_id", "fast_provider_id", "fallback_provider_id", "daily_token_limit", "soft_token_limit", "single_call_token_cap", "embedding_enabled", "embedding_auto_threshold", "embedding_provider_id", "rerank_provider_id"] },
   { title: "图片", keys: ["image_caption_provider_id", "image_caption_timeout_seconds"] },
-  { title: "Embedding 与 Rerank", keys: ["embedding_enabled", "embedding_auto_threshold", "embedding_provider_id", "rerank_provider_id"] },
 ];
 
 const SETTINGS_APPEARANCE = "外观";
@@ -936,6 +939,16 @@ const SETTINGS_HANDLED_ELSEWHERE = new Set([
   "ui_theme_color3",
 ]);
 
+const PREFIX_GROUPS = [
+  ["reply_gate_", "免@接话"],
+  ["speak_", "指派发言"],
+  ["debounce_", "消息防抖"],
+  ["window_flow_", "窗口全流"],
+  ["cross_window_", "跨窗口衔接"],
+  ["profile_", "跨会话画像"],
+  ["blank_mention_", "空@提醒"],
+];
+
 function groupSchema(schema) {
   const used = new Set();
   const groups = SETTING_GROUPS.map((g) => {
@@ -943,6 +956,13 @@ function groupSchema(schema) {
     entries.forEach(([k]) => used.add(k));
     return { title: g.title, entries };
   }).filter((g) => g.entries.length);
+  for (const [prefix, title] of PREFIX_GROUPS) {
+    const entries = Object.entries(schema).filter(
+      ([k]) => !used.has(k) && !SETTINGS_HANDLED_ELSEWHERE.has(k) && k.startsWith(prefix)
+    );
+    entries.forEach(([k]) => used.add(k));
+    if (entries.length) groups.push({ title, entries });
+  }
   const rest = Object.entries(schema).filter(
     ([k]) => !used.has(k) && !SETTINGS_HANDLED_ELSEWHERE.has(k)
   );
@@ -1010,7 +1030,8 @@ function readSettings() {
   const values = {};
   $("settings-form").querySelectorAll("[name]").forEach((el) => {
     if (el.type === "checkbox") values[el.name] = el.checked;
-    else if (el.type === "number") values[el.name] = el.value === "" ? 0 : Number(el.value);
+    // 数字框清空 = 不改（跳过该键），避免空串变 0 覆盖原值。
+    else if (el.type === "number") { if (el.value !== "") values[el.name] = Number(el.value); }
     else values[el.name] = el.value;
   });
   return values;
@@ -1346,14 +1367,23 @@ async function onAct(act, el) {
   });
   if (act === "review-reopen") return run("已恢复待审", async () => { await apiPost("reviews/set", { id: Number(el.dataset.id), status: "pending" }); await loadReviews(); });
   if (act === "archive-preview") return run("已预览", () => apiPost("archive/preview", { path: $("archive-path").value.trim() }));
-  if (act === "archive-import") return run("已导入档案", async () => { const r = await apiPost("archive/import", { path: $("archive-path").value.trim() }); await reload(); return r; });
+  if (act === "archive-import") {
+    if (!window.confirm("确定导入档案？会写入/覆盖记忆数据，建议先导出备份。")) return;
+    return run("已导入档案", async () => { const r = await apiPost("archive/import", { path: $("archive-path").value.trim() }); await reload(); return r; });
+  }
   if (act === "chat-preview") return run("已预览聊天", () => apiPost("chat/preview", { text: $("chat-text").value, user_names: $("chat-users").value, bot_names: $("chat-bots").value }));
-  if (act === "chat-import") return run("已导入聊天", async () => { const r = await apiPost("chat/import", { text: $("chat-text").value, user_names: $("chat-users").value, bot_names: $("chat-bots").value }); await reload(); return r; });
-  if (act === "reset") return run("已清空重建", async () => {
+  if (act === "chat-import") {
+    if (!window.confirm("确定导入聊天记录？会写入记忆数据，建议先导出备份。")) return;
+    return run("已导入聊天", async () => { const r = await apiPost("chat/import", { text: $("chat-text").value, user_names: $("chat-users").value, bot_names: $("chat-bots").value }); await reload(); return r; });
+  }
+  if (act === "reset") {
+    if (!window.confirm("确定清空重建？会先备份，但记忆/事件将被清空，此操作不可撤销！")) return;
+    return run("已清空重建", async () => {
     const r = await apiPost("reset", { confirm: "reset" });
     await reload();
     return r;
   });
+  }
   if (act === "theme-preset") return run("主题已切换", () => {
     if (dynamicOn) stopDynamic(true);
     return saveTheme(el.dataset.a, el.dataset.b, el.dataset.c);

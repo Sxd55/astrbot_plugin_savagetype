@@ -562,6 +562,25 @@ class CoreTest(unittest.TestCase):
         again = import_transcript_events(self.store, parsed["events"])
         self.assertEqual(again["skipped"], 2)
 
+    def test_parse_time_bad_input_returns_zero(self):
+        from savagetype.archive import parse_time
+
+        self.assertEqual(parse_time("根本不是时间"), 0)
+        self.assertEqual(parse_time(""), 0)
+        self.assertGreater(parse_time("2026-09-01 12:00:00"), 0)
+
+    def test_parse_transcript_bad_timestamp_keeps_order(self):
+        broken = (
+            "发送者：阿U\n时间：2026-09-01 12:00:00\n内容：第一句\n"
+            "发送者：阿U\n时间：不是时间\n内容：第二句\n"
+        )
+        parsed = parse_transcript(broken, user_names=["阿U"])
+        self.assertEqual(parsed["count"], 2)
+        first, second = parsed["events"][0]["ts"], parsed["events"][1]["ts"]
+        self.assertGreater(first, 0)
+        # 坏时间戳沿用上一条，不再静默变成“现在”打乱顺序。
+        self.assertEqual(second, first)
+
     def test_jsonl_roundtrip_skips_duplicate_fingerprint(self):
         self.engine.ingest(_payload(value="茶", content="我喜欢喝茶"), "我喜欢喝茶")
         svc = SavageTypeService(self.store, {}, llm_generate=None, get_provider=None, logger=None)
@@ -2296,6 +2315,24 @@ class EventLayerTest(unittest.TestCase):
         self.assertNotIn("成都之行", again)
         self.assertEqual(snap2["injected_event_ids"], [])
 
+    def test_event_limit_zero_disables_event_injection(self):
+        self._add_event("成都之行", "去成都玩了三天，吃了火锅")
+        service = self._service(
+            memory_session_isolation="strict", event_enabled=True, event_max_inject=0
+        )
+        pack, _result, snapshot = asyncio.run(
+            service.build_injection("最近怎么样", "u1", window_tag="w1")
+        )
+        self.assertNotIn("【事件】", pack)
+        self.assertNotIn("成都之行", pack)
+        self.assertEqual(snapshot["injected_event_ids"], [])
+
+    def test_fallback_summary_empty_episode(self):
+        from savagetype.events import EventPipeline
+
+        out = EventPipeline._fallback_summary(None, [])
+        self.assertEqual(out["title"], "一段对话")
+
     def test_event_blocked_in_other_session_when_isolated(self):
         self._add_event("成都之行", "去成都玩了三天", window="w2")
         strict = self._service(memory_session_isolation="strict", event_enabled=True)
@@ -2689,7 +2726,9 @@ class EntityHistoryTest(unittest.TestCase):
             result.history_current.get(r1["fact_id"]), latest.plain or latest.value
         )
 
-    def test_history_novelty_filter_skips_mentioned_value(self):
+    def test_history_question_exempt_from_novelty_filter(self):
+        # 「我以前喜欢美式吗」是疑问句（确认式提问），不是在陈述事实；
+        # 历史豁免与事实豁免同口径：content 更长就注入，直接回答这个问题。
         self._note("美式", "我喜欢喝美式", attribute="likes")
         self.engine.ingest(
             _payload(
@@ -2701,6 +2740,22 @@ class EntityHistoryTest(unittest.TestCase):
         service = self._service(memory_session_isolation="strict")
         pack, _r, _s = asyncio.run(
             service.build_injection("我以前喜欢美式吗", "u1", window_tag="w1")
+        )
+        self.assertIn("【当时】", pack)
+
+    def test_history_statement_still_filtered(self):
+        # 陈述句（无疑问标记）仍被新颖度过滤：自己刚说过的不重复注入。
+        self._note("美式", "我喜欢喝美式", attribute="likes")
+        self.engine.ingest(
+            _payload(
+                speaker="u1", attribute="likes", value="不美式",
+                content="我改口了，不喜欢美式", explicit_correction=1, window_tag="w1",
+            ),
+            "我改口了，不喜欢美式",
+        )
+        service = self._service(memory_session_isolation="strict")
+        pack, _r, _s = asyncio.run(
+            service.build_injection("我以前喜欢美式", "u1", window_tag="w1")
         )
         self.assertNotIn("【当时】", pack)
 
@@ -3594,6 +3649,7 @@ class SpeakTest(unittest.TestCase):
             "去 2 群说：我到了": ("index", "2", "我到了"),
             "去第3个群说 帮忙看下": ("index", "3", "帮忙看下"),
             "去 987654321 群说：到家了": ("number", "987654321", "到家了"),
+            "去 1234 群说：到了": ("number", "1234", "到了"),
             "帮我跟群友说 晚安": ("default", "", "晚安"),
         }
         for text, (kind, value, content) in cases.items():
@@ -3612,6 +3668,9 @@ class SpeakTest(unittest.TestCase):
         self.assertEqual(resolve_index("1", groups), groups[0])
         self.assertEqual(resolve_index("5", groups), "")
         self.assertEqual(resolve_number("222", groups), groups[1])
+        # 精确优先：12345 与 123456 并存时，「12345」必须命中前者而非子串。
+        both = ["aiocqhttp:GroupMessage:123456", "aiocqhttp:GroupMessage:12345"]
+        self.assertEqual(resolve_number("12345", both), "aiocqhttp:GroupMessage:12345")
         self.assertEqual(
             resolve_target({"target": "default", "value": ""}, default_umo=groups[0], groups=groups),
             (groups[0], ""),
@@ -3647,6 +3706,18 @@ class SpeakTest(unittest.TestCase):
         self.assertEqual(self.sends, [])
         group_event = FakeEvent(sender="owner1", window="aiocqhttp:GroupMessage:111", message_text="去群里说：测试")
         self.assertIsNone(asyncio.run(service.handle_speak_request(group_event, "去群里说：测试")))
+
+    def test_webchat_owner_toggle(self):
+        self._msg("aiocqhttp:GroupMessage:111")
+        web = FakeEvent(sender="anyone", window="webchat:FriendMessage:web", message_text="去群里说：测试")
+        web.get_platform_name = lambda: "webchat"
+        strict = self._service(owner_qq="owner1", speak_enabled=True, webchat_is_owner=False)
+        receipt = asyncio.run(strict.handle_speak_request(web, "去群里说：测试"))
+        self.assertIn("只有主人", receipt or "")
+        self.assertEqual(self.sends, [])
+        legacy = self._service(owner_qq="owner1", speak_enabled=True)
+        receipt2 = asyncio.run(legacy.handle_speak_request(web, "去群里说：测试"))
+        self.assertIn("已发到群", receipt2 or "")
 
     def test_handle_speak_rate_limit_and_whitelist(self):
         self._msg("aiocqhttp:GroupMessage:111")
@@ -3774,6 +3845,12 @@ class DebounceHeuristicTest(unittest.TestCase):
             ("", False),
         ):
             self.assertEqual(is_probably_incomplete(text, short_chars=8), expected, text)
+
+    def test_ack_words_not_held(self):
+        from savagetype.debounce import is_probably_incomplete
+
+        for text in ("好的", "收到", "明白", "可以", "行", "嗯", "哈哈", "OK", "没问题", "好嘞"):
+            self.assertFalse(is_probably_incomplete(text, short_chars=8), text)
 
     def test_merge(self):
         from savagetype.debounce import merge_fragments
@@ -3928,10 +4005,17 @@ class ReplyGateV2Test(unittest.TestCase):
         self.assertEqual(turn_is_open("", "bot1")[0], True)
         self.assertEqual(turn_is_open("at:20002|小明", "bot1"), (False, "turn_taken:20002"))
         self.assertEqual(turn_is_open("at:bot1|", "bot1")[0], True)
+        self.assertEqual(turn_is_open("at:all|", "bot1"), (True, "open_all"))
         self.assertEqual(name_hit("小鳄鱼在吗", ["小鳄鱼"]), (True, "name:小鳄鱼"))
         self.assertEqual(name_hit("在吗", ["小鳄鱼"])[0], False)
+        self.assertEqual(name_hit("BOT在吗", ["bot"]), (True, "name:bot"))
         self.assertTrue(question_like("这个怎么弄？"))
+        self.assertTrue(question_like("你闺蜜是谁"))
+        self.assertTrue(question_like("在吗"))
         self.assertFalse(question_like("今天天气不错"))
+        # 「呢」是语气词：陈述句不算问句，豁免不该放行。
+        self.assertFalse(question_like("我闺蜜是小美呢"))
+        self.assertTrue(question_like("他呢？"))
         ranges = parse_quiet_ranges("1:00-7:00;13-14")
         self.assertEqual(ranges, [(60, 420), (780, 840)])
         import datetime as dt
@@ -3963,6 +4047,35 @@ class ReplyGateV2Test(unittest.TestCase):
         fire, meta = asyncio.run(service.reply_gate_for(event))
         self.assertTrue(fire)
         self.assertEqual(meta["reason"], "name_hit")
+
+    def test_keyword_force_replies_even_when_turn_taken(self):
+        service = self._service(reply_gate_enabled=True, reply_gate_mode="probability",
+                                reply_gate_probability=0.0, reply_gate_min_interval_seconds=0,
+                                reply_gate_cooldown_seconds=0, reply_gate_keywords_force=True,
+                                reply_gate_keywords="问一下")
+        event = self._event("问一下这个怎么弄", message=[self._at("20002", "小明")])
+        fire, meta = asyncio.run(service.reply_gate_for(event))
+        self.assertTrue(fire)
+        self.assertEqual(meta["reason"], "keyword_force")
+        self.assertEqual(meta["keyword"], "keyword:问一下")
+
+    def test_keyword_force_off_by_default(self):
+        service = self._service(reply_gate_enabled=True, reply_gate_mode="probability",
+                                reply_gate_probability=0.0, reply_gate_min_interval_seconds=0,
+                                reply_gate_cooldown_seconds=0, reply_gate_keywords="问一下")
+        event = self._event("问一下这个怎么弄", message=[self._at("20002", "小明")])
+        fire, meta = asyncio.run(service.reply_gate_for(event))
+        self.assertFalse(fire)
+        self.assertEqual(meta["reason"], "turn_not_open")
+
+    def test_keyword_force_still_blocked_by_quiet_hours(self):
+        service = self._service(reply_gate_enabled=True, reply_gate_mode="probability",
+                                reply_gate_probability=0.0, reply_gate_min_interval_seconds=0,
+                                reply_gate_cooldown_seconds=0, reply_gate_keywords_force=True,
+                                reply_gate_keywords="问一下", reply_gate_quiet_hours="0:00-23:59")
+        fire, meta = asyncio.run(service.reply_gate_for(self._event("问一下这个怎么弄")))
+        self.assertFalse(fire)
+        self.assertEqual(meta["reason"], "quiet_hours")
 
     def test_quiet_hours_block_everything(self):
         service = self._service(reply_gate_enabled=True, reply_gate_mode="probability",
@@ -4065,6 +4178,100 @@ class ReplyGateV2Test(unittest.TestCase):
         reasons2 = [h.filter_reason for h in result2.blocked]
         self.assertNotIn("小美", pack2)
         self.assertTrue(reasons2)  # 陈述句场景仍被挡（去重或已提及，取决于注入窗口）
+
+    def test_short_fact_question_exempt(self):
+        """v5.3.0：短事实（content 只比 value 长一点）问句也要豁免。"""
+        self.store.add_fact(
+            {
+                "subject": "self",
+                "attribute": "note",
+                "value": "闺蜜",
+                "plain": "闺蜜是小美",
+                "content": "闺蜜是小美",
+                "speaker_id": "u1",
+                "speaker_name": "阿U",
+                "status": "live",
+                "confidence": 0.9,
+                "first_person": 1,
+            }
+        )
+        service = self._service(inject_novelty_filter=True, memory_session_isolation="off")
+        pack, result, _snapshot = asyncio.run(
+            service.build_injection("你闺蜜是谁", "u1", window_tag="w1")
+        )
+        self.assertIn("小美", pack)
+        self.assertNotIn("query_mentioned", [h.filter_reason for h in result.blocked])
+
+    def test_statement_with_ne_particle_still_blocked(self):
+        """v5.3.0：「我闺蜜是小美呢」是陈述句（呢=语气词），仍被 query_mentioned 挡。"""
+        self.store.add_fact(
+            {
+                "subject": "self",
+                "attribute": "note",
+                "value": "闺蜜",
+                "plain": "闺蜜是小美",
+                "content": "她俩大一社团认识，闺蜜叫小美",
+                "speaker_id": "u1",
+                "speaker_name": "阿U",
+                "status": "live",
+                "confidence": 0.9,
+                "first_person": 1,
+            }
+        )
+        service = self._service(inject_novelty_filter=True, memory_session_isolation="off")
+        pack, result, _snapshot = asyncio.run(
+            service.build_injection("我闺蜜是小美呢", "u1", window_tag="w1")
+        )
+        self.assertNotIn("小美", pack)
+        self.assertIn("query_mentioned", [h.filter_reason for h in result.blocked])
+
+    def test_unanswered_fires_when_nobody_replied(self):
+        """v5.3.0：问句之后只有问者自己说话 → 无人应答成立。"""
+        service = self._service()
+        window = "aiocqhttp:GroupMessage:77"
+        now = int(now_ts())
+        self.store.add_timeline(
+            {
+                "ts": now - 30, "speaker_id": "asker", "speaker_name": "问者",
+                "bot_id": "b", "window_tag": window, "role": "user",
+                "content": "这个方案大家怎么看？", "persona_id": "",
+                "fingerprint": "q1",
+            }
+        )
+        self.assertTrue(service.reply_gate_unanswered(window, now - 31, "asker"))
+        # 问者自己追问一句，仍算无人应答。
+        self.store.add_timeline(
+            {
+                "ts": now - 10, "speaker_id": "asker", "speaker_name": "问者",
+                "bot_id": "b", "window_tag": window, "role": "user",
+                "content": "有人吗", "persona_id": "",
+                "fingerprint": "q2",
+            }
+        )
+        self.assertTrue(service.reply_gate_unanswered(window, now - 31, "asker"))
+
+    def test_unanswered_blocked_when_answered(self):
+        """v5.3.0：别人或 Bot 回过 → 不算无人应答。"""
+        service = self._service()
+        window = "aiocqhttp:GroupMessage:78"
+        now = int(now_ts())
+        self.store.add_timeline(
+            {
+                "ts": now - 30, "speaker_id": "asker", "speaker_name": "问者",
+                "bot_id": "b", "window_tag": window, "role": "user",
+                "content": "这个方案大家怎么看？", "persona_id": "",
+                "fingerprint": "q1",
+            }
+        )
+        self.store.add_timeline(
+            {
+                "ts": now - 5, "speaker_id": "other", "speaker_name": "路人",
+                "bot_id": "b", "window_tag": window, "role": "user",
+                "content": "我觉得行", "persona_id": "",
+                "fingerprint": "a1",
+            }
+        )
+        self.assertFalse(service.reply_gate_unanswered(window, now - 31, "asker"))
 
 
 if __name__ == "__main__":

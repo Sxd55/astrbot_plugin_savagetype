@@ -24,7 +24,7 @@ try:
     from .savagetype.replygate import question_like as savagetype_question_like
     from .savagetype.crosswin import window_kind
     from .savagetype.slots import apply_slot
-    from .savagetype.speak import group_label
+    from .savagetype.speak import group_label, parse_intent
     from .savagetype.store import Store
     from .savagetype.util import (
         PLUGIN_NAME,
@@ -44,7 +44,7 @@ except ImportError:
     from savagetype.replygate import question_like as savagetype_question_like
     from savagetype.crosswin import window_kind
     from savagetype.slots import apply_slot
-    from savagetype.speak import group_label
+    from savagetype.speak import group_label, parse_intent
     from savagetype.store import Store
     from savagetype.util import (
         PLUGIN_NAME,
@@ -62,6 +62,14 @@ SCHEMA_PATH = Path(__file__).resolve().parent / "_conf_schema.json"
 PLUGIN_NAME_CONST = PLUGIN_NAME
 
 
+def _safe_int(value, default: int = 0) -> int:
+    """脏数据/伪造载荷里的整数：转不成回默认，不抛 500。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _data_dir() -> Path:
     try:
         root = Path(get_astrbot_plugin_data_path())
@@ -76,7 +84,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "5.1.0",
+    "5.3.1",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -230,6 +238,18 @@ class SavageTypePlugin(Star):
                         except Exception:
                             pass
                         return
+                elif (
+                    self.service.speak_enabled()
+                    and window_kind(event.unified_msg_origin) == "private"
+                    and parse_intent(text)
+                ):
+                    # 非主人私聊命中指派句式：明确拒绝，不丢给 LLM 自由发挥。
+                    await self.service.send_text(event.unified_msg_origin, "（只有主人能让我去群里说话）")
+                    try:
+                        event.stop_event()
+                    except Exception:
+                        pass
+                    return
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Savage Type owner reply failed: %s", exc)
             if self.service.is_command_text(text, event):
@@ -274,10 +294,6 @@ class SavageTypePlugin(Star):
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         try:
-            if event.get_extra("_stype_debounce_merge"):
-                # 防抖：这条碎片已经并入待发送的消息，本次不回复。
-                event.stop_event()
-                return
             self.service.refresh_coexistence(self.context.get_all_stars())
             if not self.service.inject_ok(event):
                 return
@@ -344,22 +360,25 @@ class SavageTypePlugin(Star):
             if message_id and message_id in self._debounce_skip:
                 self._debounce_skip.discard(message_id)
                 return
-            if event.get_extra("_stype_debounce_merge"):
-                event.stop_event()
-                return
             if not self._debounce_qualifies(event):
                 return
             key = self._debounce_key(event)
             text = str(event.message_str or "").strip()
             now = time.time()
-            window = max(0.5, float(self.config.get("debounce_window_seconds", 2.5) or 2.5))
-            max_seconds = max(1.0, float(self.config.get("debounce_max_seconds", 8) or 8))
-            max_fragments = max(2, int(self.config.get("debounce_max_fragments", 4) or 4))
+            window = self._num("debounce_window_seconds", 2.5, float, 0.5)
+            max_seconds = self._num("debounce_max_seconds", 8, float, 1.0)
+            max_fragments = self._num("debounce_max_fragments", 4, int, 2)
             hold = self._debounce_hold.get(key)
             if hold and str(hold.get("speaker")) == str(event.get_sender_id()):
                 hold["fragments"].append(text)
                 hold["count"] = int(hold.get("count", 1)) + 1
                 hold["deadline"] = min(now + window, float(hold.get("start", now)) + max_seconds)
+                try:
+                    hold.setdefault("extras", []).extend(
+                        list(getattr(event.message_obj, "message", None) or [])
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 if hold.get("task"):
                     hold["task"].cancel()
                 if hold["count"] >= max_fragments:
@@ -370,8 +389,15 @@ class SavageTypePlugin(Star):
                 event.stop_event()
                 return
             if hold:
-                # 换人或超时：先把之前合并的放出去（异步），本条按正常流程走。
-                asyncio.create_task(self._debounce_flush(key))
+                # 换人或新一轮：先把旧 hold 同步刷出去再建新 hold。
+                # 旧碎片已经被 stop_event 拦下，不刷就丢了；也不能只 create_task
+                # 挂起——新 hold 会立刻覆盖 dict，旧任务稍后 pop 到的是新 hold。
+                old = self._debounce_hold.pop(key, None)
+                if old is not None:
+                    old_task = old.get("task")
+                    if old_task is not None:
+                        old_task.cancel()
+                    await self._flush_hold(old)
             hold = {
                 "speaker": str(event.get_sender_id()),
                 "fragments": [text],
@@ -379,6 +405,7 @@ class SavageTypePlugin(Star):
                 "start": now,
                 "deadline": now + window,
                 "event": event,
+                "extras": list(getattr(event.message_obj, "message", None) or []),
             }
             hold["task"] = asyncio.create_task(self._debounce_timer(key, window))
             self._debounce_hold[key] = hold
@@ -399,25 +426,49 @@ class SavageTypePlugin(Star):
         hold = self._debounce_hold.pop(key, None)
         if not hold:
             return
+        await self._flush_hold(hold)
+
+    async def _flush_hold(self, hold: dict) -> None:
         task = hold.get("task")
         if task is not None and task is not asyncio.current_task():
-            task.cancel()
+            try:
+                task.cancel()
+            except Exception:  # noqa: BLE001
+                pass
         merged = merge_fragments(
             [str(item) for item in (hold.get("fragments") or [])],
-            max_chars=max(60, int(self.config.get("debounce_max_chars", 600) or 600)),
+            max_chars=self._num("debounce_max_chars", 600, int, 60),
         )
         event = hold.get("event")
         if not merged or event is None:
             return
         self.store.add_diag("debounce", {"chars": len(merged), "fragments": int(hold.get("count", 1))})
-        await self._reinject(event, merged)
+        wake = True
+        try:
+            if self.service.reply_gate_enabled() and window_kind(event.unified_msg_origin) == "group":
+                # 接话门开着时，合并消息不强制唤醒，交由 reply_gate 按合并文本判定；
+                # 否则概率未中 / 话轮被占也会被强制回复。私聊不受门控，保持唤醒。
+                wake = False
+        except Exception:  # noqa: BLE001
+            wake = True
+        await self._reinject(event, merged, wake=wake, extra_components=hold.get("extras"))
 
-    async def _reinject(self, event: AstrMessageEvent, text: str) -> None:
-        """把文本重新提交进 AstrBot 管道（走完整的人格/记忆流程）。防抖合并与延迟接话共用。"""
+    async def _reinject(
+        self, event: AstrMessageEvent, text: str, wake: bool = True,
+        extra_components: list | None = None,
+    ) -> None:
+        """把文本重新提交进 AstrBot 管道（走完整的人格/记忆流程）。防抖合并与延迟接话共用。
+
+        wake=True（延迟接话 / 门控关闭时）直接唤醒回复；wake=False 时作为普通
+        群消息重注，由 reply_gate 按合并文本重新判定。
+        """
         from astrbot.core.message.components import Plain
         from astrbot.core.star.star_tools import StarTools
 
-        components = [c for c in (event.message_obj.message or []) if not isinstance(c, Plain)]
+        base = list(extra_components) if extra_components is not None else list(
+            event.message_obj.message or []
+        )
+        components = [c for c in base if not isinstance(c, Plain)]
         components.insert(0, Plain(text))
         message = await StarTools.create_message(
             type=str(event.message_obj.type.value),
@@ -430,13 +481,15 @@ class SavageTypePlugin(Star):
             message_id=event.message_obj.message_id,
         )
         try:
+            if len(self._debounce_skip) > 2000:
+                self._debounce_skip.clear()
             self._debounce_skip.add(str(message.message_id))
         except Exception:  # noqa: BLE001
             pass
         await StarTools.create_event(
             abm=message,
             platform=event.get_platform_name(),
-            is_wake=True,
+            is_wake=wake,
         )
         if self.config.get("debug_log_injection"):
             logger.info("Savage Type debounce flushed: %s", text[:60])
@@ -454,7 +507,7 @@ class SavageTypePlugin(Star):
             if old and old.get("task"):
                 old["task"].cancel()
             try:
-                delay = max(3, int(self.config.get("reply_gate_unanswered_seconds", 20) or 20))
+                delay = self._num("reply_gate_unanswered_seconds", 20, int, 3)
             except (TypeError, ValueError):
                 delay = 20
             try:
@@ -490,6 +543,11 @@ class SavageTypePlugin(Star):
             if event is None:
                 return
             await self._reinject(event, text)
+            # 延迟接话同样计入冷却与日限，否则可绕过连续刷。
+            try:
+                self.service.reply_gate_mark_fired(window)
+            except Exception:  # noqa: BLE001
+                pass
             if self.config.get("debug_log_injection"):
                 logger.info("Savage Type unanswered gate fired: %s", text[:40])
         except asyncio.CancelledError:
@@ -519,12 +577,12 @@ class SavageTypePlugin(Star):
                 # 明确 @ 机器人的消息立即回复，不等待。
                 return False
         text = str(event.message_str or "").strip()
-        if not text or text.startswith(("/", "／", "!")):
+        if not text or text.startswith(("/", "／", "!", "！")):
             return False
         if self._has_image(event):
             return False
         try:
-            short_chars = max(2, int(self.config.get("debounce_short_chars", 12) or 12))
+            short_chars = self._num("debounce_short_chars", 12, int, 2)
         except (TypeError, ValueError):
             short_chars = 12
         return is_probably_incomplete(text, short_chars=short_chars)
@@ -607,6 +665,43 @@ class SavageTypePlugin(Star):
     @filter.command_group("stype")
     def stype(self):
         pass
+
+    def _num(self, key: str, default: float, cast=float, minimum: float | None = None):
+        """读数字配置：None/空串/非法值回退默认；显式 0 会保留（不被 or 吞掉）。"""
+        raw = self.config.get(key)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            value = default
+        else:
+            try:
+                value = cast(raw)
+            except (TypeError, ValueError):
+                try:
+                    value = cast(float(str(raw).strip()))
+                except (TypeError, ValueError):
+                    value = default
+        if minimum is not None:
+            value = max(minimum, value)
+        return value
+
+    @staticmethod
+    def _parse_id(payload: dict, field: str = "id") -> int:
+        """解析面板/命令传来的整数 id：非法值返回 0（由调用方报 400，而非 500）。"""
+        try:
+            return int((payload or {}).get(field) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _privileged(self, event: AstrMessageEvent) -> bool:
+        """写操作与敏感查看：AstrBot 管理员或插件主人。"""
+        try:
+            if event.is_admin():
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            return bool(self.service.is_owner_event(event))
+        except Exception:  # noqa: BLE001
+            return False
 
     @stype.command("status")
     async def cmd_status(self, event: AstrMessageEvent):
@@ -728,7 +823,10 @@ class SavageTypePlugin(Star):
 
     @stype.command("groups")
     async def cmd_groups(self, event: AstrMessageEvent):
-        """列出已知群与编号（指派发言选目标用）"""
+        """列出已知群与编号（指派发言选目标用，仅管理员/主人）"""
+        if not self._privileged(event):
+            yield event.plain_result("只有管理员或主人能查看已知群。")
+            return
         rows = self.service.speak_groups()
         if not rows:
             yield event.plain_result("还没有记录到任何群（先在群里说句话）。")
@@ -756,7 +854,10 @@ class SavageTypePlugin(Star):
 
     @stype.command("flow")
     async def cmd_flow(self, event: AstrMessageEvent):
-        """预览窗口全流上下文（其他窗口最近消息流，含群成员与 Bot）"""
+        """预览窗口全流上下文（其他窗口最近消息流，含群成员与 Bot，仅管理员/主人）"""
+        if not self._privileged(event):
+            yield event.plain_result("只有管理员或主人能预览窗口全流。")
+            return
         ident = await self._ident(event)
         block, meta = self.service.window_flow_for(
             event.message_str or "",
@@ -801,7 +902,10 @@ class SavageTypePlugin(Star):
 
     @stype.command("add")
     async def cmd_add(self, event: AstrMessageEvent):
-        """手动写入当前说话人事实"""
+        """手动写入当前说话人事实（仅管理员/主人，防记忆投毒）"""
+        if not self._privileged(event):
+            yield event.plain_result("只有管理员或主人能手动写入记忆。")
+            return
         msg = event.message_str or ""
         idx = msg.lower().find("add")
         content = msg[idx + 3 :].strip() if idx >= 0 else msg.strip()
@@ -876,13 +980,19 @@ class SavageTypePlugin(Star):
 
     @stype.command("rollback")
     async def cmd_rollback(self, event: AstrMessageEvent, fact_id: int):
-        """回滚一条覆盖，恢复被归档的旧事实"""
+        """回滚一条覆盖，恢复被归档的旧事实（仅管理员/主人）"""
+        if not self._privileged(event):
+            yield event.plain_result("只有管理员或主人能回滚记忆。")
+            return
         result = self.service.contradiction.rollback(fact_id)
         yield event.plain_result(str(result))
 
     @stype.command("diagnostics")
     async def cmd_diagnostics(self, event: AstrMessageEvent):
-        """诊断：共存、检索、库规模"""
+        """诊断：共存、检索、库规模（含配置，仅管理员/主人）"""
+        if not self._privileged(event):
+            yield event.plain_result("只有管理员或主人能查看诊断。")
+            return
         ov = self.service.overview()
         yield event.plain_result(str(ov))
 
@@ -1162,6 +1272,12 @@ class SavageTypePlugin(Star):
             path = Path(raw)
             if not path.is_file():
                 return ""
+            # 超大图片不读进内存（12MB 上限），避免打爆内存。
+            try:
+                if path.stat().st_size > 12 * 1024 * 1024:
+                    return ""
+            except Exception:  # noqa: BLE001
+                return ""
             mime = mimetypes.guess_type(path.name)[0] or "image/png"
             encoded = base64.b64encode(path.read_bytes()).decode("ascii")
             return f"data:{mime};base64,{encoded}"
@@ -1169,8 +1285,7 @@ class SavageTypePlugin(Star):
             return ""
 
     def _caption_timeout(self) -> int:
-        raw = self.config.get("image_caption_timeout_seconds")
-        return 30 if raw is None else int(raw)
+        return int(self._num("image_caption_timeout_seconds", 30, int))
 
     async def _caption_via_provider(self, event: AstrMessageEvent, provider_id: str) -> str:
         def note(kind: str, payload: dict) -> None:
@@ -1204,7 +1319,18 @@ class SavageTypePlugin(Star):
             )
             note("image_caption_skip", {"reason": decision.reason})
             return ""
-        result = call(prompt=prompt, image_urls=urls)
+        result = None
+        try:
+            if asyncio.iscoroutinefunction(call):
+                result = await asyncio.wait_for(call(prompt=prompt, image_urls=urls), timeout=timeout)
+            else:
+                # 同步 provider 放线程池，避免阻塞事件循环。
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(call, prompt=prompt, image_urls=urls), timeout=timeout
+                )
+        except Exception as exc:  # noqa: BLE001
+            note("image_caption_fail", {"error": f"{type(exc).__name__}: {exc}"[:200]})
+            return ""
         if asyncio.iscoroutine(result):
             result = await asyncio.wait_for(result, timeout=timeout)
         text = getattr(result, "completion_text", "") or ""
@@ -1299,7 +1425,7 @@ class SavageTypePlugin(Star):
         event.set_extra("_stype_ident", ident)
         return ident
 
-    async def _llm_generate(self, prompt: str, provider_id: str) -> str:
+    async def _llm_generate(self, prompt: str, provider_id: str) -> tuple[str, int, int]:
         pid = (provider_id or "").strip()
         if not pid:
             try:
@@ -1341,7 +1467,10 @@ class SavageTypePlugin(Star):
     async def page_search(self):
         keyword = request.query.get("q", "")
         speaker_id = request.query.get("speaker_id", "") or None
-        k = request.query.get("k", 12, type=int)
+        try:
+            k = max(1, min(int(request.query.get("k", 12)), 200))
+        except (TypeError, ValueError):
+            k = 12
         canonical = self.store.resolve_speaker(speaker_id) if speaker_id else None
         ids = self.store.speaker_ids_for(canonical) if canonical else None
         facts = self.store.search_facts(keyword, speaker_id=canonical, limit=k, speaker_ids=ids)
@@ -1408,7 +1537,7 @@ class SavageTypePlugin(Star):
 
     async def page_memory_review(self):
         payload = await request.json(default={})
-        review_id = int(payload.get("id") or 0)
+        review_id = self._parse_id(payload)
         if not review_id:
             return error_response("missing id", status_code=400)
         status = str(payload.get("status") or "").strip().lower()
@@ -1478,7 +1607,7 @@ class SavageTypePlugin(Star):
 
     async def page_fact_update(self):
         payload = await request.json(default={})
-        fact_id = int(payload.get("id") or 0)
+        fact_id = self._parse_id(payload)
         if not fact_id:
             return error_response("missing id", status_code=400)
         fact = self.store.get_fact(fact_id)
@@ -1492,7 +1621,11 @@ class SavageTypePlugin(Star):
         if "content" in payload:
             fields["content"] = str(payload.get("content") or "")
         if "keywords" in payload:
-            fields["keywords"] = payload.get("keywords") or []
+            raw_keywords = payload.get("keywords") or []
+            if isinstance(raw_keywords, str):
+                # 手填字符串时按逗号/空白切词，避免存成裸串导致下游逐字迭代。
+                raw_keywords = [x.strip() for x in re.split(r"[,，、\s]+", raw_keywords) if x.strip()]
+            fields["keywords"] = list(raw_keywords or [])
         if "importance" in payload:
             try:
                 importance = float(payload.get("importance"))
@@ -1706,21 +1839,21 @@ class SavageTypePlugin(Star):
 
     async def page_pending_confirm(self):
         payload = await request.json(default={})
-        pending_id = int(payload.get("id") or 0)
+        pending_id = self._parse_id(payload)
         if not pending_id:
             return error_response("missing id", status_code=400)
         return json_response(self.service.contradiction.confirm_pending(pending_id))
 
     async def page_pending_reject(self):
         payload = await request.json(default={})
-        pending_id = int(payload.get("id") or 0)
+        pending_id = self._parse_id(payload)
         if not pending_id:
             return error_response("missing id", status_code=400)
         return json_response(self.service.contradiction.reject_pending(pending_id))
 
     async def page_rollback(self):
         payload = await request.json(default={})
-        fact_id = int(payload.get("id") or 0)
+        fact_id = self._parse_id(payload)
         if not fact_id:
             return error_response("missing id", status_code=400)
         return json_response(self.service.contradiction.rollback(fact_id))
@@ -1766,7 +1899,7 @@ class SavageTypePlugin(Star):
             "status": r.status,
             "title": r.title,
             "reason": r.reason,
-            "quality": int((r.payload or {}).get("quality") or 0),
+            "quality": _safe_int((r.payload or {}).get("quality")),
             "speaker_id": r.speaker_id,
             "persona_id": r.persona_id,
             "payload": r.payload,
@@ -1794,7 +1927,7 @@ class SavageTypePlugin(Star):
                 if review_id:
                     results.append(self.service.learning.set_status(review_id, status))
             return json_response({"ok": True, "count": len(results), "results": results})
-        review_id = int(payload.get("id") or 0)
+        review_id = self._parse_id(payload)
         if not review_id:
             return error_response("missing id", status_code=400)
         return json_response(self.service.learning.set_status(review_id, status))
@@ -1816,26 +1949,44 @@ class SavageTypePlugin(Star):
     async def page_export(self):
         dest = self.data_dir / "exports" / f"savagetype-{self.store.revision()}.jsonl"
         path = self.service.export_jsonl(dest)
+        try:
+            # 只保留最近 5 个导出，避免 exports 无限增长。
+            files = sorted(dest.parent.glob("savagetype-*.jsonl"), key=lambda p: p.stat().st_mtime)
+            for old in files[:-5]:
+                try:
+                    old.unlink()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
         return file_response(path, filename=path.name, content_type="application/json")
+
+    def _archive_path(self, raw: str) -> Path | None:
+        """档案导入/预览只允许读 data_dir 下的文件，防任意路径读取。"""
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            base = self.data_dir.resolve()
+            path = (base / text).resolve() if not Path(text).is_absolute() else Path(text).resolve()
+        except Exception:  # noqa: BLE001
+            return None
+        if base not in path.parents and path != base:
+            return None
+        return path if path.is_file() else None
 
     async def page_archive_preview(self):
         payload = await request.json(default={})
-        raw = str(payload.get("path") or "").strip()
-        if not raw:
-            return error_response("missing path", status_code=400)
-        path = Path(raw)
-        if not path.is_file():
-            return error_response("file not found", status_code=400)
+        path = self._archive_path(str(payload.get("path") or ""))
+        if path is None:
+            return error_response("file not found (only files under data_dir)", status_code=400)
         return json_response(self.service.preview_archive(path))
 
     async def page_archive_import(self):
         payload = await request.json(default={})
-        raw = str(payload.get("path") or "").strip()
-        if not raw:
-            return error_response("missing path", status_code=400)
-        path = Path(raw)
-        if not path.is_file():
-            return error_response("file not found", status_code=400)
+        path = self._archive_path(str(payload.get("path") or ""))
+        if path is None:
+            return error_response("file not found (only files under data_dir)", status_code=400)
         return json_response(self.service.import_archive(path, self.data_dir / "backups"))
 
     async def page_chat_preview(self):
@@ -1985,7 +2136,7 @@ class SavageTypePlugin(Star):
 
     async def page_event_update(self):
         payload = await request.json(default={})
-        event_id = int(payload.get("id") or 0)
+        event_id = self._parse_id(payload)
         if not event_id:
             return error_response("missing id", status_code=400)
         event = self.store.get_event(event_id)
@@ -2032,7 +2183,7 @@ class SavageTypePlugin(Star):
 
     async def page_event_pin(self):
         payload = await request.json(default={})
-        event_id = int(payload.get("id") or 0)
+        event_id = self._parse_id(payload)
         if not event_id:
             return error_response("missing id", status_code=400)
         raw_pinned = payload.get("pinned", True)
@@ -2102,7 +2253,7 @@ class SavageTypePlugin(Star):
 
     async def page_fact_pin(self):
         payload = await request.json(default={})
-        fact_id = int(payload.get("id") or 0)
+        fact_id = self._parse_id(payload)
         if not fact_id:
             return error_response("missing id", status_code=400)
         raw_pinned = payload.get("pinned", True)
@@ -2142,6 +2293,8 @@ class SavageTypePlugin(Star):
             return round(float(getattr(f, "importance", 0) or 0), 3)
 
     def _fact_view(self, f) -> dict:
+        if f is None:
+            return {}
         return {
             "id": f.id,
             "subject": f.subject,

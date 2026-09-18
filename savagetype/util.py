@@ -133,7 +133,7 @@ RELATION_GUARD_RE = re.compile(
     r"爸爸|妈妈|父亲|母亲|儿子|女儿|哥哥|弟弟|姐姐|妹妹|"
     r"老板|上司|领导|管理员|群主|admin)"
 )
-COMMAND_SPLIT_RE = re.compile(r"^[/／]")
+COMMAND_SPLIT_RE = re.compile(r"^[/／!！]")
 BOT_DEFINE_RE = re.compile(
     r"(你叫|你名叫|你是|你的名字|你的身份|你以后|从现在起你|记住你是|记住你叫|"
     r"你要|你不要|你不许|称呼你|给你起名)"

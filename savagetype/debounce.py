@@ -16,11 +16,20 @@ CONT_WORDS = (
     "如果", "虽然", "不过", "并且", "要是", "感觉", "觉得", "帮我", "你看看",
 )
 
+# 完整短回复：本身就是一句话，不用等后续（精确匹配才算）。
+ACK_WORDS = frozenset({
+    "好", "好的", "好嘞", "好的好的", "收到", "收到收到", "明白", "知道了",
+    "了解", "可以", "行", "嗯", "嗯嗯", "哦", "哦哦", "哈哈", "嘿嘿",
+    "没问题", "OK", "ok", "Ok", "okok",
+})
+
 
 def is_probably_incomplete(text: str, *, short_chars: int = 12) -> bool:
     """启发式判断：这条消息像不像「话还没说完」。"""
     value = (text or "").strip()
     if not value:
+        return False
+    if value in ACK_WORDS:
         return False
     if len(value) > max(1, int(short_chars)):
         return False

@@ -103,8 +103,9 @@ check("config count claim", claimed_count and int(claimed_count.group(1)) == len
       f"README={claimed_count.group(1) if claimed_count else '?'} schema={len(SCHEMA)}")
 
 # 10. settings groups in app.js vs README list
-for group in ("总开关与采集", "抽取与整理", "检索与注入", "重要性与维护",
-              "学习与人格草稿", "图片", "Embedding 与 Rerank", "外观", "事件记忆与隐私"):
+for group in ("总开关与主人", "免@接话", "指派发言", "消息防抖", "记忆注入",
+              "隐私、画像与跨会话", "事件与历史", "抽取与整理", "学习与表达",
+              "重要性与维护", "模型与预算", "图片", "外观"):
     check(f"settings group {group}", group in APPJS or group in INDEX)
 
 print()

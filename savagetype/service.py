@@ -32,7 +32,7 @@ from .contradiction import ContradictionEngine
 from .crosswin import build_cross_window, window_kind
 from .events import EventPipeline
 from .extract import Extractor
-from .inject import build_pack
+from .inject import build_pack, wrap_untrusted
 from .learn import LearningEngine
 from .addressee import (
     from_components as addressee_from_components,
@@ -544,8 +544,10 @@ class SavageTypeService:
             return False
         try:
             if self.event_platform(event) == "webchat":
-                # ChatUI 只有管理员能进，视为主人本人。
-                return True
+                # ChatUI：默认视同主人（ historically 只有管理员能进）。
+                # 若 ChatUI 暴露在不可信网络，请关闭 webchat_is_owner。
+                if bool(self._cfg_value("webchat_is_owner", True)):
+                    return True
         except Exception:
             pass
         owner = self.owner_qq()
@@ -711,13 +713,13 @@ class SavageTypeService:
                 sender_id = str(event.get_sender_id() or "")
             except Exception:  # noqa: BLE001
                 sender_id = ""
-            ttl_minutes = max(1, int(self._cfg_value("blank_mention_hint_ttl_minutes", 30)))
+            ttl_minutes = max(1, self._cfg_int("blank_mention_hint_ttl_minutes", 30))
             age = now_ts() - int(target.get("ts") or 0)
             if age > ttl_minutes * 60:
                 return ""
             same_user = bool(sender_id) and str(target.get("id") or "") == sender_id
             name = str(target.get("name") or target.get("id") or "对方")
-            gap = max(0, int(self._cfg_value("blank_mention_hint_gap_messages", 12)))
+            gap = max(0, self._cfg_int("blank_mention_hint_gap_messages", 12))
             recent = self.store.query(
                 "SELECT COUNT(*) FROM timeline WHERE window_tag=? AND ts>?",
                 (window, int(target.get("ts") or 0)),
@@ -737,7 +739,7 @@ class SavageTypeService:
             lines.append("拿不准时别强行续话，自然回一句「怎么了」「？」之类即可。")
             block = "\n".join(lines)
             self.store.add_diag("blank_mention", {"window": window, "same_user": same_user, "age": age})
-            return block
+            return wrap_untrusted(block)
         except Exception as exc:  # noqa: BLE001
             self.store.add_diag("blank_mention_fail", {"error": str(exc)[:160]})
             return ""
@@ -778,6 +780,35 @@ class SavageTypeService:
     def _cfg_value(self, key: str, default: Any) -> Any:
         raw = self.config.get(key)
         return default if raw is None else raw
+
+    def _cfg_int(self, key: str, default: int = 0) -> int:
+        """读整数配置：None/空串/非法值回退默认，不抛异常（显式 0 会保留）。"""
+        raw = self._cfg_value(key, default)
+        if isinstance(raw, bool):
+            return int(raw)
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        try:
+            text = str(raw or "").strip()
+            return int(text) if text else int(default)
+        except (TypeError, ValueError):
+            try:
+                return int(float(str(raw or "").strip() or "nan"))
+            except (TypeError, ValueError):
+                return int(default)
+
+    def _cfg_float(self, key: str, default: float = 0.0) -> float:
+        """读浮点配置：None/空串/非法值回退默认，不抛异常。"""
+        raw = self._cfg_value(key, default)
+        if isinstance(raw, bool):
+            return float(raw)
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        try:
+            text = str(raw or "").strip()
+            return float(text) if text else float(default)
+        except (TypeError, ValueError):
+            return float(default)
 
     def idle_pending(self) -> bool:
         """True when the newest unsummarized message has been silent long enough."""
@@ -1018,29 +1049,36 @@ class SavageTypeService:
 
     def importance_cfg(self) -> dict[str, float]:
         return {
-            "weight": float(self._cfg_value("importance_weight", 0.25)),
-            "half_life_days": float(self._cfg_value("importance_half_life_days", 30)),
-            "reinforce_factor": float(self._cfg_value("importance_reinforce_factor", 0.5)),
-            "max_multiplier": float(self._cfg_value("importance_max_half_life_multiplier", 3)),
+            "weight": self._cfg_float("importance_weight", 0.25),
+            "half_life_days": self._cfg_float("importance_half_life_days", 30),
+            "reinforce_factor": self._cfg_float("importance_reinforce_factor", 0.5),
+            "max_multiplier": self._cfg_float("importance_max_half_life_multiplier", 3),
         }
 
     def _recent_ids(self, window_tag: str) -> set[int]:
         if not window_tag:
             return set()
-        window = max(0, int(self._cfg_value("inject_dedup_window_seconds", 600)))
+        window = max(0, self._cfg_int("inject_dedup_window_seconds", 600))
         if window <= 0:
             return set()
         return self.store.recent_recall_ids(window_tag, now_ts() - window)
 
+    def _dedup_keep_seconds(self) -> int:
+        window = max(0, self._cfg_int("inject_dedup_window_seconds", 600))
+        return max(7 * 86400, (window + 86400) if window else 0)
+
     def _remember_injected(self, window_tag: str, fact_ids: list[int]) -> None:
         if not window_tag or not fact_ids:
             return
-        self.store.add_recall(window_tag, [int(fid) for fid in fact_ids], now_ts())
+        self.store.add_recall(
+            window_tag, [int(fid) for fid in fact_ids], now_ts(),
+            keep_seconds=self._dedup_keep_seconds(),
+        )
 
     def _recent_event_ids(self, window_tag: str) -> set[int]:
         if not window_tag:
             return set()
-        window = max(0, int(self._cfg_value("inject_dedup_window_seconds", 600)))
+        window = max(0, self._cfg_int("inject_dedup_window_seconds", 600))
         if window <= 0:
             return set()
         return self.store.recent_event_recall_ids(window_tag, now_ts() - window)
@@ -1048,7 +1086,10 @@ class SavageTypeService:
     def _remember_injected_events(self, window_tag: str, event_ids: list[int]) -> None:
         if not window_tag or not event_ids:
             return
-        self.store.add_event_recall(window_tag, [int(eid) for eid in event_ids], now_ts())
+        self.store.add_event_recall(
+            window_tag, [int(eid) for eid in event_ids], now_ts(),
+            keep_seconds=self._dedup_keep_seconds(),
+        )
 
     def session_isolation_mode(self) -> str:
         from .util import session_isolation
@@ -1115,10 +1156,20 @@ class SavageTypeService:
             isolation=self.session_isolation_mode(),
             owner_ids=set(self._owner_ids),
             event_skip_ids=event_skip_ids,
-            event_limit=max(1, int(event_limit or self.config.get("event_max_inject") or 2)),
+            event_limit=self._resolve_event_limit(event_limit),
             entity_weight=self.entity_boost_weight(),
             history_limit=self.history_limit(),
         )
+
+    def _resolve_event_limit(self, event_limit: int = 0) -> int:
+        """事件条数：显式传入 >0 优先；否则读 event_max_inject（0=关闭事件注入）。"""
+        try:
+            explicit = int(event_limit or 0)
+        except (TypeError, ValueError):
+            explicit = 0
+        if explicit > 0:
+            return explicit
+        return max(0, self._cfg_int("event_max_inject", 2))
 
     async def warm_retrieval(
         self,
@@ -1203,6 +1254,19 @@ class SavageTypeService:
             max_chars = max(0, int(self._cfg_value("profile_max_chars", 300)))
         except (TypeError, ValueError):
             max_chars = 300
+        canonical = self.store.resolve_speaker(speaker_id)
+        ids = self.store.speaker_ids_for(canonical)
+        visible = None
+        if isolation != "off" and window_tag:
+            # 画像也要过与档案卡同一套可见性：主人记忆 / 私聊来源不借画像漏出去。
+            owners = set(self._owner_ids)
+
+            def visible(fact, _ids=ids, _owners=owners):
+                return not self.retriever._visibility(  # noqa: SLF001
+                    fact, canonical, "", None, "long_term", _ids, persona_id,
+                    window_tag, isolation, _owners,
+                )
+
         card, meta = build_profile_card(
             self.store,
             speaker_id,
@@ -1210,6 +1274,7 @@ class SavageTypeService:
             max_chars=max_chars,
             window_tag=window_tag,
             isolation=isolation,
+            visible=visible,
         )
         meta["enabled"] = True
         return card, meta
@@ -1296,11 +1361,12 @@ class SavageTypeService:
             private_to_group=bool(self._cfg_value("window_flow_private_to_group", True)),
             exclude_private_users=exclude_ids,
             persona_id=persona_id,
+            isolation=self.session_isolation_mode(),
         )
         meta["enabled"] = True
         if meta.get("items"):
             self.store.add_diag("window_flow", meta)
-        return block, meta
+        return wrap_untrusted(block), meta
 
     def reply_gate_enabled(self) -> bool:
         return bool(self._cfg_value("reply_gate_enabled", False))
@@ -1378,10 +1444,7 @@ class SavageTypeService:
         allow = parse_targets(self._cfg_value("speak_groups", ""))
         if not allowed_target(target, default_umo=default_umo, allow=allow):
             return f"群 {group_label(target)} 不在允许名单里（speak_groups）。"
-        try:
-            limit = max(0, int(self._cfg_value("speak_rate_limit_per_min", 5)))
-        except (TypeError, ValueError):
-            limit = 5
+        limit = max(0, self._cfg_int("speak_rate_limit_per_min", 5))
         try:
             owner_id = str(event.get_sender_id() or "")
         except Exception:  # noqa: BLE001
@@ -1393,17 +1456,26 @@ class SavageTypeService:
             used = 0
         if limit and used >= limit:
             return f"太快了，每分钟最多 {limit} 条，等一分钟再发。"
-        try:
-            max_chars = max(1, int(self._cfg_value("speak_max_chars", 300)))
-        except (TypeError, ValueError):
-            max_chars = 300
-        content = clip_content(str(intent.get("content") or ""), max_chars)
+        max_chars = max(1, self._cfg_int("speak_max_chars", 300))
+        raw_content = str(intent.get("content") or "")
+        content = clip_content(raw_content, max_chars)
         if not content:
             return "内容为空，没发。"
+        truncated = len(raw_content) > len(content)
+        # 先占位再发送：并发连发时不超限；发送失败则回退名额。
+        self.store.set_meta(minute_key, str(used + 1))
         ok = await self.send_text(target, content)
         if not ok:
+            try:
+                current = int(self.store.get_meta(minute_key) or 0)
+                self.store.set_meta(minute_key, str(max(0, current - 1)))
+            except (TypeError, ValueError):
+                pass
             return "发送失败（目标群可能不支持主动消息，或平台未连接）。"
-        self.store.set_meta(minute_key, str(used + 1))
+        try:
+            self.store.prune_speak_rate(10)
+        except Exception:  # noqa: BLE001
+            pass
         if bool(self._cfg_value("speak_record_to_target", True)):
             try:
                 ts = now_ts()
@@ -1424,8 +1496,21 @@ class SavageTypeService:
                 self.store.add_diag("speak_record_fail", {"error": str(exc)[:120]})
         self.store.add_diag("speak", {"window": target, "chars": len(content)})
         if bool(self._cfg_value("speak_reply_receipt", True)):
-            return f"已发到群 {group_label(target)}：{content}"
+            note = "（内容超长已截断）" if truncated else ""
+            return f"已发到群 {group_label(target)}：{content}{note}"
         return "已发送。"
+
+    def reply_gate_mark_fired(self, window_tag: str) -> None:
+        """记录一次主动接话：刷新同群冷却时间戳与每日计数（供延迟接话复用）。"""
+        if not window_tag:
+            return
+        self.store.set_meta(f"reply_gate_last:{window_tag}", str(now_ts()))
+        key = self._reply_gate_counter_key("day", window_tag)
+        try:
+            today = int(self.store.get_meta(key) or 0)
+        except (TypeError, ValueError):
+            today = 0
+        self.store.set_meta(key, str(today + 1))
 
     def _reply_gate_counter_key(self, kind: str, window_tag: str) -> str:
         day = datetime.now().strftime("%Y%m%d")
@@ -1480,22 +1565,27 @@ class SavageTypeService:
         return score >= threshold, ("judge_pass" if score >= threshold else "judge_below"), meta
 
     def reply_gate_unanswered(self, window_tag: str, since_ts: int, asker_id: str) -> bool:
-        """无人应答检测（d）：这条消息之后，群里没有别人（含 Bot）回复过。"""
+        """无人应答检测（d）：这条消息之后，群里没有别人（含 Bot）回复过。
+
+        问者自己的话（含触发问句本行与之后追问）不算应答；只有 Bot 或
+        其他人的后续消息才算有人应答。
+        """
         if not window_tag or since_ts <= 0:
             return False
         rows = self.store.query(
             "SELECT speaker_id, role FROM timeline WHERE window_tag=? AND ts>? AND role IN ('user','assistant')"
-            " ORDER BY id DESC LIMIT 20",
+            " ORDER BY ts ASC, id ASC LIMIT 20",
             (window_tag, int(since_ts)),
         )
+        asker = str(asker_id or "")
         for speaker_id, role in rows:
             speaker = str(speaker_id or "")
             if speaker in {ROLE_BOT_ID, "", "bot"}:
                 return False
-            if speaker == str(asker_id or ""):
-                return False
             if role == ROLE_ASSISTANT:
                 return False
+            if asker and speaker == asker:
+                continue
             return False
         return True
 
@@ -1510,6 +1600,7 @@ class SavageTypeService:
             "turn_not_open",
             "probability_miss",
             "keyword_miss",
+            "no_keywords",
             "low_info",
             "memory_miss",
             "judge_below",
@@ -1564,6 +1655,8 @@ class SavageTypeService:
         """免@主动接话 v2：规则预筛 → 点名必接 → 话轮判断 → 模式判定（含读空气）。"""
         meta: dict[str, Any] = {"enabled": self.reply_gate_enabled()}
         if not meta["enabled"]:
+            meta["fire"] = False
+            meta["reason"] = "disabled"
             return False, meta
         try:
             window_tag = str(getattr(event, "unified_msg_origin", "") or "")
@@ -1610,6 +1703,12 @@ class SavageTypeService:
                 turn_open, turn_reason = True, "turn_filter_off"
             names = self.reply_gate_bot_names() if bool(self._cfg_value("reply_gate_name_hit_enabled", True)) else []
             name_fired, name_reason = name_hit(text, names)
+            if bool(self._cfg_value("reply_gate_keywords_force", False)):
+                keyword_fired, keyword_reason = keyword_hit(
+                    text, parse_targets(self._cfg_value("reply_gate_keywords", ""))
+                )
+            else:
+                keyword_fired, keyword_reason = False, "force_off"
             mode_hit = False
             mode_reason = ""
             judge_meta: dict[str, Any] = {}
@@ -1661,9 +1760,10 @@ class SavageTypeService:
                 min_interval_ok=min_interval_ok,
                 daily_ok=daily_ok,
                 turn_open=turn_open,
-                name_fired=name_fired and bool(turn_open or True),
+                name_fired=name_fired,
                 mode_hit=mode_hit,
                 mode_reason=mode_reason,
+                keyword_fired=keyword_fired,
             )
             meta.update(
                 {
@@ -1678,15 +1778,13 @@ class SavageTypeService:
                     "quiet": quiet_reason,
                     "turn": turn_reason,
                     "name": name_reason,
+                    "keyword": keyword_reason,
                 }
             )
             if judge_meta:
                 meta["judge"] = judge_meta
             if fire and window_tag:
-                self.store.set_meta(f"reply_gate_last:{window_tag}", str(now))
-                self.store.set_meta(
-                    self._reply_gate_counter_key("day", window_tag), str(today_count + 1)
-                )
+                self.reply_gate_mark_fired(window_tag)
             self.store.add_diag("reply_gate", meta)
             return fire, meta
         except Exception as exc:  # noqa: BLE001
@@ -1757,7 +1855,7 @@ class SavageTypeService:
         pack = build_pack(
             result,
             # 0 表示不限（见 inject._fits 的预算语义），显式 0 不能被 or 默认值吞掉。
-            budget=int(self._cfg_value("inject_budget_chars", 800)),
+            budget=self._cfg_int("inject_budget_chars", 800),
             companion_present=any("companion" in d for d in self.coexistence.detected),
             learning=learning,
             dossier=card,
@@ -1765,24 +1863,23 @@ class SavageTypeService:
             bot_facts=bot_facts,
             out_ids=injected_ids,
             events=list(getattr(result, "events", None) or []),
-            event_budget=int(self._cfg_value("event_budget_chars", 300)),
-            event_limit=max(1, int(self._cfg_value("event_max_inject", 2))),
+            event_budget=self._cfg_int("event_budget_chars", 300),
+            event_limit=max(0, self._cfg_int("event_max_inject", 2)),
             out_event_ids=injected_event_ids,
             history=list(getattr(result, "history", None) or []),
             history_current=dict(getattr(result, "history_current", None) or {}),
             history_label=str(getattr(result, "history_label", "") or ""),
-            history_limit=max(1, int(self._cfg_value("history_max_facts", 6))),
+            history_limit=max(0, self._cfg_int("history_max_facts", 6)),
             profile=profile_card,
             cross_window=cross_block,
-            profile_budget=int(self._cfg_value("profile_max_chars", 300)),
-            cross_budget=int(self._cfg_value("cross_window_max_chars", 320)),
+            profile_budget=self._cfg_int("profile_max_chars", 300),
+            cross_budget=self._cfg_int("cross_window_max_chars", 320),
         )
         if pack:
             # 只有真的进了包的事实/事件才算「最近注入过」；被预算裁掉/未触发的都不占名额。
             self._remember_injected(window_tag, injected_ids)
             self._remember_injected_events(window_tag, injected_event_ids)
-            for event_id in injected_event_ids:
-                self.store.bump_event_access(event_id)
+            self.store.bump_event_access_many(injected_event_ids)
         snapshot = {
             "query": clip(query, 80),
             "speaker_id": speaker_id,

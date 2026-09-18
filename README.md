@@ -2,7 +2,7 @@
 
 **Savage Type** 是面向 AstrBot 的全局人格记忆中枢。Savage 只是插件名：身份和语气永远读 AstrBot 当前人格，本插件只负责**记住事实、处理改口、在需要时把少量相关记忆注入本轮对话**。不改写人格文件，不做日程和主动陪伴。
 
-当前版本 `v5.1.0`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
+当前版本 `v5.3.1`。仓库：https://github.com/Sxd55/astrbot_plugin_savagetype
 要求 AstrBot `>= 4.22.0`；运行依赖只有 `jieba`（可选，BM25 分词用，装不上自动回退）；离线测试只需 Python 3.11+ 标准库。
 
 ---
@@ -107,17 +107,19 @@
   - **cold**：本轮相关事实，按预算逐行装入。
 - **事件块**：`【事件】` 放在核心事实之前，按时间渲染 `[日期 · 标题] 摘要（谁讲的）`；预算 `event_budget_chars`（默认 300，0=不限），每轮最多 `event_max_inject`（默认 2）条。
 - **窗口全流（C 层，v4.6.0）**：把其他窗口（群聊 / 私聊）最近的**完整消息流**单独作为一段动态内容注入，含其他成员与 Bot 发言、带说话人与时间，解决「群里什么情况」这类问题——B 层只带本人发言的碎片，C 层带整段。默认**双向全通**（私聊 ↔ 群聊），回看 24 小时、最多 150 条 / 6000 字 / 3 个窗口；命中 `window_flow_keywords`（默认「群里 / 群友 / 私聊…」）时才注入，或把 `window_flow_always` 打开每次注入；`window_flow_exclude_private_users` 可屏蔽指定用户的私聊窗口，防止他人私聊内容流入群聊。预览：`/stype flow`。
-| `/stype groups` | 列出已知群与编号（指派发言选目标用） |
-| `/stype default <群号\|序号>` | 设置默认群（指派发言的默认目标；`clear` 清除） |
+| `/stype groups` | 列出已知群与编号（指派发言选目标用，管理员/主人） |
+| `/stype default <群号\|序号>` | 设置默认群（指派发言的默认目标；`clear` 清除，管理员/主人） |
 - **免@主动接话（v4.7.0）**：群聊里没 @ 机器人时，插件按 `reply_gate_mode` 判定是否主动接话——probability 按概率、keyword 命中词表、memory 只在「这条消息命中了记忆（核心/相关事实/事件）」时才接；判定命中后把事件标记为已唤醒，走 AstrBot 默认 LLM 通路（人格 / 记忆注入 / 分段 / TTS 全部照旧）。另有同群冷却（`reply_gate_cooldown_seconds`）、每群每日上限（`reply_gate_daily_limit`）、群白名单（`reply_gate_groups`）、最小字数与跳过命令（`reply_gate_min_chars` / `reply_gate_skip_commands`）。建议与 AstrBot 内置「主动回复」（配置→扩展功能→群聊上下文感知）**二选一**，避免重复接话；判定过程记录在 `/stype diagnostics` 的 `reply_gate` 项。
-- **疑问句不再误伤（v5.1.0）**：`query_mentioned` 过滤此前会把「你闺蜜是谁」这类问句里出现的短 value 当作「用户已经说过」而整条挡掉，导致 Bot 明明有记录却答不上来（要查一下才知道）。现在**疑问句 + content 比 value 更完整**时不再过滤，正常注入完整内容；陈述句（「我闺蜜是小美」）与置顶条目行为不变。
-- **免@接话 v2（v5.0.0）**：把「一次掷骰子」换成**分层漏斗**——①规则预筛（长度/命令/白名单/冷却/硬间隔/日限）→ ②**称呼命中必接**（话里叫到 Bot 名字，不@也接）→ ③**话轮判断**（消息 @/引用了别人就不插嘴，只有开放话轮才可能接）→ ④模式判定（`probability` / `keyword` / `memory` / **`judge` 读空气**：四维打分 相关度 0.3 / 意愿 0.25 / 氛围 0.25 / 时机 0.2，过阈值才接）→ ⑤**无人应答检测**（问句发出后等 N 秒没人回应，Bot 再接「没人答我来」）。另有 **免打扰时段**（`reply_gate_quiet_hours`）。每层判定原因都记录在 `/stype diagnostics` 的 `reply_gate` / `reply_gate_delayed` 项。
+- **疑问句不再误伤（v5.1.0，v5.3.0 修双向漏洞）**：`query_mentioned` 过滤此前会把「你闺蜜是谁」这类问句里出现的短 value 当作「用户已经说过」而整条挡掉，导致 Bot 明明有记录却答不上来（要查一下才知道）。现在**疑问句 + content 比 value 更长**时不再过滤，正常注入完整内容；v5.3.0 补了两个反向漏洞——短事实（「闺蜜是小美」）问句也能豁免，而「我闺蜜是小美呢」这类带语气词「呢」的**陈述句**不再被当成疑问句放行；历史/事件的新颖度过滤与事实同口径。
+- **关键词必回（v5.2.0）**：打开 `reply_gate_keywords_force` 后，任何模式（probability / keyword / memory / judge）下消息只要包含「接话关键词」（`reply_gate_keywords`）里任一词就**必回**，等同于点名必接——@别人、话轮被别人占着也会回；免打扰 / 冷却 / 硬间隔 / 日限仍然生效。适合「问一下」「为什么」「小萨」这类你想让它一定接的词。
+- **审查修补 v5.3.0**：无人应答检测之前因把触发问句本行计入查询而**永远不触发**，现已修活（问者自己的追问不算应答）；防抖换人交错发言不再丢消息，且接话门开着时合并消息交由 `reply_gate` 重新判定（不再强制回复）；窗口全流与空@提醒同样包进 `<savagetype_memory>` 不可信声明；strict/owner 隔离下群聊窗口不再带入私聊全流；`/stype flow|rollback|diagnostics|add|groups` 仅管理员/主人可用；画像过与档案卡同一套可见性；`event_max_inject=0` 可彻底关闭事件注入；`learn_window` 与 `webchat_is_owner` 新配置项。
+- **免@接话 v2（v5.0.0）**：把「一次掷骰子」换成**分层漏斗**——①规则预筛（长度/命令/白名单/冷却/硬间隔/日限）→ ②**称呼命中必接**（话里叫到 Bot 名字，不@也接；大小写不敏感）/ **关键词必回** → ③**话轮判断**（消息 @/引用了别人就不插嘴，只有开放话轮才可能接）→ ④模式判定（`probability` / `keyword` / `memory` / **`judge` 读空气**：四维打分 相关度 0.3 / 意愿 0.25 / 氛围 0.25 / 时机 0.2，过阈值才接）→ ⑤**无人应答检测**（问句发出后等 N 秒没人回应，Bot 再接「没人答我来」）。注意②的必回也要过①的规则层（只有免打扰/冷却等全过才放行）。另有 **免打扰时段**（`reply_gate_quiet_hours`）。每层判定原因都记录在 `/stype diagnostics` 的 `reply_gate` / `reply_gate_delayed` 项。
 - **指派发言（v4.8.0）**：主人在私聊说「去群里说：晚上八点开黑」「跟群友说 明天休息」「去 2 群说：我下课了」「去 987654321 群说：到家了」，Bot 就会把这句发到目标群（默认群或指定群），并回执「已发到群 X」。目标群从插件见过的群窗口里解析（`/stype groups` 查看编号，`/stype default` 设默认群）；发言会计入目标群时间线（`speak_record_to_target`）保证记忆一致；另有每分钟限流、最大字数与群名单（`speak_groups`）约束。发送走 `context.send_message`，需要平台支持主动消息（QQ/NapCat 支持）。
 - **谁对谁说（v4.9.0）**：消息捕获时解析 @ 与引用组件，窗口全流的每条记录升级为「谁 → 谁: 内容」（`timeline.addressee` 列，老数据为空不影响）。
 - **空@上下文提醒（v4.9.0）**：群里有人只 @ 机器人、不带正文时，注入「上次明确和你对话的人是 X（N 秒前、隔了 M 条）」的提醒，并给出「同一人可能在续话题；拿不准就自然问一句」的引导。开关与有效期见 `blank_mention_hint_*`。
-- **消息防抖（v4.9.0，启发式）**：用户短时间连发几条短消息时，插件先把消息挂起，在「最后一条之后等 `debounce_window_seconds`」或达到 `debounce_max_fragments` 后合并成一条重新提交（走完整的人格/记忆流程）。纯启发式判断（句末标点/连接词/长度），无模型依赖；@/唤醒消息默认直接回复。判定与合并记录在 `/stype diagnostics` 的 `debounce` 项。（v4.9.1 修复：命令回复如 `/stype flow` 的回执不再被当成 Bot 发言写入记忆。）
-- **新颖度过滤**：用户当前消息里已经说到的事实（值 ≥2 字）不重复注入。
-- **跨轮去重**：同一会话刚注入过的事实，在 `inject_dedup_window_seconds`（默认 600 秒）内不重复；「还记得 / 上次」类问题豁免；去重记录落库，重载插件不丢。
+- **消息防抖（v4.9.0，启发式，v5.3.0 补强）**：用户短时间连发几条短消息时，插件先把消息挂起，在「最后一条之后等 `debounce_window_seconds`」或达到 `debounce_max_fragments` 后合并成一条重新提交（走完整的人格/记忆流程）。纯启发式判断（句末标点/连接词/长度），无模型依赖；@/唤醒消息默认直接回复；「好的」「收到」这类完整短回复不等了直接走；换人交错发言时先刷出旧 hold 再建新 hold（不丢消息）；接话门开着时合并消息交由 `reply_gate` 按合并文本重新判定（私聊不受门控）。判定与合并记录在 `/stype diagnostics` 的 `debounce` 项。（v4.9.1 修复：命令回复如 `/stype flow` 的回执不再被当成 Bot 发言写入记忆。）
+- **新颖度过滤**：用户当前消息里已经说到的事实（值 ≥2 字）不重复注入；疑问句 + content 更长时豁免（历史/事件同口径）。
+- **跨轮去重**：同一会话刚注入过的事实，在 `inject_dedup_window_seconds`（默认 600 秒）内不重复；「还记得 / 上次」与「昨天/上周」类召回问法不受去重限制；去重记录落库且保留时长跟随窗口（最长=窗口+1天），重载插件不丢。
 - **预算**：`inject_budget_chars`（默认 800，0=不限）；超预算时事实按行尽量塞，黑话 / few-shot / 草稿整块丢；只有真的进了包的事实才占去重名额。
 - **不写不存在的记忆**：档案卡内容被本轮事实覆盖或有意去重时跳过，不重复占预算。
 - 注入位置：`req.extra_user_content_parts` 并 `mark_as_temp()`，**不改 system_prompt**；包内稳定块在前、波动块在后，方便供应商前缀缓存。
@@ -173,7 +175,7 @@
 - **事件**：经历/聊过的事件列表（当前 / 待审 / 已归档 / 置顶筛选），看原文（这一段消息）、编辑标题/摘要/要点/重要度、确认写入、置顶、删除与恢复。
 - **人物档案**：搜索、点选查看，改昵称/备注，条目增删改、置顶。
 - **诊断**：注入显微镜（路由、命中、过滤原因、`chars≈tokens`）、聊天导入、回收站（归档+被覆盖恢复，槽位冲突阻止）、原始 JSON 诊断、清空并重建（先自动备份）。
-- **设置**：147 项配置按左右分栏展示（左侧导航、右侧只显示选中的一组，未保存的输入切组不丢；保存按钮固定在右下；窄屏导航变为顶部横向条）——总开关与采集 / 抽取与整理 / 检索与注入 / 重要性与维护 / 学习与人格草稿 / 图片 / Embedding 与 Rerank / 外观。
+- **设置**：150 项配置按左右分栏展示（左侧导航、右侧只显示选中的一组，未保存的输入切组不丢；保存按钮固定在右下；窄屏导航变为顶部横向条）——总开关与主人 / 免@接话 / 指派发言 / 消息防抖 / 记忆注入 / 隐私、画像与跨会话 / 事件与历史 / 抽取与整理 / 学习与表达 / 重要性与维护 / 模型与预算 / 图片 / 外观。
 - **外观**：Shader Gradient 风格——近黑底上跑真实 WebGL 片元着色器流动渐变（fbm 域扭曲），内容在磨砂玻璃面板上；5 组主题预设（极光 / 碧金 / 暮霞 / 午夜 / 森林）+ 三色取色器；**动态颜色**开关按固定顺序循环渐变（停 1 秒 / 过渡 5 秒），手动点预设自动关闭。
 - 动效降级：devicePixelRatio 封顶 2、离屏暂停、`prefers-reduced-motion` 单帧、WebGL 不可用或上下文丢失时回退静态 CSS 渐变。
 
@@ -186,7 +188,7 @@
 | `/stype status` | 时间线、记忆数量、采集/注入状态、上次采集跳过原因 |
 | `/stype search <关键词>` | 当前说话人可见 live 事实 |
 | `/stype explain <关键词>` | 召回路由、命中和过滤原因 |
-| `/stype add <内容>` | 手动写入（说话人是当前聊天对象） |
+| `/stype add <内容>` | 手动写入（管理员/主人） |
 | `/stype recent [n]` | 最近时间线 |
 | `/stype events [n]` | 当前会话最近的事件（整件事记忆） |
 | `/stype history [时间或问题]` | 看那段时间的状态与事件，例：`/stype history 去年12月` |
@@ -208,7 +210,7 @@
 | `/stype alias <旧id> <主id>` | 说话人归并（管理员） |
 | `/stype aliases` | 已映射别名 + 同名建议（管理员） |
 | `/stype microscope [n]` | 最近注入快照（管理员） |
-| `/stype diagnostics` | 诊断快照 |
+| `/stype diagnostics` | 诊断快照（管理员/主人） |
 
 LLM 工具（模型可主动调用）：
 
@@ -286,6 +288,7 @@ pages/console/           面板：index.html / app.js / style.css / shader.js(We
 | 配置 | 说明 |
 | --- | --- |
 | `owner_qq` | 主人 QQ，只允许一个；留空回退 AstrBot 管理员 |
+| `webchat_is_owner` | ChatUI 视同主人（默认开；暴露在不可信网络请关闭） |
 | `enabled` / `capture_enabled` / `inject_enabled` / `extract_enabled` / `learning_enabled` | 总开关与采集、注入、抽取、学习各层开关 |
 | `high_evidence_confidence` / `cache_ttl_seconds` / `summary_provider_id` / `debug_log_injection` | 高证据阈值（默认 0.8）、检索缓存秒数、抽取模型、注入调试日志 |
 | `memory_source_platforms` | 记忆来源平台，默认 `aiocqhttp,qq_official,qq_official_webhook` |
@@ -309,9 +312,10 @@ pages/console/           面板：index.html / app.js / style.css / shader.js(We
 | `window_flow_enabled` / `window_flow_always` / `window_flow_keywords` | 窗口全流（C 层）：其他窗口的完整消息流；开关、是否每次都注入、触发关键词（回看 24 小时 / 150 条 / 6000 字 / 3 窗口为默认值） |
 | `window_flow_hours` / `window_flow_max_items` / `window_flow_max_chars` | 窗口全流回看小时数（24）、最多条数（150）、最多字符（6000） |
 | `window_flow_max_windows` / `window_flow_msg_chars` / `window_flow_include_bot` | 窗口全流最多窗口数（3）、单条截断（200 字）、是否包含 Bot 发言 |
-| `window_flow_group_to_private` / `window_flow_private_to_group` / `window_flow_exclude_private_users` | 窗口全流方向（默认双向开）与私聊排除名单（填用户 ID，逗号分隔） |
+| `window_flow_group_to_private` / `window_flow_private_to_group` / `window_flow_exclude_private_users` | 窗口全流方向（默认双向开）与私聊排除名单（填用户 ID，逗号分隔）；strict/owner 隔离下群聊窗口强制不带私聊来源 |
 | `reply_gate_enabled` / `reply_gate_mode` | 免@主动接话开关与判定方式（probability 概率 / keyword 关键词 / memory 记忆命中） |
-| `reply_gate_probability` / `reply_gate_keywords` | 概率模式的接话概率（默认 0.05）、关键词模式的词表 |
+| `reply_gate_probability` / `reply_gate_keywords` | 概率模式的接话概率（默认 0.05）、关键词词表（keyword 模式判定依据；打开必回后为任何模式的必回词表） |
+| `reply_gate_keywords_force` | 关键词必回：任何模式下命中词表就必回（等同点名，越过话轮过滤；免打扰/冷却/日限仍生效） |
 | `reply_gate_groups` / `reply_gate_cooldown_seconds` / `reply_gate_daily_limit` | 接话群白名单（空=所有群）、同群冷却（90 秒）、每群每日上限（30） |
 | `reply_gate_min_chars` / `reply_gate_skip_commands` | 最小接话字数（2）、是否跳过以 / ！ 开头的命令消息 |
 | `reply_gate_judge_provider_id` / `reply_gate_judge_threshold` / `reply_gate_judge_context_messages` | 读空气判定（judge 模式）：打分模型（留空=当前会话模型）、阈值（0.6）、参考消息数（6） |
@@ -334,6 +338,7 @@ pages/console/           面板：index.html / app.js / style.css / shader.js(We
 | `sleep_timeline_retain_days` / `sleep_low_value_days` / `sleep_low_value_confidence` / `sleep_superseded_retain_days` | 维护保留期与归档条件 |
 | `image_caption_provider_id` / `image_caption_timeout_seconds` | 图片转述模型与超时 |
 | `jargon_enabled` / `jargon_scope` / `fewshot_enabled` / `fewshot_cooldown_seconds` / `fewshot_max_per_run` / `fewshot_min_quality` / `persona_draft_enabled` 等 | 学习开关与限额 |
+| `learn_window` | 学习每轮回看的最近时间线条数（默认 40） |
 | `empty_profile_ttl_days` / `notify_umo` / `coexistence_degrade` | 空档案清理、通知会话、共存降级 |
 | `ui_theme_color` / `ui_theme_color2` / `ui_theme_color3` / `ui_dynamic_colors` | 面板三色主题与动态颜色 |
 

@@ -362,7 +362,7 @@ await check("模型用量行：显示消耗、限额与按任务拆解", () => {
   assert.match(line.textContent, /缩写 900/, "任务名应翻译成中文标签");
 });
 
-await check("设置页出现「模型档位与 Token 预算」分组与三个 Provider 下拉", async () => {
+await check("设置页出现「模型与预算」分组与三个 Provider 下拉", async () => {
   state.schema = {
     quality_provider_id: { description: "精准档模型", type: "string", default: "" },
     fast_provider_id: { description: "快速档模型", type: "string", default: "" },
@@ -377,12 +377,12 @@ await check("设置页出现「模型档位与 Token 预算」分组与三个 Pr
   };
   click([...document.querySelectorAll(".tabs button")].find((b) => b.dataset.tab === "settings"));
   await waitFor(
-    () => document.querySelector('#settings-nav [data-group="模型档位与 Token 预算"]'),
+    () => document.querySelector('#settings-nav [data-group="模型与预算"]'),
     "settings group rendered"
   );
-  const group = document.querySelector('#settings-nav [data-group="模型档位与 Token 预算"]');
+  const group = document.querySelector('#settings-nav [data-group="模型与预算"]');
   assert.match(group.textContent, /6/);
-  const panel = document.querySelector('.settings-panel[data-group="模型档位与 Token 预算"]');
+  const panel = document.querySelector('.settings-panel[data-group="模型与预算"]');
   assert.ok(panel, "settings panel exists");
   for (const key of ["quality_provider_id", "fast_provider_id", "fallback_provider_id"]) {
     const field = panel.querySelector(`#cfg-${key}`);
