@@ -68,21 +68,26 @@ def get_preset_defaults(preset_name: str) -> dict[str, Any]:
 
 
 def resolve_effective_config(config: dict[str, Any], key: str, default: Any) -> Any:
-    """根据所选场景预设动态返回有效配置。"""
+    """根据所选场景预设动态返回有效配置。
+
+    设计原则：
+    1. 当处于预设模式（daily/frugal/assistant/rpg）时，预设所声明的核心算法参数由预设接管，
+       确保一键生效真实调优，避免因旧配置残留导致预设失效；
+       其它未被预设托管的配置（如 owner_qq、模型选择、黑名单、开关等）100% 保持用户配置。
+    2. 预设只在内存中动态生效（Overlay），绝不擦除或覆盖用户在磁盘上保存的任何配置值。
+    3. 只要随时切回 'custom'（专家自定义），用户所有的微调参数全盘恢复生效。
+    """
     preset_name = str(config.get("config_preset", "daily") or "daily").strip().lower()
     raw = config.get(key)
 
-    # 如果是自定义模式，直接返回用户配置
+    # custom 模式：完全放权给用户自定义配置
     if preset_name == "custom":
         return default if raw is None else raw
 
-    # 处于预设模式下：
+    # 预设模式：托管的核心参数按预设值生效
     preset_vals = PRESET_DEFINITIONS.get(preset_name, PRESET_DEFINITIONS["daily"])
     if key in preset_vals:
-        # 用户若未在配置中显式修改（或者值为 None），返回预设推荐值
-        if raw is None:
-            return preset_vals[key]
-        # 若用户有显式设定值，仍以用户设定为准，赋予用户覆盖权限
-        return raw
+        return preset_vals[key]
 
+    # 非预设托管项：原样读取用户配置或默认值
     return default if raw is None else raw

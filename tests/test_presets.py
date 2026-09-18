@@ -53,13 +53,17 @@ class TestPresets(unittest.TestCase):
         self.assertFalse(resolve_effective_config(cfg, "cross_window_enabled", default=True))
 
     def test_resolve_custom_preset_and_user_override(self):
-        # 1. custom 模式
+        # 1. custom 模式：用户自定义参数直接生效
         cfg_custom = {"config_preset": "custom", "top_k": 8}
         self.assertEqual(resolve_effective_config(cfg_custom, "top_k", default=3), 8)
 
-        # 2. 预设模式下用户显式覆盖
-        cfg_override = {"config_preset": "daily", "top_k": 10}
-        self.assertEqual(resolve_effective_config(cfg_override, "top_k", default=3), 10)
+        # 2. 预设模式：托管参数由预设接管（daily 推荐值为 3）
+        cfg_daily = {"config_preset": "daily", "top_k": 10}
+        self.assertEqual(resolve_effective_config(cfg_daily, "top_k", default=5), 3)
+
+        # 3. 预设模式：非托管项（如 owner_qq）100% 保持用户配置
+        cfg_owner = {"config_preset": "daily", "owner_qq": "12345678"}
+        self.assertEqual(resolve_effective_config(cfg_owner, "owner_qq", default=""), "12345678")
 
 
 class TestCoexistenceAvoidance(unittest.TestCase):
