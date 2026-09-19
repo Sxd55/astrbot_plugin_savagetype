@@ -1145,7 +1145,7 @@ async function loadDoctor() {
       <div class="doc-card">
         <div class="doc-header">
           <span style="font-weight:700;">🧠 SavageType 记忆中枢</span>
-          <span class="status-pill ok">v${esc(st.version || "5.5.0")}</span>
+          <span class="status-pill ok">v${esc(st.version || "5.6.0")}</span>
         </div>
         <div style="font-size:13px; line-height:1.6;">
           <div>场景预设：<b>${esc(st.preset?.name || "daily")}</b> ${st.preset?.is_custom ? '<span style="color:var(--accent);">(专家自定义)</span>' : '(预设接管)'}</div>
