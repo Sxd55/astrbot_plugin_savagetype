@@ -1399,6 +1399,9 @@ class SavageTypeService:
         known = [str(row["window_tag"]) for row in self.speak_groups(limit=80, days=365)]
         return resolve_number(raw, known)
 
+    def speak_default_group(self) -> str:
+        return self.speak_default_umo()
+
     def set_speak_default(self, value: str) -> str:
         """设置 / 清除默认群，返回给人看的回执。"""
         raw = (value or "").strip()

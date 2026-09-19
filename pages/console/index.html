@@ -36,6 +36,7 @@
           <button type="button" class="ghost" data-act="sleep">维护</button>
           <button type="button" class="ghost" data-act="learn">跑一轮学习</button>
           <button type="button" class="ghost" data-act="export">导出 JSONL</button>
+          <button type="button" class="ghost" data-act="preset-modal" style="color: var(--accent);">⚙️ 场景预设与变更清单</button>
         </div>
         <div class="kpis" id="kpis"></div>
         <p id="coexist" class="lede"></p>
@@ -169,6 +170,52 @@
             </div>
           </section>
         </div>
+
+        <!-- 全景健康体检卡片 -->
+        <section class="card glass">
+          <div class="row" style="justify-content: space-between; align-items: center;">
+            <h2>Savage 生态全景健康体检 (Doctor)</h2>
+            <button type="button" class="tiny" data-act="doctor-refresh">重新体检</button>
+          </div>
+          <p class="lede">聚合 SavageType 记忆大脑、SavageReply 交互中枢、SavageMode 设定层与 BiliLearn 知识获取层的一站式健康度与风控指标。</p>
+          <div id="doctor-container" class="doctor-cards-grid"></div>
+        </section>
+
+        <!-- Prompt 注入预览卡片 -->
+        <section class="card glass">
+          <h2>Prompt 提示词注入实时预览 (Prompt Preview)</h2>
+          <p class="lede">实时模拟向大模型注入的完整上下文结构（角色设定、记忆事实、事件、时间流及 Token 开销预估）。</p>
+          <div class="row">
+            <input id="prompt-preview-q" placeholder="模拟用户发言文本" value="你好呀，今天有什么事吗" />
+            <input id="prompt-preview-speaker" placeholder="说话人 QQ / id" value="admin" style="max-width: 140px;" />
+            <button type="button" data-act="prompt-preview-run">生成预览</button>
+          </div>
+          <div class="row kpis" id="prompt-preview-stats"></div>
+          <pre class="scroll diag" id="prompt-preview-box" style="white-space: pre-wrap; font-family: monospace;"></pre>
+        </section>
+
+        <!-- 群聊上下文与流监控卡片 -->
+        <section class="card glass">
+          <h2>群聊上下文与消息流监控 (Groups & Flow)</h2>
+          <p class="lede">实时监控机器人参与的所有活跃群聊，点选任意群查看跨窗口近期消息流，并可一键设为指派发言群。</p>
+          <div class="grid two">
+            <div>
+              <div class="row" style="justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <h3>活跃群聊列表</h3>
+                <button type="button" class="tiny ghost" data-act="groups-refresh">刷新列表</button>
+              </div>
+              <div class="scroll short" id="groups-list"></div>
+            </div>
+            <div>
+              <div class="row" style="justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <h3 id="current-flow-title">群消息流预览</h3>
+                <button type="button" class="tiny ghost" data-act="flow-refresh">刷新本群流</button>
+              </div>
+              <pre class="scroll short diag" id="flow-content-box" style="white-space: pre-wrap; font-family: monospace;">请在左侧选择一个群聊查看消息流</pre>
+            </div>
+          </div>
+        </section>
+
         <section class="card glass">
           <h2>回收站</h2>
           <p class="lede">已归档的记忆可以恢复；如果槽位已被新记忆占用会阻止恢复，避免出现两条冲突事实。</p>
@@ -210,6 +257,27 @@
           </div>
         </div>
       </section>
+    </div>
+
+    <!-- 预设变更清单对比 Modal 弹窗 -->
+    <div id="preset-modal" class="modal-backdrop" hidden>
+      <div class="modal-box glass">
+        <div class="modal-header" style="display: flex; justify-content: space-between; align-items: center;">
+          <h2>场景预设方案与参数变更清单</h2>
+          <button type="button" class="close-btn" data-act="preset-modal-close" style="background:none;border:none;font-size:24px;cursor:pointer;color:var(--text);">&times;</button>
+        </div>
+        <p class="lede">选择目标场景档位，系统将实时计算 11 项核心算法参数的变更清单（当前值 ➔ 目标值），绝不擦除您在磁盘上手动保存的配置。</p>
+        <div class="row" style="align-items: center; margin-bottom: 12px; gap: 8px;">
+          <label for="preset-select-picker" style="font-weight: 600;">目标预设：</label>
+          <select id="preset-select-picker" style="flex: 1; max-width: 260px;"></select>
+          <button type="button" data-act="preset-apply-btn" class="primary" style="background: var(--accent); color: #fff;">确认应用此预设</button>
+        </div>
+        <div id="preset-diff-table" class="scroll" style="max-height: 360px; margin-bottom: 12px;"></div>
+        <div class="modal-footer" style="display: flex; justify-content: space-between; align-items: center;">
+          <span style="font-size: 13px; color: var(--text-dim);">🛡️ 零覆盖保障：随时选择「专家自定义」恢复所有手动值</span>
+          <button type="button" class="ghost" data-act="preset-modal-close">关闭</button>
+        </div>
+      </div>
     </div>
     <script type="module" src="./app.js"></script>
   </body>

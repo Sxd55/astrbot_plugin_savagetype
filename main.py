@@ -227,6 +227,13 @@ class SavageTypePlugin(Star):
             ("providers", self.page_providers, ["GET"], "List providers by type"),
             ("ui/theme", self.page_theme_set, ["POST"], "Save panel theme colors"),
             ("ui/dynamic", self.page_dynamic_set, ["POST"], "Toggle dynamic colors"),
+            ("preset/diff", self.page_preset_diff, ["GET"], "Preset diff"),
+            ("preset/apply", self.page_preset_apply, ["POST"], "Apply preset"),
+            ("doctor", self.page_doctor, ["GET"], "Ecosystem health doctor"),
+            ("prompt/preview", self.page_prompt_preview, ["GET"], "Preview prompt injection"),
+            ("groups", self.page_groups, ["GET"], "List active groups"),
+            ("flow", self.page_flow, ["GET"], "Window message flow"),
+            ("groups/default", self.page_groups_default, ["POST"], "Set default speak group"),
         ]
         for route, handler, methods, desc in apis:
             self.context.register_web_api(
@@ -2446,3 +2453,185 @@ class SavageTypePlugin(Star):
             "persona_id": getattr(f, "persona_id", ""),
             "slot_key": f.slot_key(),
         }
+
+    async def page_preset_diff(self):
+        target = str(request.query.get("target", "daily") or "daily").strip().lower()
+        cur = str(self.config.get("config_preset", "daily") or "daily").strip().lower()
+        diffs = diff_preset(self.config, target)
+        text = format_preset_diff_text(cur, target, diffs, is_applied=False)
+        return json_response({
+            "current_preset": cur,
+            "target_preset": target,
+            "diffs": diffs,
+            "formatted_text": text,
+            "supported_presets": list(SUPPORTED_PRESETS),
+            "preset_names": PRESET_NAMES,
+        })
+
+    async def page_preset_apply(self):
+        payload = await request.json(default={})
+        target = str(payload.get("target", "") or "").strip().lower()
+        if target not in SUPPORTED_PRESETS:
+            return error_response(f"unknown preset: {target}", status_code=400)
+        cur = str(self.config.get("config_preset", "daily") or "daily").strip().lower()
+        diffs = diff_preset(self.config, target)
+        self.config["config_preset"] = target
+        if hasattr(self.config, "save_config"):
+            self.config.save_config()
+        self.service.apply_config()
+        text = format_preset_diff_text(cur, target, diffs, is_applied=True)
+        return json_response({
+            "ok": True,
+            "current_preset": target,
+            "previous_preset": cur,
+            "diffs": diffs,
+            "formatted_text": text,
+        })
+
+    async def page_doctor(self):
+        st_ov = self.service.overview()
+        stars = []
+        try:
+            stars = self.context.get_all_stars() or []
+        except Exception:
+            pass
+
+        # 探测 SavageReply
+        reply_star = next((s for s in stars if getattr(s, "name", "") == "astrbot_plugin_savagereply"), None)
+        reply_info = {}
+        if reply_star:
+            reply_cfg = getattr(reply_star, "config", {}) or {}
+            reply_info = {
+                "installed": True,
+                "active": bool(getattr(reply_star, "activated", True)),
+                "active_reply_enabled": bool(reply_cfg.get("active_reply_enabled", False)),
+                "active_reply_mode": str(reply_cfg.get("active_reply_mode", "smart")),
+                "active_reply_probability": float(reply_cfg.get("active_reply_probability", 0.05)),
+                "active_reply_cooldown": int(reply_cfg.get("active_reply_cooldown", 60)),
+                "active_reply_daily_limit": int(reply_cfg.get("active_reply_daily_limit", 50)),
+                "active_reply_unanswered_break": bool(reply_cfg.get("active_reply_unanswered_break", True)),
+            }
+        else:
+            reply_info = {"installed": False}
+
+        # 探测 SavageMode
+        mode_star = next((s for s in stars if getattr(s, "name", "") == "astrbot_plugin_savagemode"), None)
+        mode_info = {}
+        if mode_star:
+            mode_cfg = getattr(mode_star, "config", {}) or {}
+            mode_info = {
+                "installed": True,
+                "active": bool(getattr(mode_star, "activated", True)),
+                "chat_mode": str(mode_cfg.get("chat_mode", "normal")),
+                "inject_stage": str(mode_cfg.get("inject_stage", "system")),
+            }
+        else:
+            mode_info = {"installed": False}
+
+        # 探测 BiliLearn
+        bili_star = next((s for s in stars if getattr(s, "name", "") == "astrbot_plugin_bili_learn"), None)
+        bili_info = {}
+        if bili_star:
+            bili_cfg = getattr(bili_star, "config", {}) or {}
+            bili_info = {
+                "installed": True,
+                "active": bool(getattr(bili_star, "activated", True)),
+                "audio_fallback_policy": str(bili_cfg.get("audio_fallback_policy", "ai_official_first")),
+            }
+        else:
+            bili_info = {"installed": False}
+
+        return json_response({
+            "ok": True,
+            "savagetype": {
+                "version": PLUGIN_VERSION,
+                "preset": st_ov.get("preset", {}),
+                "counts": st_ov.get("counts", {}),
+                "tokens": st_ov.get("tokens", {}),
+                "coexistence": st_ov.get("coexistence", {}),
+                "embedding": st_ov.get("embedding", {}),
+            },
+            "savagereply": reply_info,
+            "savagemode": mode_info,
+            "bili_learn": bili_info,
+        })
+
+    async def page_prompt_preview(self):
+        query = str(request.query.get("query", "你好呀") or "你好呀")
+        speaker_id = str(request.query.get("speaker_id", "admin") or "admin")
+        persona_id = str(request.query.get("persona_id", "") or "")
+        window_tag = str(request.query.get("window_tag", "webchat:1") or "webchat:1")
+
+        pack, result, snapshot = await self.service.build_injection(
+            query=query,
+            speaker_id=speaker_id,
+            persona_id=persona_id,
+            window_tag=window_tag,
+        )
+        return json_response({
+            "ok": True,
+            "query": query,
+            "speaker_id": speaker_id,
+            "pack_text": pack,
+            "char_count": len(pack),
+            "approx_tokens": estimate_tokens(pack),
+            "injected_fact_ids": snapshot.get("injected_ids", []),
+            "injected_event_ids": snapshot.get("injected_event_ids", []),
+            "window_flow": snapshot.get("window_flow", {}),
+            "cross_window": snapshot.get("cross_window", {}),
+        })
+
+    async def page_groups(self):
+        default_window = self.service.speak_default_group()
+        rows = self.store.query(
+            "SELECT window_tag, COUNT(*) as c FROM timeline WHERE window_tag LIKE 'aiocqhttp:GroupMessage:%' OR window_tag LIKE 'qq_official:GroupMessage:%' GROUP BY window_tag ORDER BY c DESC LIMIT 100"
+        )
+        items = []
+        for index, (window, count) in enumerate(rows, 1):
+            window_str = str(window or "")
+            items.append({
+                "index": index,
+                "window_tag": window_str,
+                "label": group_label(window_str),
+                "count": int(count or 0),
+                "is_default": (window_str == default_window),
+            })
+        return json_response({"items": items, "default_group": default_window})
+
+    async def page_flow(self):
+        window_tag = str(request.query.get("window_tag", "") or "").strip()
+        if not window_tag:
+            groups = self.store.query("SELECT window_tag FROM timeline WHERE window_tag LIKE '%GroupMessage%' ORDER BY ts DESC LIMIT 1")
+            if groups:
+                window_tag = str(groups[0][0])
+            else:
+                window_tag = "aiocqhttp:GroupMessage:default"
+        block, meta = self.service.window_flow_for(query="flow", window_tag=window_tag, force=True)
+        if not block:
+            recent = self.store.query(
+                "SELECT ts, speaker_name, role, content FROM timeline WHERE window_tag = ? ORDER BY ts DESC LIMIT 50",
+                (window_tag,),
+            )
+            if recent:
+                lines = []
+                for ts, name, role, content in reversed(recent):
+                    who = name or role or "user"
+                    lines.append(f"[{fmt_ts(ts)}] {who}: {content}")
+                block = "\n".join(lines)
+                meta = {"enabled": True, "items": len(recent), "chars": len(block), "source": "timeline"}
+        return json_response({
+            "ok": True,
+            "window_tag": window_tag,
+            "flow_text": block,
+            "meta": meta,
+        })
+
+    async def page_groups_default(self):
+        payload = await request.json(default={})
+        target = str(payload.get("target", "") or "").strip()
+        msg = self.service.set_speak_default(target)
+        return json_response({
+            "ok": True,
+            "message": msg,
+            "default_group": self.service.speak_default_group(),
+        })

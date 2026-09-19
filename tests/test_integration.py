@@ -981,9 +981,11 @@ class IntegrationTest(unittest.TestCase):
             plugin_main.request = FakeRequest(query={"speaker_id": "u1"})
             data = _json(asyncio.run(self.plugin.page_profile()))
             self.assertIn("items", data)
-            plugin_main.request = FakeRequest(
-                body={"speaker_id": "u1", "speaker_name": "阿优", "note": "备注"}
-            )
+            plugin_main.request = FakeRequest(query={})
+            self.assertEqual(asyncio.run(self.plugin.page_profile()).status_code, 400)
+            resp = asyncio.run(self.plugin.page_profile_update())
+            self.assertEqual(resp.status_code, 400)
+            plugin_main.request = FakeRequest(body={"speaker_id": "u1", "speaker_name": "新名", "note": "备注"})
             data = _json(asyncio.run(self.plugin.page_profile_update()))
             self.assertTrue(data["ok"])
             plugin_main.request = FakeRequest(query={"speaker_id": "u1"})
@@ -993,6 +995,102 @@ class IntegrationTest(unittest.TestCase):
             self.assertEqual(asyncio.run(self.plugin.page_dossier()).status_code, 400)
         finally:
             plugin_main.request = FakeRequest()
+
+    def test_page_visual_consolidation_apis(self):
+        """测试 Web 控制台全景可视化 7 个新 API 闭环"""
+        plugin_main.request = FakeRequest()
+        try:
+            # 1. preset/diff (GET)
+            plugin_main.request = FakeRequest(query={"target": "frugal"})
+            resp = asyncio.run(self.plugin.page_preset_diff())
+            self.assertEqual(resp.status_code, 200)
+            data = _json(resp)
+            self.assertEqual(data["target_preset"], "frugal")
+            self.assertTrue(len(data["diffs"]) > 0)
+            self.assertIn("supported_presets", data)
+
+            # 2. preset/apply (POST) - 正常切换与未知报错
+            plugin_main.request = FakeRequest(body={"target": "invalid_xyz"})
+            resp_err = asyncio.run(self.plugin.page_preset_apply())
+            self.assertEqual(resp_err.status_code, 400)
+
+            plugin_main.request = FakeRequest(body={"target": "frugal"})
+            resp = asyncio.run(self.plugin.page_preset_apply())
+            self.assertEqual(resp.status_code, 200)
+            data = _json(resp)
+            self.assertTrue(data["ok"])
+            self.assertEqual(data["current_preset"], "frugal")
+            self.assertEqual(self.plugin.config["config_preset"], "frugal")
+
+            # 3. doctor (GET)
+            from types import SimpleNamespace
+            self.ctx.stars = [
+                SimpleNamespace(
+                    name="astrbot_plugin_savagereply",
+                    activated=True,
+                    config={"active_reply_enabled": True, "active_reply_mode": "smart"},
+                ),
+                SimpleNamespace(
+                    name="astrbot_plugin_savagemode",
+                    activated=True,
+                    config={"chat_mode": "tsundere"},
+                ),
+                SimpleNamespace(
+                    name="astrbot_plugin_bili_learn",
+                    activated=True,
+                    config={"audio_fallback_policy": "ai_first"},
+                ),
+            ]
+            resp = asyncio.run(self.plugin.page_doctor())
+            self.assertEqual(resp.status_code, 200)
+            doc_data = _json(resp)
+            self.assertTrue(doc_data["ok"])
+            self.assertIn("savagetype", doc_data)
+            self.assertTrue(doc_data["savagereply"]["installed"])
+            self.assertTrue(doc_data["savagereply"]["active_reply_enabled"])
+            self.assertTrue(doc_data["savagemode"]["installed"])
+            self.assertEqual(doc_data["savagemode"]["chat_mode"], "tsundere")
+            self.assertTrue(doc_data["bili_learn"]["installed"])
+
+            # 4. prompt/preview (GET)
+            plugin_main.request = FakeRequest(query={"query": "你好呀", "speaker_id": "u1"})
+            resp = asyncio.run(self.plugin.page_prompt_preview())
+            self.assertEqual(resp.status_code, 200)
+            prev_data = _json(resp)
+            self.assertTrue(prev_data["ok"])
+            self.assertIn("pack_text", prev_data)
+            self.assertIn("approx_tokens", prev_data)
+
+            # 5. groups (GET)
+            self.store.add_timeline({"content": "群消息1", "speaker_id": "u1", "speaker_name": "阿U", "role": "user", "window_tag": "aiocqhttp:GroupMessage:1001"})
+            self.store.add_timeline({"content": "群消息2", "speaker_id": "u2", "speaker_name": "小V", "role": "user", "window_tag": "aiocqhttp:GroupMessage:1002"})
+            resp = asyncio.run(self.plugin.page_groups())
+            self.assertEqual(resp.status_code, 200)
+            groups_data = _json(resp)
+            self.assertIn("items", groups_data)
+            self.assertTrue(any("1001" in item["window_tag"] for item in groups_data["items"]))
+
+            # 6. flow (GET)
+            plugin_main.request = FakeRequest(query={"window_tag": "aiocqhttp:GroupMessage:1001"})
+            resp = asyncio.run(self.plugin.page_flow())
+            self.assertEqual(resp.status_code, 200)
+            flow_data = _json(resp)
+            self.assertTrue(flow_data["ok"])
+            self.assertIn("flow_text", flow_data)
+            self.assertIn("群消息1", flow_data["flow_text"])
+
+            # 7. groups/default (POST)
+            plugin_main.request = FakeRequest(body={"target": "aiocqhttp:GroupMessage:1001"})
+            resp = asyncio.run(self.plugin.page_groups_default())
+            self.assertEqual(resp.status_code, 200)
+            def_data = _json(resp)
+            self.assertTrue(def_data["ok"])
+            self.assertIn("1001", def_data["default_group"])
+            self.assertEqual(self.service.speak_default_group(), "aiocqhttp:GroupMessage:1001")
+
+        finally:
+            plugin_main.request = FakeRequest()
+            self.ctx.stars = []
 
     def test_on_waiting_llm_request_warms_cache(self):
         if not hasattr(self.plugin, "on_waiting_llm_request"):

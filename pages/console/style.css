@@ -572,3 +572,128 @@ pre.trace {
     transition: none !important;
   }
 }
+
+/* Modal 弹窗 */
+.modal-backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.modal-backdrop[hidden] {
+  display: none;
+}
+.modal-box {
+  width: 100%;
+  max-width: 680px;
+  max-height: 90vh;
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+  background: #18181b;
+  border: 1px solid var(--border);
+  overflow-y: auto;
+}
+
+/* 预设 Diff 对比条目 */
+.diff-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 14px;
+  margin-bottom: 8px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.diff-item.changed {
+  background: rgba(124, 92, 255, 0.12);
+  border-color: rgba(124, 92, 255, 0.35);
+}
+.diff-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.diff-name {
+  font-weight: 600;
+  font-size: 14px;
+}
+.diff-desc {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.diff-values {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: monospace;
+  font-size: 13px;
+}
+
+/* Doctor 卡片网格 */
+.doctor-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px;
+  margin-top: 12px;
+}
+.doc-card {
+  padding: 16px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.doc-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.status-pill {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-weight: 600;
+}
+.status-pill.ok {
+  background: rgba(16, 185, 129, 0.2);
+  color: #10b981;
+}
+.status-pill.warn {
+  background: rgba(245, 158, 11, 0.2);
+  color: #f59e0b;
+}
+.status-pill.off {
+  background: rgba(107, 114, 128, 0.2);
+  color: #9ca3af;
+}
+
+/* 群聊列表 */
+.group-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  border-radius: 8px;
+  margin-bottom: 6px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.group-item:hover, .group-item.active {
+  background: rgba(124, 92, 255, 0.15);
+  border-color: var(--accent);
+}

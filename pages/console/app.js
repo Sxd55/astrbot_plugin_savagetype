@@ -1054,6 +1054,249 @@ async function reload() {
   }
 }
 
+// ====== 预设变更清单 Modal 交互 ======
+let currentPresetTarget = "daily";
+
+async function openPresetModal(defaultTarget) {
+  const modal = $("preset-modal");
+  if (!modal) return;
+  modal.hidden = false;
+
+  const sel = $("preset-select-picker");
+  if (sel && (!sel.options || sel.options.length === 0)) {
+    try {
+      const data = await apiGet("preset/diff", { target: "daily" });
+      const names = data.preset_names || {};
+      sel.innerHTML = Object.entries(names).map(([k, v]) =>
+        `<option value="${esc(k)}" ${k === (defaultTarget || data.current_preset || "daily") ? "selected" : ""}>${esc(v)}</option>`
+      ).join("");
+      currentPresetTarget = sel.value;
+      sel.onchange = () => {
+        currentPresetTarget = sel.value;
+        loadPresetDiff(currentPresetTarget);
+      };
+    } catch (err) {
+      showDiag(`加载预设选项失败: ${err}`);
+    }
+  }
+  await loadPresetDiff(sel && sel.value ? sel.value : (defaultTarget || "daily"));
+}
+
+function closePresetModal() {
+  const modal = $("preset-modal");
+  if (modal) modal.hidden = true;
+}
+
+async function loadPresetDiff(target) {
+  const table = $("preset-diff-table");
+  if (!table) return;
+  table.innerHTML = `<p class="lede">正在计算参数变动清单...</p>`;
+  try {
+    const data = await apiGet("preset/diff", { target });
+    const diffs = data.diffs || [];
+    let html = "";
+    diffs.forEach((d) => {
+      const isChanged = d.changed;
+      const badge = isChanged ? `<span class="status-pill warn">${esc(d.symbol)} 变动</span>` : `<span class="status-pill ok">保持一致</span>`;
+      html += `
+        <div class="diff-item ${isChanged ? "changed" : ""}">
+          <div class="diff-meta">
+            <span class="diff-name">${esc(d.name)} <code style="font-size:11px;opacity:0.7;">(${esc(d.key)})</code></span>
+            <span class="diff-desc">${esc(d.desc)}</span>
+          </div>
+          <div class="diff-values">
+            <span>${esc(d.current_display)}</span>
+            ${isChanged ? `<span>➔</span><span style="font-weight:700;color:var(--accent);">${esc(d.target_display)}</span>` : ""}
+            ${badge}
+          </div>
+        </div>
+      `;
+    });
+    table.innerHTML = html;
+  } catch (err) {
+    table.innerHTML = `<p class="lede" style="color:red;">获取 Diff 失败: ${esc(err)}</p>`;
+  }
+}
+
+async function applyPresetFromModal() {
+  const sel = $("preset-select-picker");
+  const target = sel && sel.value ? sel.value : currentPresetTarget;
+  return run("已成功应用预设", async () => {
+    const r = await apiPost("preset/apply", { target });
+    closePresetModal();
+    await reload();
+    return r;
+  });
+}
+
+// ====== 全景健康体检 (Doctor) ======
+async function loadDoctor() {
+  const box = $("doctor-container");
+  if (!box) return;
+  box.innerHTML = `<p class="lede">正在体检 Savage 插件生态...</p>`;
+  try {
+    const doc = await apiGet("doctor");
+    const st = doc.savagetype || {};
+    const sr = doc.savagereply || {};
+    const sm = doc.savagemode || {};
+    const bl = doc.bili_learn || {};
+
+    const stCards = `
+      <div class="doc-card">
+        <div class="doc-header">
+          <span style="font-weight:700;">🧠 SavageType 记忆中枢</span>
+          <span class="status-pill ok">v${esc(st.version || "5.5.0")}</span>
+        </div>
+        <div style="font-size:13px; line-height:1.6;">
+          <div>场景预设：<b>${esc(st.preset?.name || "daily")}</b> ${st.preset?.is_custom ? '<span style="color:var(--accent);">(专家自定义)</span>' : '(预设接管)'}</div>
+          <div>事实记忆：<b>${esc(st.counts?.facts_live ?? 0)}</b> 条 (事件 ${esc(st.counts?.events ?? 0)} 条)</div>
+          <div>今日Token：<b>${esc(st.tokens?.used ?? 0)}</b> (软限 ${esc(st.tokens?.soft_limit || "不限")})</div>
+          <div>向量检索：${st.embedding?.active ? '<span style="color:#10b981;">🟢 开启</span>' : '<span style="color:#9ca3af;">⚪ 关闭</span>'}</div>
+        </div>
+      </div>
+    `;
+
+    const srCards = `
+      <div class="doc-card">
+        <div class="doc-header">
+          <span style="font-weight:700;">💬 SavageReply 交互中枢</span>
+          <span class="status-pill ${sr.installed ? (sr.active_reply_enabled ? "ok" : "warn") : "off"}">
+            ${sr.installed ? (sr.active_reply_enabled ? "活跃接话已开启" : "仅基础打字分段") : "未检测到"}
+          </span>
+        </div>
+        <div style="font-size:13px; line-height:1.6;">
+          ${sr.installed ? `
+            <div>接话模式：<b>${esc(sr.active_reply_mode || "smart")}</b> (基础概率 ${Math.round((sr.active_reply_probability || 0.05) * 100)}%)</div>
+            <div>风控保护：冷却 <b>${sr.active_reply_cooldown || 60}s</b> / 单群日限 <b>${sr.active_reply_daily_limit || 50}次</b></div>
+            <div>冷场打破：${sr.active_reply_unanswered_break ? '<span style="color:#10b981;">🟢 自动救场</span>' : '<span style="color:#9ca3af;">⚪ 关闭</span>'}</div>
+            <div>智能防插嘴：<span style="color:#10b981;">🟢 内存话轮队列追踪</span></div>
+          ` : `<div style="color:var(--text-dim);">可在 AstrBot 面板安装并开启</div>`}
+        </div>
+      </div>
+    `;
+
+    const smCards = `
+      <div class="doc-card">
+        <div class="doc-header">
+          <span style="font-weight:700;">🎭 SavageMode 设定层</span>
+          <span class="status-pill ${sm.installed ? "ok" : "off"}">${sm.installed ? "正常运行" : "未检测到"}</span>
+        </div>
+        <div style="font-size:13px; line-height:1.6;">
+          ${sm.installed ? `
+            <div>当前角色模式：<b>${esc(sm.chat_mode || "normal")}</b></div>
+            <div>提示词注入时机：<b>${esc(sm.inject_stage || "system")}</b></div>
+          ` : `<div style="color:var(--text-dim);">未检测到模式插件</div>`}
+        </div>
+      </div>
+    `;
+
+    const blCards = `
+      <div class="doc-card">
+        <div class="doc-header">
+          <span style="font-weight:700;">📺 BiliLearn 知识获取</span>
+          <span class="status-pill ${bl.installed ? "ok" : "off"}">${bl.installed ? "正常运行" : "未检测到"}</span>
+        </div>
+        <div style="font-size:13px; line-height:1.6;">
+          ${bl.installed ? `
+            <div>无字幕策略：<b>${esc(bl.audio_fallback_policy || "ai_official_first")}</b></div>
+            <div>沉淀通路：<span style="color:#10b981;">🟢 直通 SavageType 记忆中枢</span></div>
+          ` : `<div style="color:var(--text-dim);">未检测到 B 站学习插件</div>`}
+        </div>
+      </div>
+    `;
+
+    box.innerHTML = stCards + srCards + smCards + blCards;
+  } catch (err) {
+    box.innerHTML = `<p class="lede" style="color:red;">体检失败: ${esc(err)}</p>`;
+  }
+}
+
+// ====== Prompt 注入实时预览 ======
+async function loadPromptPreview() {
+  const qEl = $("prompt-preview-q");
+  const spEl = $("prompt-preview-speaker");
+  const box = $("prompt-preview-box");
+  const statsBox = $("prompt-preview-stats");
+  if (!box) return;
+
+  const query = qEl && qEl.value.trim() ? qEl.value.trim() : "你好呀";
+  const speaker = spEl && spEl.value.trim() ? spEl.value.trim() : "admin";
+
+  box.textContent = "正在模拟组装 Prompt 注入包...";
+  try {
+    const data = await apiGet("prompt/preview", { query, speaker_id: speaker });
+    if (statsBox) {
+      statsBox.innerHTML = `
+        <div class="kpi"><b>${esc(data.char_count || 0)}</b><span>注入总字符</span></div>
+        <div class="kpi"><b>~${esc(data.approx_tokens || 0)}</b><span>预估 Tokens</span></div>
+        <div class="kpi"><b>${(data.injected_fact_ids || []).length}</b><span>命中事实数</span></div>
+        <div class="kpi"><b>${(data.injected_event_ids || []).length}</b><span>命中事件数</span></div>
+      `;
+    }
+    box.textContent = data.pack_text || "（本轮未命中任何记忆注入内容）";
+  } catch (err) {
+    box.textContent = `生成预览失败: ${err}`;
+  }
+}
+
+// ====== 群聊上下文与流监控 (Groups & Flow) ======
+let currentFlowWindow = "";
+
+async function loadGroups() {
+  const list = $("groups-list");
+  if (!list) return;
+  list.innerHTML = `<p class="lede">加载活跃群聊中...</p>`;
+  try {
+    const data = await apiGet("groups");
+    const items = data.items || [];
+    if (!items.length) {
+      list.innerHTML = `<p class="lede">暂无群聊时间线记录</p>`;
+      return;
+    }
+    list.innerHTML = items.map((g) => `
+      <div class="group-item ${g.window_tag === currentFlowWindow ? "active" : ""}" data-act="group-select" data-tag="${esc(g.window_tag)}" data-label="${esc(g.label)}">
+        <div>
+          <div style="font-weight:600; font-size:13px;">${esc(g.label)} ${g.is_default ? '<span class="status-pill ok">默认发言群</span>' : ''}</div>
+          <div style="font-size:11px; color:var(--text-dim);">${esc(g.window_tag)} · 积累 ${g.count} 条</div>
+        </div>
+        <div>
+          ${!g.is_default ? `<button type="button" class="ghost tiny" data-act="group-set-default" data-tag="${esc(g.window_tag)}">设为默认</button>` : ''}
+        </div>
+      </div>
+    `).join("");
+
+    if (!currentFlowWindow && items[0]) {
+      currentFlowWindow = items[0].window_tag;
+      loadFlow(currentFlowWindow, items[0].label);
+    }
+  } catch (err) {
+    list.innerHTML = `<p class="lede" style="color:red;">加载群聊失败: ${esc(err)}</p>`;
+  }
+}
+
+async function loadFlow(windowTag, label) {
+  if (windowTag) currentFlowWindow = windowTag;
+  const box = $("flow-content-box");
+  const title = $("current-flow-title");
+  if (title && label) title.textContent = `群消息流: ${label}`;
+  if (!box) return;
+  box.textContent = "正在读取消息流...";
+  try {
+    const data = await apiGet("flow", { window_tag: currentFlowWindow });
+    box.textContent = data.flow_text || "（当前会话暂无群消息流内容）";
+  } catch (err) {
+    box.textContent = `加载流失败: ${err}`;
+  }
+}
+
+async function setDefaultGroup(tag) {
+  return run("已设置默认群", async () => {
+    const r = await apiPost("groups/default", { target: tag });
+    await loadGroups();
+    return r;
+  });
+}
+
 function showTab(name) {
   ["memory", "events", "profiles", "diag", "settings"].forEach((key) => {
     const page = $(`page-${key}`);
@@ -1069,6 +1312,11 @@ function showTab(name) {
   if (name === "settings") run("加载设置", loadSettings);
   if (name === "profiles") run("已刷新档案", loadProfiles);
   if (name === "events") run("已刷新事件", loadEvents);
+  if (name === "diag") {
+    loadDoctor();
+    loadGroups();
+    loadPromptPreview();
+  }
 }
 
 function attachRipple(ev) {
@@ -1406,6 +1654,27 @@ async function onAct(act, el) {
   });
   if (act === "settings-group") return safe(() => applySettingsGroup(el.dataset.group || ""));
   if (act === "settings-save") return run("已保存设置", async () => { const r = await apiPost("config/save", { values: readSettings() }); await loadSettings(); await loadOverview(); return r; });
+
+  // 预设 Modal 与变更清单
+  if (act === "preset-modal") return safe(() => openPresetModal());
+  if (act === "preset-modal-close") return safe(() => closePresetModal());
+  if (act === "preset-apply-btn") return applyPresetFromModal();
+
+  // 生态全景体检
+  if (act === "doctor-refresh") return run("已重新体检", loadDoctor);
+
+  // Prompt 注入实时预览
+  if (act === "prompt-preview-run") return run("已生成注入预览", loadPromptPreview);
+
+  // 群聊与流监控
+  if (act === "groups-refresh") return run("已刷新群列表", loadGroups);
+  if (act === "flow-refresh") return run("已刷新消息流", () => loadFlow(currentFlowWindow));
+  if (act === "group-select") {
+    document.querySelectorAll(".group-item").forEach((item) => item.classList.remove("active"));
+    el.classList.add("active");
+    return loadFlow(el.dataset.tag, el.dataset.label);
+  }
+  if (act === "group-set-default") return setDefaultGroup(el.dataset.tag);
 }
 
 document.addEventListener("pointerdown", (ev) => {
