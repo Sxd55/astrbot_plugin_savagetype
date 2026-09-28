@@ -344,68 +344,132 @@ async def query_group_upcoming_birthdays(event: Any, *, days: int = 7) -> str:
 
 
 # 定义 FunctionTool 类
+@dataclass
 class QueryGroupMemberIdentityTool(FunctionTool if FunctionTool else object):
+    logger: Any = None
     name: str = GROUP_MEMBER_TOOL_NAME
     description: str = "查询当前群内某个成员的群身份、群等级、专属头衔和昵称信息。当询问群主、管理员或群友身份时调用。"
-    parameters: dict[str, Any] = {
-        "type": "object",
-        "properties": {
-            "target": {"type": "string", "description": "要查询的成员QQ号、昵称或@，留空为当前发言人"}
-        },
-    }
+    parameters: dict[str, Any] = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "要查询的成员QQ号、昵称或@，留空为当前发言人"}
+            },
+        }
+    )
 
     async def run(self, event: Any, target: str = "") -> str:
         return await query_group_member_identity(event, target=target)
 
 
+@dataclass
 class QueryGroupManagementIdentityTool(FunctionTool if FunctionTool else object):
+    logger: Any = None
     name: str = GROUP_MANAGEMENT_TOOL_NAME
     description: str = "查询当前群的群主和管理员名单。当询问群主或管理员是谁时调用。"
-    parameters: dict[str, Any] = {
-        "type": "object",
-        "properties": {
-            "scope": {"type": "string", "description": "查询范围：all(群主和管理员), owner(仅群主), admin(仅管理员)"}
-        },
-    }
+    parameters: dict[str, Any] = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "scope": {"type": "string", "description": "查询范围：all(群主和管理员), owner(仅群主), admin(仅管理员)"}
+            },
+        }
+    )
 
     async def run(self, event: Any, scope: str = "all") -> str:
         return await query_group_management_identity(event, scope=scope)
 
 
+@dataclass
 class QueryGroupMemberBirthdayTool(FunctionTool if FunctionTool else object):
+    logger: Any = None
     name: str = GROUP_MEMBER_BIRTHDAY_TOOL_NAME
     description: str = "查询当前群内成员的生日(月日)。当询问群友生日时调用。"
-    parameters: dict[str, Any] = {
-        "type": "object",
-        "properties": {
-            "target": {"type": "string", "description": "要查询的成员QQ号或昵称，留空为当前发言人"}
-        },
-    }
+    parameters: dict[str, Any] = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "要查询的成员QQ号或昵称，留空为当前发言人"}
+            },
+        }
+    )
 
     async def run(self, event: Any, target: str = "") -> str:
         return await query_group_member_birthday(event, target=target)
 
 
+@dataclass
 class QueryGroupUpcomingBirthdaysTool(FunctionTool if FunctionTool else object):
+    logger: Any = None
     name: str = GROUP_UPCOMING_BIRTHDAYS_TOOL_NAME
     description: str = "查询当前群未来一段时间内过生日的成员名单。当询问最近或未来几天谁过生日时调用。"
-    parameters: dict[str, Any] = {
-        "type": "object",
-        "properties": {
-            "days": {"type": "integer", "description": "向后查询的天数(默认7天，最大366天)"}
-        },
-    }
+    parameters: dict[str, Any] = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "向后查询的天数(默认7天，最大366天)"}
+            },
+        }
+    )
 
     async def run(self, event: Any, days: int = 7) -> str:
         return await query_group_upcoming_birthdays(event, days=days)
 
 
+def _safe_create_tool(cls: type, name: str, description: str, params: dict[str, Any]) -> Any:
+    # 策略 1: 零参调用（由 dataclass 提供默认值）
+    try:
+        return cls()
+    except Exception:
+        pass
+    # 策略 2: 显式关键字实参调用（满足 Pydantic BaseModel 校验）
+    try:
+        return cls(name=name, description=description, parameters=params)
+    except Exception:
+        pass
+    # 策略 3: 手动注入属性
+    try:
+        inst = cls.__new__(cls)
+        inst.name = name
+        inst.description = description
+        inst.parameters = params
+        return inst
+    except Exception:
+        return None
+
+
 def get_all_group_identity_tools() -> list[Any]:
     if not FunctionTool:
         return []
-    return [
-        QueryGroupMemberIdentityTool(),
-        QueryGroupManagementIdentityTool(),
-        QueryGroupMemberBirthdayTool(),
-        QueryGroupUpcomingBirthdaysTool(),
+    defs = [
+        (
+            QueryGroupMemberIdentityTool,
+            GROUP_MEMBER_TOOL_NAME,
+            "查询当前群内某个成员的群身份、群等级、专属头衔和昵称信息。当询问群主、管理员或群友身份时调用。",
+            {"type": "object", "properties": {"target": {"type": "string", "description": "要查询的成员QQ号、昵称或@，留空为当前发言人"}}},
+        ),
+        (
+            QueryGroupManagementIdentityTool,
+            GROUP_MANAGEMENT_TOOL_NAME,
+            "查询当前群的群主和管理员名单。当询问群主或管理员是谁时调用。",
+            {"type": "object", "properties": {"scope": {"type": "string", "description": "查询范围：all(群主和管理员), owner(仅群主), admin(仅管理员)"}}},
+        ),
+        (
+            QueryGroupMemberBirthdayTool,
+            GROUP_MEMBER_BIRTHDAY_TOOL_NAME,
+            "查询当前群内成员的生日(月日)。当询问群友生日时调用。",
+            {"type": "object", "properties": {"target": {"type": "string", "description": "要查询的成员QQ号或昵称，留空为当前发言人"}}},
+        ),
+        (
+            QueryGroupUpcomingBirthdaysTool,
+            GROUP_UPCOMING_BIRTHDAYS_TOOL_NAME,
+            "查询当前群未来一段时间内过生日的成员名单。当询问最近或未来几天谁过生日时调用。",
+            {"type": "object", "properties": {"days": {"type": "integer", "description": "向后查询的天数(默认7天，最大366天)"}}},
+        ),
     ]
+    tools = []
+    for cls, name, desc, p in defs:
+        inst = _safe_create_tool(cls, name, desc, p)
+        if inst is not None:
+            tools.append(inst)
+    return tools

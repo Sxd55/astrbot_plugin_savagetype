@@ -118,7 +118,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "5.8.1",
+    "5.8.2",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -565,6 +565,8 @@ class SavageTypePlugin(Star):
         )
         components = [c for c in base if not isinstance(c, Plain)]
         components.insert(0, Plain(text))
+        orig_msg_id = str(getattr(event.message_obj, "message_id", "") or "")
+        new_msg_id = f"{orig_msg_id}_reinject_{int(time.time() * 1000)}" if orig_msg_id else f"reinject_{int(time.time() * 1000)}"
         message = await StarTools.create_message(
             type=str(event.message_obj.type.value),
             self_id=event.get_self_id(),
@@ -573,21 +575,26 @@ class SavageTypePlugin(Star):
             message=components,
             message_str=text,
             group_id=event.get_group_id() or "",
-            message_id=event.message_obj.message_id,
+            message_id=new_msg_id,
         )
         try:
             while len(self._debounce_skip) > 1000:
                 self._debounce_skip.pop()
+            if orig_msg_id:
+                self._debounce_skip.add(orig_msg_id)
             self._debounce_skip.add(str(message.message_id))
         except Exception:  # noqa: BLE001
             pass
-        await StarTools.create_event(
-            abm=message,
-            platform=event.get_platform_name(),
-            is_wake=wake,
-        )
-        if self.config.get("debug_log_injection"):
-            logger.info("Savage Type debounce flushed: %s", text[:60])
+        try:
+            await StarTools.create_event(
+                abm=message,
+                platform=event.get_platform_name(),
+                is_wake=wake,
+            )
+            if self.config.get("debug_log_injection"):
+                logger.info("Savage Type debounce flushed: %s (wake=%s)", text[:60], wake)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Savage Type debounce reinject failed: %s", exc)
 
     def _schedule_unanswered_check(self, event: AstrMessageEvent, meta: dict) -> None:
         """(d) 问句发出后 N 秒没人应答 → Bot 再接话（延迟任务，同群只留一个）。"""
@@ -663,25 +670,65 @@ class SavageTypePlugin(Star):
             return False
         if scope == "private" and not is_private:
             return False
-        if bool(self.config.get("debounce_skip_wake", True)):
-            try:
-                self_id = str(getattr(event.message_obj, "self_id", "") or "")
-            except Exception:  # noqa: BLE001
-                self_id = ""
-            if self_id and has_bot_mention(self.service.addressee_from_event(event), self_id):
-                # 明确 @ 机器人的消息立即回复，不等待。
-                return False
-            # 明确叫了机器人名字/称呼的消息立即回复，不挂起等待
-            names_raw = str(self.config.get("reply_gate_bot_names", "") or "")
-            bot_names = [n.strip() for n in names_raw.replace("，", ",").split(",") if n.strip()]
-            for bname in bot_names:
-                if bname and bname.lower() in text.lower():
-                    return False
+
         text = str(event.message_str or "").strip()
         if not text or text.startswith(("/", "／", "!", "！")):
             return False
         if self._has_image(event):
             return False
+
+        if bool(self.config.get("debounce_skip_wake", True)):
+            # 1. 明确 @ 机器人的消息立即放行，不等待
+            try:
+                self_id = str(getattr(event.message_obj, "self_id", "") or "")
+                if self_id and has_bot_mention(self.service.addressee_from_event(event), self_id):
+                    return False
+            except Exception:  # noqa: BLE001
+                pass
+
+            # 2. 检查 AstrBot 原生事件唤醒标记：已经唤醒的消息直接回复，绝不截停防抖
+            if getattr(event, "is_wake", False) or getattr(event, "_is_wake", False):
+                return False
+            try:
+                if hasattr(event, "get_extra") and event.get_extra("_is_wake"):
+                    return False
+            except Exception:  # noqa: BLE001
+                pass
+
+            # 3. 收集所有可能的 Bot 名字/称呼/唤醒词（包括全局配置与插件配置）
+            bot_names: set[str] = set()
+            try:
+                gate_names = str(self.config.get("reply_gate_bot_names", "") or "")
+                bot_names.update(n.strip() for n in gate_names.replace("，", ",").split(",") if n.strip())
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                p_name = str(self.config.get("bot_name", "") or "").strip()
+                if p_name:
+                    bot_names.add(p_name)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                if hasattr(self, "context") and callable(getattr(self.context, "get_config", None)):
+                    cfg = self.context.get_config()
+                    if cfg:
+                        for key in ("bot_name", "nickname", "wake_words", "custom_wake_words"):
+                            val = cfg.get(key)
+                            if isinstance(val, list):
+                                bot_names.update(str(x).strip() for x in val if str(x).strip())
+                            elif isinstance(val, str) and val.strip():
+                                bot_names.add(val.strip())
+            except Exception:  # noqa: BLE001
+                pass
+
+            # 萨维奇默认名字兜底
+            bot_names.update({"小萨", "萨维奇", "savage", "Savage", "bot", "Bot"})
+
+            text_lower = text.lower()
+            for bname in bot_names:
+                if bname and bname.lower() in text_lower:
+                    return False
+
         try:
             short_chars = self._num("debounce_short_chars", 12, int, 2)
         except (TypeError, ValueError):

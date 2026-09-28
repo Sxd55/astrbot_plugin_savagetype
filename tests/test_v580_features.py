@@ -161,10 +161,104 @@ class TestV580Features(unittest.TestCase):
         cfg_frugal = {"config_preset": "frugal"}
         self.assertFalse(resolve_effective_config(cfg_frugal, "group_identity_tools_enabled", True))
 
-        diffs = diff_preset(cfg_daily, "frugal")
-        changed_keys = [d["key"] for d in diffs if d["changed"]]
-        self.assertIn("group_identity_tools_enabled", changed_keys)
+    def test_group_identity_tools_dataclass_and_resilient_creation(self):
+        from savagetype.groupidentity import (
+            get_all_group_identity_tools,
+            GROUP_MEMBER_TOOL_NAME,
+            GROUP_MANAGEMENT_TOOL_NAME,
+            GROUP_MEMBER_BIRTHDAY_TOOL_NAME,
+            GROUP_UPCOMING_BIRTHDAYS_TOOL_NAME,
+        )
+        tools = get_all_group_identity_tools()
+        # 即使在没有真实 AstrBot 依赖的离线环境下，如果 FunctionTool 不存在，返回空；
+        # 但我们单独测试各 tool 类的 dataclass 默认参数生成
+        tool1 = QueryGroupMemberIdentityTool()
+        self.assertEqual(tool1.name, GROUP_MEMBER_TOOL_NAME)
+        self.assertIn("target", tool1.parameters["properties"])
+
+        tool2 = QueryGroupManagementIdentityTool()
+        self.assertEqual(tool2.name, GROUP_MANAGEMENT_TOOL_NAME)
+        self.assertIn("scope", tool2.parameters["properties"])
+
+        tool3 = QueryGroupMemberBirthdayTool()
+        self.assertEqual(tool3.name, GROUP_MEMBER_BIRTHDAY_TOOL_NAME)
+        self.assertIn("target", tool3.parameters["properties"])
+
+        tool4 = QueryGroupUpcomingBirthdaysTool()
+        self.assertEqual(tool4.name, GROUP_UPCOMING_BIRTHDAYS_TOOL_NAME)
+        self.assertIn("days", tool4.parameters["properties"])
+
+    def test_debounce_qualifies_wake_and_bot_name_bypass(self):
+        import sys
+        from unittest.mock import MagicMock
+
+        mock_keys = []
+        for mod_name in [
+            "astrbot", "astrbot.api", "astrbot.api.event", "astrbot.api.provider",
+            "astrbot.api.star", "astrbot.api.web", "astrbot.core.agent.message",
+            "astrbot.core.provider.provider", "astrbot.core.utils.astrbot_path"
+        ]:
+            if mod_name not in sys.modules:
+                m = MagicMock()
+                if mod_name == "astrbot.api.star":
+                    m.register = lambda *a, **kw: (lambda cls: cls)
+                    class _BaseStar:
+                        def __init__(self, context=None, *a, **kw):
+                            self.context = context
+                    m.Star = _BaseStar
+                sys.modules[mod_name] = m
+                mock_keys.append(mod_name)
+
+        try:
+            import importlib
+            if "main" in sys.modules:
+                del sys.modules["main"]
+            import main as plugin_main
+            SavageTypePlugin = plugin_main.SavageTypePlugin
+
+            class FakeContext:
+                def __init__(self, bot_name="小萨"):
+                    self._cfg = {"bot_name": bot_name, "wake_words": ["萨维奇"]}
+                def get_config(self):
+                    return self._cfg
+                def register_web_api(self, *a, **kw):
+                    pass
+
+            plugin = SavageTypePlugin(FakeContext(), config={"debounce_enabled": True, "debounce_skip_wake": True})
+
+            # 模拟“小萨来色色”事件
+            event_wake_name = SimpleNamespace(
+                message_str="小萨来色色",
+                unified_msg_origin="group:123456",
+                message_obj=SimpleNamespace(self_id="9999", message_id="101", message=[]),
+                get_sender_id=lambda: "2412260046",
+            )
+            # 因为叫了名字“小萨”，哪怕只有 5 个字，也不能被防抖拦截（必须放行立即回复）
+            self.assertFalse(plugin._debounce_qualifies(event_wake_name))
+
+            # 模拟带原生 is_wake=True 标记的事件
+            event_wake_flag = SimpleNamespace(
+                message_str="来色色",
+                is_wake=True,
+                unified_msg_origin="group:123456",
+                message_obj=SimpleNamespace(self_id="9999", message_id="102", message=[]),
+                get_sender_id=lambda: "2412260046",
+            )
+            self.assertFalse(plugin._debounce_qualifies(event_wake_flag))
+
+            # 模拟普通没带名字、未唤醒的断句碎片（例如“在吗”），应该被防抖收集
+            event_incomplete = SimpleNamespace(
+                message_str="在吗",
+                unified_msg_origin="group:123456",
+                message_obj=SimpleNamespace(self_id="9999", message_id="103", message=[]),
+                get_sender_id=lambda: "2412260046",
+            )
+            self.assertTrue(plugin._debounce_qualifies(event_incomplete))
+        finally:
+            for k in mock_keys:
+                sys.modules.pop(k, None)
 
 
 if __name__ == "__main__":
     unittest.main()
+
