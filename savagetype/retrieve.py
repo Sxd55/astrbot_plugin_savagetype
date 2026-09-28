@@ -81,6 +81,69 @@ def _split_tokens(text: str) -> list[str]:
     return buf
 
 
+_KEYWORD_STOPWORDS = {
+    "什么", "怎么", "这个", "那个", "可以", "没有", "觉得", "知道", "喜欢", "讨厌",
+    "不要", "不是", "就是", "还是", "以及", "因为", "所以", "但是", "如果", "虽然",
+    "今天", "明天", "昨天", "现在", "最近", "刚才", "一下", "一次", "一直", "很多",
+    "非常", "特别", "感觉", "告诉", "认识", "记得", "想起", "听说", "看到", "这是",
+    "那是", "哪个", "哪里", "为什么", "什么时候", "多少", "怎样", "还有", "或者"
+}
+
+
+def extract_matchable_terms(texts: list[Any]) -> set[str]:
+    """提取长度 >= 2 且排除纯虚词的关键词集合（支持短语和子分词）。"""
+    terms: set[str] = set()
+    for text in texts:
+        t = str(text or "").strip()
+        if not t:
+            continue
+        # 短短语直接作为完整匹配项（过滤停用虚词）
+        if 2 <= len(t) <= 15 and t not in _KEYWORD_STOPWORDS:
+            terms.add(t.lower())
+        # 对长短句进行切词提取实词
+        try:
+            toks = tokenizer_mod.tokens(t)
+        except Exception:
+            toks = _split_tokens(t)
+        for tok in toks:
+            tok_s = str(tok or "").strip().lower()
+            if len(tok_s) >= 2 and tok_s not in _KEYWORD_STOPWORDS:
+                terms.add(tok_s)
+    return terms
+
+
+def fact_matches_query(query: str, fact: Fact) -> bool:
+    """检查用户 query 是否直接命中了事实的关键词/内容/取值/属性。"""
+    q = (query or "").strip().lower()
+    if len(q) < 2:
+        return False
+    cands: list[Any] = [fact.value, fact.plain]
+    if getattr(fact, "keywords", None):
+        cands.extend(fact.keywords)
+    if getattr(fact, "content", None):
+        cands.append(fact.content)
+    if getattr(fact, "topic", None):
+        cands.append(fact.topic)
+    terms = extract_matchable_terms(cands)
+    return any(term in q for term in terms)
+
+
+def event_matches_query(query: str, event: Event) -> bool:
+    """检查用户 query 是否直接命中了事件的标题/关键词/要点/摘要。"""
+    q = (query or "").strip().lower()
+    if len(q) < 2:
+        return False
+    cands: list[Any] = [event.title]
+    if getattr(event, "keywords", None):
+        cands.extend(event.keywords)
+    if getattr(event, "highlights", None):
+        cands.extend(event.highlights)
+    if getattr(event, "summary", None):
+        cands.append(event.summary)
+    terms = extract_matchable_terms(cands)
+    return any(term in q for term in terms)
+
+
 def rrf_merge(rank_lists: list[list[int]], k: int = 60) -> dict[int, float]:
     scores: dict[int, float] = {}
     for ranks in rank_lists:
@@ -260,21 +323,23 @@ class Retriever:
             filtered: list[RetrievalHit] = []
             for hit in hits:
                 fact = hit.fact
-                if dedup_route and fact.id in skip_ids and not int(getattr(fact, "pinned", 0) or 0):
-                    blocked.append(
-                        RetrievalHit(fact=fact, score=0, source="filter", filter_reason="recently_injected")
-                    )
-                    continue
+                is_matched = fact_matches_query(query, fact)
                 if fact.id in mentioned_ids and not int(getattr(fact, "pinned", 0) or 0):
                     blocked.append(
                         RetrievalHit(fact=fact, score=0, source="filter", filter_reason="query_mentioned")
                     )
                     continue
+                if dedup_route and fact.id in skip_ids and not int(getattr(fact, "pinned", 0) or 0):
+                    if not is_matched:
+                        blocked.append(
+                            RetrievalHit(fact=fact, score=0, source="filter", filter_reason="recently_injected")
+                        )
+                        continue
                 filtered.append(hit)
             hits = mmr(filtered, k=top_k) if len(filtered) != len(hits) else filtered
 
         core, related, uncertain = self._slot(
-            hits, bundle["ids"], core_limit, related_limit, route
+            hits, bundle["ids"], core_limit, related_limit, route, query=query
         )
         # 访问计数原子自增，避免用缓存里的旧 access_count 回写；批量一次提交。
         self.store.bump_access_many([fact.id for fact in core + related])
@@ -354,7 +419,7 @@ class Retriever:
     ) -> list[Event]:
         out: list[Event] = []
         for event in events:
-            if int(event.pinned or 0):
+            if int(event.pinned or 0) or event_matches_query(query_norm, event):
                 out.append(event)
                 continue
             if event.id in event_skip_ids:
@@ -432,25 +497,6 @@ class Retriever:
                 bundle["cache"] = "hit"
                 return bundle
 
-        if route == "low_info":
-            bundle: dict[str, Any] = {
-                "route": route,
-                "path": "skip",
-                "cache": "miss",
-                "hits": [],
-                "blocked": [],
-                "ids": [],
-                "superseded": [],
-                "events": [],
-                "event_blocked": [],
-                "history": [],
-                "history_current": {},
-                "history_label": "",
-            }
-            if self.cache_ttl > 0:
-                self._cache[key] = (time.time(), dict(bundle))
-            return bundle
-
         entity_fact_ids: set[int] = set()
         entity_event_ids: set[int] = set()
         entity_names: list[str] = []
@@ -481,6 +527,30 @@ class Retriever:
             )
             seen = {f.id for f in candidates}
             candidates.extend(f for f in extra if f.id not in seen)
+
+        # 若命中已有实体或具体事实关键词，绝不当 low_info 处理，强制提升为回忆路由
+        if route == "low_info":
+            has_keyword_match = bool(entity_names) or any(fact_matches_query(query, f) for f in candidates)
+            if has_keyword_match:
+                route = "recall"
+            else:
+                bundle: dict[str, Any] = {
+                    "route": route,
+                    "path": "skip",
+                    "cache": "miss",
+                    "hits": [],
+                    "blocked": [],
+                    "ids": [],
+                    "superseded": [],
+                    "events": [],
+                    "event_blocked": [],
+                    "history": [],
+                    "history_current": {},
+                    "history_label": "",
+                }
+                if self.cache_ttl > 0:
+                    self._cache[key] = (time.time(), dict(bundle))
+                return bundle
 
         blocked: list[RetrievalHit] = []
         visible: list[Fact] = []
@@ -607,6 +677,8 @@ class Retriever:
                 score += 0.05
             if fact.speaker_id in ids:
                 score += 0.08
+            if fact_matches_query(query, fact):
+                score += 2.0
             if route == "current_status" and age_days > 2:
                 score -= 0.1
             hits.append(RetrievalHit(fact=fact, score=score, source="rrf"))
@@ -620,14 +692,26 @@ class Retriever:
                 for idx, rel in reranked:
                     if 0 <= idx < len(hits):
                         h = hits[idx]
-                        new_hits.append(RetrievalHit(fact=h.fact, score=rel, source="rerank"))
+                        bonus = 2.0 if fact_matches_query(query, h.fact) else 0.0
+                        new_hits.append(RetrievalHit(fact=h.fact, score=rel + bonus, source="rerank"))
                 if new_hits:
                     hits = new_hits
                     path = "rerank"
             except Exception:  # noqa: BLE001
                 path = "fallback_basic"
 
-        hits = mmr(hits, k=top_k)
+        matched_hits = [h for h in hits if fact_matches_query(query, h.fact)]
+        seen_hit_ids: set[int] = set()
+        final_hits: list[RetrievalHit] = []
+        for h in matched_hits:
+            if h.fact.id not in seen_hit_ids:
+                final_hits.append(h)
+                seen_hit_ids.add(h.fact.id)
+        for h in mmr(hits, k=top_k):
+            if h.fact.id not in seen_hit_ids:
+                final_hits.append(h)
+                seen_hit_ids.add(h.fact.id)
+        hits = final_hits[:top_k]
         superseded = []
         if route in {"recall", "long_term"}:
             superseded = self.store.recent_superseded(ids, persona_id=persona_id, limit=6)[:3]
@@ -676,7 +760,7 @@ class Retriever:
             if end > 0:
                 since = start or 0
                 until = end
-        same_window = isolation in {"owner", "strict"} and bool(window_tag)
+        same_window = (isolation == "strict") and bool(window_tag)
         if same_window:
             candidates = self.store.live_events(
                 window_tag=window_tag,
@@ -748,6 +832,8 @@ class Retriever:
         score += 0.25 * fact_weight(event, now_ts())
         if int(event.pinned or 0):
             score += 0.25
+        if event_matches_query(query, event):
+            score += 2.5
         if route == "current_status" and age_days > 7:
             score -= 0.4
         if route == "time_window":
@@ -906,7 +992,7 @@ class Retriever:
         if persona_id and event.persona_id and event.persona_id != persona_id:
             return "other_persona"
         ids = set(speaker_ids or [])
-        if isolation == "off":
+        if isolation in {"off", "shared"}:
             if set(event.speaker_ids or []) & ids:
                 return ""
             if (window_tag and event.window_tag and event.window_tag == window_tag):
@@ -948,6 +1034,8 @@ class Retriever:
         ids = set(speaker_ids or [speaker_id])
         if fact.speaker_id in ids:
             score += 0.15
+        if fact_matches_query(query, fact):
+            score += 2.5
         if getattr(fact, "scope", "") == SCOPE_OWNER:
             score += 0.12
         if importance_cfg:
@@ -1026,6 +1114,7 @@ class Retriever:
         core_limit: int,
         related_limit: int,
         route: str,
+        query: str = "",
     ) -> tuple[list[Fact], list[Fact], list[Fact]]:
         core: list[Fact] = []
         related: list[Fact] = []
@@ -1037,16 +1126,19 @@ class Retriever:
                 if len(uncertain) < 3:
                     uncertain.append(fact)
                 continue
+            matched = bool(query and fact_matches_query(query, fact))
             if (
-                (
-                    fact.speaker_id in ids
-                    or getattr(fact, "scope", "") == SCOPE_OWNER
-                    or int(getattr(fact, "pinned", 0) or 0)
+                matched
+                or (
+                    (
+                        fact.speaker_id in ids
+                        or getattr(fact, "scope", "") == SCOPE_OWNER
+                        or int(getattr(fact, "pinned", 0) or 0)
+                    )
+                    and fact.confidence >= 0.7
+                    and fact.attribute in {"likes", "dislikes", "name", "identity", "habit", "promise"}
                 )
-                and fact.confidence >= 0.7
-                and fact.attribute in {"likes", "dislikes", "name", "identity", "habit", "promise"}
-                and len(core) < core_limit
-            ):
+            ) and len(core) < core_limit:
                 core.append(fact)
                 continue
             if len(related) < related_limit:

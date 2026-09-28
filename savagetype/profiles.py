@@ -25,6 +25,7 @@ def build_profile(
     facts: list[Fact],
     speaker_name: str = "",
     speaker_ids: list[str] | None = None,
+    query: str = "",
 ) -> dict[str, Any]:
     sid = (speaker_id or "").strip()
     if not sid:
@@ -43,11 +44,21 @@ def build_profile(
             by_attr[fact.attribute].append(fact)
     lines: list[str] = []
     evidence: list[int] = []
+    q = (query or "").strip().lower()
     for attr in CARD_ATTRS:
         items = by_attr.get(attr) or []
         if not items:
             continue
-        items = sorted(items, key=lambda f: (-float(f.confidence or 0), -(f.updated_at or 0)))[:2]
+        def _item_key(f: Fact) -> tuple[int, float, float]:
+            hit = 0
+            if q and len(q) >= 2:
+                v = str(f.value or "").lower()
+                p = str(getattr(f, "plain", "") or "").lower()
+                c = str(f.content or "").lower()
+                if (v and (v in q or q in v)) or (p and q in p) or (c and q in c):
+                    hit = -1
+            return (hit, -float(f.confidence or 0), -(f.updated_at or 0))
+        items = sorted(items, key=_item_key)[:2]
         bits = []
         for fact in items:
             text = clip(getattr(fact, "plain", "") or fact.value or fact.content, 40)

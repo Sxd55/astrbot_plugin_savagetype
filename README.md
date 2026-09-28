@@ -131,7 +131,7 @@
 ### 7. 过滤与来源可见性
 
 - 人格隔离：记忆带 `persona_id`，跨人格不串。
-- **会话隐私隔离**（`memory_session_isolation`，默认 `strict`）：`owner` 档下主人记忆只在主人自己的会话注入；`strict` 档再加一条——私聊来源的记忆（含别人私聊说的）不再注入到群聊，即使被点名。`off` 回到旧行为。
+- **会话隐私隔离与互通**（`memory_session_isolation`，默认 `shared`）：`shared` 档开启全局人物记忆无缝互通（私聊与群聊记忆双向打通，私聊不会再换了个人）；`owner` 档下主人记忆只在主人自己的会话注入；`strict` 档私聊来源的记忆严格不注入到群聊；`off` 完全不隔离。
 - 说话人优先：本人、主人全局条、被点名的人可见；其他人的私事默认不注入。
 - 敏感来源（关系自称）降级为备注或拒收。
 
@@ -308,7 +308,7 @@ pages/console/           面板：index.html / app.js / style.css / shader.js(We
 | `event_enabled` / `event_gap_minutes` / `event_max_hours` / `event_min_messages` | 事件层开关、切段静默、单段最长时长、成段最少用户消息 |
 | `event_merge_minutes` / `event_max_per_run` / `event_provider_id` | 续聊合并窗口、单轮最多整理段数、事件摘要模型（默认回退整理模型） |
 | `event_budget_chars` / `event_max_inject` / `event_archive_days` | 事件注入预算、每轮最多注入条数、事件归档最短天数 |
-| `memory_session_isolation` | 会话隐私隔离：`off` / `owner` / `strict`（默认 strict） |
+| `memory_session_isolation` | 会话隐私隔离与互通：`shared` / `off` / `owner` / `strict`（默认 shared） |
 | `profile_inject_enabled` / `profile_max_chars` | 每轮注入跨会话画像卡（称呼/身份/偏好/语气），默认 开、上限 300 字 |
 | `cross_window_enabled` / `cross_window_minutes` / `cross_window_max_items` / `cross_window_max_chars` | 跨会话衔接：默认 开、窗口 30 分钟、最多 6 条、上限 320 字 |
 | `cross_window_private_to_group` / `cross_window_group_to_group` | 衔接方向：私聊→群、群→群 默认 关（私→私、群→私 恒开） |

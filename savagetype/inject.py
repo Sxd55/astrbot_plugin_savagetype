@@ -254,7 +254,7 @@ def build_pack(
         asking = question_like(str(getattr(result, "query", "") or ""))
         include_promises = _warm_needed(
             route, query_norm, promises, PROMISE_TRIGGER_RE, {"recall", "time_window"}, asking=asking
-        )
+        ) or any(query_norm and (normalize_slot(f.value or "") in query_norm or normalize_slot(f.plain or "") in query_norm) for f in promises)
         include_statuses = _warm_needed(
             route,
             query_norm,
@@ -262,7 +262,7 @@ def build_pack(
             STATUS_TRIGGER_RE,
             {"current_status", "recall", "time_window"},
             asking=asking,
-        )
+        ) or any(query_norm and (normalize_slot(f.value or "") in query_norm or normalize_slot(f.plain or "") in query_norm) for f in statuses)
     else:
         include_promises = bool(promises)
         include_statuses = bool(statuses)
@@ -313,11 +313,14 @@ def build_pack(
             if out_ids is not None:
                 out_ids.extend(f.id for f in kept_history)
     if events and event_limit > 0:
+        from .retrieve import event_matches_query
+        q_raw = str(getattr(result, "query", "") or "")
+        sorted_events = sorted(events, key=lambda e: (0 if event_matches_query(q_raw, e) else 1))
         limit = max(0, int(event_limit if event_limit is not None else 2))
         lines = ["【事件】按时间回忆用；可能不完整，不要当逐字记录。"]
         kept_events: list[Event] = []
         used = 0
-        for event in events[:limit]:
+        for event in sorted_events[:limit]:
             line = render_event(event)
             if event_budget > 0 and used + len(line) > event_budget:
                 break

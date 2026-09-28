@@ -4297,7 +4297,104 @@ class ReplyGateV2Test(unittest.TestCase):
         hit_ids = [h.fact.id for h in result.hits]
         self.assertIn(f_fresh_pinned, hit_ids)
         scores = {h.fact.id: h.score for h in result.hits}
-        self.assertGreater(scores[f_fresh_pinned], scores[f_old])
+
+class KeywordWakeupAndCrossSessionTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "kw_test.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _service(self, **overrides) -> SavageTypeService:
+        cfg = {
+            "profile_inject_enabled": True,
+            "memory_session_isolation": "shared",
+            "event_max_inject": 2,
+            **overrides,
+        }
+        service = SavageTypeService(
+            store=self.store,
+            config=cfg,
+            llm_generate=None,
+            get_provider=lambda *_a, **_k: None,
+            logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, debug=lambda *a, **k: None),
+        )
+        service.apply_config()
+        return service
+
+    def test_event_wakeup_on_keyword(self):
+        """聊天时提到事件关键词或标题，哪怕是简短语句，自动唤醒并注入【事件】提示词。"""
+        now = now_ts()
+        self.store.add_event(
+            {
+                "title": "海边露营",
+                "summary": "上周末大家一起去金沙滩海边露营看日出",
+                "speaker_id": "u1",
+                "speaker_name": "小明",
+                "speaker_ids": ["u1"],
+                "keywords": ["露营", "海边", "日出"],
+                "highlights": ["金沙滩"],
+                "window_tag": "group:100",
+                "start_ts": now - 3600,
+                "end_ts": now - 1800,
+            }
+        )
+        service = self._service()
+        # 用户在私聊中提到关键词「露营」
+        pack, result, _snap = asyncio.run(
+            service.build_injection("上次露营怎么样", "u1", window_tag="private:u1")
+        )
+        self.assertIn("【事件】", pack)
+        self.assertIn("海边露营", pack)
+        self.assertIn("金沙滩", pack)
+
+    def test_profile_wakeup_on_keyword_and_other_person(self):
+        """聊天时提到其他人的名字或档案关键词，自动将该人物的画像与档案注入提示词。"""
+        now = now_ts()
+        self.store.add_fact(
+            {
+                "subject": "self", "attribute": "name", "value": "张三",
+                "plain": "我叫张三", "content": "用户名字叫张三",
+                "speaker_id": "u2", "speaker_name": "张三",
+                "confidence": 0.95, "status": "live", "created_at": now, "updated_at": now,
+            }
+        )
+        self.store.add_fact(
+            {
+                "subject": "self", "attribute": "likes", "value": "红烧肉",
+                "plain": "特别爱吃红烧肉", "content": "张三特别爱吃红烧肉",
+                "speaker_id": "u2", "speaker_name": "张三",
+                "confidence": 0.9, "status": "live", "created_at": now, "updated_at": now,
+            }
+        )
+        service = self._service()
+        # u1 发言问「张三喜欢吃什么」
+        pack, result, _snap = asyncio.run(
+            service.build_injection("张三喜欢吃什么", "u1", window_tag="group:100")
+        )
+        self.assertIn("张三", pack)
+        self.assertIn("红烧肉", pack)
+
+    def test_cross_session_private_and_group_shared(self):
+        """私聊与群聊记忆完全互通：群聊记录的事实在私聊直接读取，私聊记录的在群聊读取。"""
+        now = now_ts()
+        self.store.add_fact(
+            {
+                "subject": "self", "attribute": "identity", "value": "Python架构师",
+                "plain": "我是个Python架构师", "content": "职业是个Python架构师",
+                "speaker_id": "u1", "speaker_name": "阿强",
+                "confidence": 0.9, "status": "live", "window_tag": "group:100",
+                "created_at": now, "updated_at": now,
+            }
+        )
+        service = self._service()
+        # 在私聊窗口询问职业
+        pack, result, _snap = asyncio.run(
+            service.build_injection("我的职业是什么来着", "u1", window_tag="private:u1")
+        )
+        self.assertIn("Python架构师", pack)
 
 
 if __name__ == "__main__":

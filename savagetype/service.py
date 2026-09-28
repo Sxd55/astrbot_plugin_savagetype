@@ -1095,7 +1095,7 @@ class SavageTypeService:
     def session_isolation_mode(self) -> str:
         from .util import session_isolation
 
-        return session_isolation(str(self._cfg_value("memory_session_isolation", "strict")))
+        return session_isolation(str(self._cfg_value("memory_session_isolation", "shared")))
 
     def entity_boost_weight(self) -> float:
         if not bool(self._cfg_value("entity_linking_enabled", True)):
@@ -1227,7 +1227,7 @@ class SavageTypeService:
         name = ""
         if facts:
             name = facts[0].speaker_name or ""
-        return build_profile(canonical, facts, speaker_name=name, speaker_ids=ids)
+        return build_profile(canonical, facts, speaker_name=name, speaker_ids=ids, query=query)
 
     def list_dossiers(self, persona_id: str = "") -> list[dict[str, Any]]:
         out = []
@@ -1243,6 +1243,7 @@ class SavageTypeService:
         persona_id: str = "",
         window_tag: str = "",
         isolation: str = "",
+        query: str = "",
     ) -> tuple[str, dict[str, Any]]:
         """跨会话画像卡（A 层）：同一个人在任何会话里的称呼/身份/偏好/语气锚点。
 
@@ -1276,6 +1277,7 @@ class SavageTypeService:
             window_tag=window_tag,
             isolation=isolation,
             visible=visible,
+            query=query,
         )
         meta["enabled"] = True
         return card, meta
@@ -1816,6 +1818,7 @@ class SavageTypeService:
             window_tag=window_tag,
             event_skip_ids=event_skip_ids,
         )
+        canonical, ids, ask_other = self._retrieval_ctx(query, speaker_id, persona_id)
         learning = self.learning.pack_for(query, persona_id=persona_id, route=result.route)
         dossier = self.dossier_for(
             speaker_id,
@@ -1830,7 +1833,29 @@ class SavageTypeService:
             persona_id=persona_id,
             window_tag=window_tag,
             isolation=self.session_isolation_mode(),
+            query=query,
         )
+        if ask_other and ask_other != canonical:
+            other_profile_card, _ = self.profile_card_for(
+                ask_other,
+                persona_id=persona_id,
+                window_tag=window_tag,
+                isolation=self.session_isolation_mode(),
+                query=query,
+            )
+            if other_profile_card:
+                profile_card = f"{profile_card}\n{other_profile_card}".strip() if profile_card else other_profile_card
+            other_dossier = self.dossier_for(
+                ask_other,
+                persona_id=persona_id,
+                window_tag=window_tag,
+                query=query,
+                isolation=self.session_isolation_mode(),
+            )
+            other_card = other_dossier.get("card") or ""
+            if other_card:
+                card = f"{card}\n{other_card}".strip() if card else other_card
+
         cross_block, cross_meta = self.cross_window_for(
             speaker_id,
             window_tag=window_tag,
@@ -1847,8 +1872,12 @@ class SavageTypeService:
             for h in result.blocked
             if h.filter_reason in {"recently_injected", "query_mentioned"}
         }
-        if card and dossier_ids and dossier_ids.issubset(shown_ids | suppressed_ids):
-            # 档案内容要么已在本轮事实里，要么被去重/新颖度有意压掉：不重复占预算。
+        card_mentions_query = bool(ask_other) or any(
+            len(str(line or "").strip()) >= 2 and any(ch in query for ch in str(line or "").strip().split(":")[-1].split("；"))
+            for line in (dossier.get("lines") or [])
+        )
+        if not card_mentions_query and card and dossier_ids and dossier_ids.issubset(shown_ids | suppressed_ids):
+            # 仅当未提到档案词且全部内容已在本轮事实里时，才省预算置空。
             card = ""
         bot_facts = [
             f

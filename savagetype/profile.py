@@ -57,9 +57,22 @@ def _tone_hint(fact: Fact) -> str:
     return ""
 
 
-def _collect(facts: list[Fact]) -> dict[str, list[str]]:
+def _collect(facts: list[Fact], query: str = "") -> dict[str, list[str]]:
     buckets: dict[str, list[str]] = {key: [] for key in SECTION_ORDER}
-    for fact in facts:
+    q = (query or "").strip().lower()
+
+    def _match_rank(fact: Fact) -> int:
+        if q and len(q) >= 2:
+            val = str(getattr(fact, "value", "") or "").lower()
+            plain = str(getattr(fact, "plain", "") or "").lower()
+            content = str(getattr(fact, "content", "") or "").lower()
+            if (val and (val in q or q in val)) or (plain and q in plain) or (content and q in content):
+                return 0
+        return 1
+
+    ordered_facts = sorted(facts, key=_match_rank) if q else facts
+
+    for fact in ordered_facts:
         if getattr(fact, "mention_policy", "") == "tone":
             continue  # 语气类只在语气行体现，不复述内容
         attr = str(getattr(fact, "attribute", "") or "").strip()
@@ -72,9 +85,14 @@ def _collect(facts: list[Fact]) -> dict[str, list[str]]:
         value = _section_value(fact)
         if not value or value in buckets[attr]:
             continue
-        if len(buckets[attr]) >= PER_ATTR_LIMIT:
+        is_hit = _match_rank(fact) == 0
+        limit = PER_ATTR_LIMIT + 1 if is_hit else PER_ATTR_LIMIT
+        if len(buckets[attr]) >= limit:
             continue
-        buckets[attr].append(value)
+        if is_hit:
+            buckets[attr].insert(0, value)
+        else:
+            buckets[attr].append(value)
     return buckets
 
 
@@ -85,7 +103,7 @@ def _window_visible(fact: Fact, window_tag: str, isolation: str) -> bool:
     """
     mode = (isolation or "").strip().lower()
     current = (window_tag or "").strip()
-    if mode in ("", "off") or not current:
+    if mode in ("", "off", "shared") or not current:
         return True
     origin = str(getattr(fact, "window_tag", "") or "").strip()
     if not origin:
@@ -103,6 +121,7 @@ def build_profile_card(
     window_tag: str = "",
     isolation: str = "",
     visible=None,
+    query: str = "",
 ) -> tuple[str, dict[str, Any]]:
     """组装当前说话人的跨会话画像卡。
 
@@ -134,7 +153,7 @@ def build_profile_card(
         profile = store.get_profile(canonical)
         name = str(getattr(profile, "speaker_name", "") or "").strip() or str(canonical)
 
-    buckets = _collect(facts)
+    buckets = _collect(facts, query=query)
     tone_facts = [
         fact
         for fact in facts

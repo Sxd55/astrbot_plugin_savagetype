@@ -35,7 +35,7 @@ for tool in ("savagetype_recall", "savagetype_remember", "savagetype_navigate"):
 
 # 3. config keys in README section 5 vs schema
 section5 = README.split("## 五、主要配置项")[1].split("\n---\n")[0]
-readme_keys = set(re.findall(r"`([a-z][a-z0-9_]+)`", section5)) - {"off", "owner", "strict"}
+readme_keys = set(re.findall(r"`([a-z][a-z0-9_]+)`", section5)) - {"shared", "off", "owner", "strict"}
 print(f"INFO readme section5 keys found: {len(readme_keys)}")
 for key in sorted(readme_keys):
     check(f"config {key} in schema", key in SCHEMA)
@@ -48,7 +48,7 @@ for key, spec in SCHEMA.items():
     if isinstance(default, bool) or default in ("", None):
         continue
     # find "key ... 默认 X" nearby mentions: search whole README for `key` then 默认
-    pattern = re.compile(rf"`{re.escape(key)}`[^`]*?默认\s*`?([0-9.]+|strict|off|owner)[`，,）)]?", re.S)
+    pattern = re.compile(rf"`{re.escape(key)}`[^`]*?默认\s*`?([0-9.]+|shared|strict|off|owner)[`，,）)]?", re.S)
     for match in pattern.finditer(README):
         claimed = match.group(1)
         actual = str(default)

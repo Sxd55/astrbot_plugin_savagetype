@@ -182,7 +182,10 @@ class TestPresetCommand(unittest.IsolatedAsyncioTestCase):
     async def test_cmd_preset_workflows(self):
         import tempfile
         import os
-        from main import SavageTypePlugin
+        try:
+            from main import SavageTypePlugin
+        except ImportError:
+            raise unittest.SkipTest("astrbot environment not installed")
 
         class MockContext:
             def get_all_stars(self):

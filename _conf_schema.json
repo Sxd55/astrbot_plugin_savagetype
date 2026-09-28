@@ -123,15 +123,16 @@
     "default": 90
   },
   "memory_session_isolation": {
-    "description": "会话隐私隔离",
+    "description": "会话隐私隔离与互通",
     "type": "string",
     "options": [
+      "shared",
       "off",
       "owner",
       "strict"
     ],
-    "hint": "off=不隔离；owner=主人记忆只在主人自己的会话注入；strict=在 owner 基础上，私聊来源的记忆不再注入到群聊。推荐 strict。",
-    "default": "strict"
+    "hint": "shared=全局人物记忆互通（推荐默认：私聊与群聊无缝打通）；off=完全不隔离；owner=主人记忆仅在主人会话可见；strict=私聊记忆严格不进群聊。",
+    "default": "shared"
   },
   "entity_linking_enabled": {
     "description": "实体链接加权",

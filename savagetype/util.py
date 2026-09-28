@@ -188,7 +188,7 @@ def time_window_days(query: str) -> int:
 
 def session_isolation(value: str) -> str:
     mode = (value or "").strip().lower()
-    return mode if mode in {"off", "owner", "strict"} else "strict"
+    return mode if mode in {"off", "owner", "strict", "shared"} else "shared"
 
 
 _RE_YM = re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月")
