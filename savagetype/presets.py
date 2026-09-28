@@ -70,6 +70,31 @@ PRESET_METADATA: dict[str, dict[str, str]] = {
         "unit": "开关",
         "desc": "是否在检索时进行实体识别与同义词扩展",
     },
+    "clean_image_history_context": {
+        "name": "优化图片历史上下文",
+        "unit": "开关",
+        "desc": "历史消息中的旧 Base64 图片自动替换为轻量占位符，大幅降低 Token 消耗",
+    },
+    "clean_tool_history_context": {
+        "name": "优化工具历史上下文",
+        "unit": "开关",
+        "desc": "已闭环的历史大段工具返回结果压缩为轻量占位符，防止撑爆上下文",
+    },
+    "group_identity_tools_enabled": {
+        "name": "群身份查询工具",
+        "unit": "开关",
+        "desc": "为 LLM 提供查询当前群成员身份、群主/管理员及生日月日的工具",
+    },
+    "auto_cache_cleanup_enabled": {
+        "name": "自动清理磁盘缓存",
+        "unit": "开关",
+        "desc": "每日凌晨 00:00 在系统空闲时自动打扫 AstrBot 临时磁盘缓存",
+    },
+    "builtin_command_allowlist_enabled": {
+        "name": "内置指令白名单",
+        "unit": "开关",
+        "desc": "细粒度控制 AstrBot 原生内置指令放行，未授权指令不阻断会话",
+    },
 }
 
 # 历史与别名映射（确保向后完全兼容已有调用与测试）
@@ -94,6 +119,11 @@ PRESET_DEFINITIONS: dict[str, dict[str, Any]] = {
         "window_flow_enabled": True,
         "retrieval_bm25": True,
         "entity_linking_enabled": True,
+        "clean_image_history_context": True,
+        "clean_tool_history_context": True,
+        "group_identity_tools_enabled": True,
+        "auto_cache_cleanup_enabled": True,
+        "builtin_command_allowlist_enabled": False,
     },
     "frugal": {
         # 极致省 Token 档位
@@ -108,6 +138,11 @@ PRESET_DEFINITIONS: dict[str, dict[str, Any]] = {
         "window_flow_enabled": False,
         "retrieval_bm25": True,
         "entity_linking_enabled": False,
+        "clean_image_history_context": True,
+        "clean_tool_history_context": True,
+        "group_identity_tools_enabled": False,
+        "auto_cache_cleanup_enabled": True,
+        "builtin_command_allowlist_enabled": False,
     },
     "assistant": {
         # 群聊助手 / 事实知识档位
@@ -122,6 +157,11 @@ PRESET_DEFINITIONS: dict[str, dict[str, Any]] = {
         "window_flow_enabled": False,
         "retrieval_bm25": True,
         "entity_linking_enabled": True,
+        "clean_image_history_context": True,
+        "clean_tool_history_context": True,
+        "group_identity_tools_enabled": True,
+        "auto_cache_cleanup_enabled": True,
+        "builtin_command_allowlist_enabled": False,
     },
     "rpg": {
         # 跑团与角色扮演档位
@@ -136,6 +176,11 @@ PRESET_DEFINITIONS: dict[str, dict[str, Any]] = {
         "window_flow_enabled": True,
         "retrieval_bm25": True,
         "entity_linking_enabled": True,
+        "clean_image_history_context": True,
+        "clean_tool_history_context": True,
+        "group_identity_tools_enabled": False,
+        "auto_cache_cleanup_enabled": True,
+        "builtin_command_allowlist_enabled": False,
     },
 }
 

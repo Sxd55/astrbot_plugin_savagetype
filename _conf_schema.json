@@ -4,7 +4,7 @@
     "type": "string",
     "options": ["daily", "frugal", "assistant", "rpg", "custom"],
     "labels": ["日常陪伴（推荐平衡档）", "极致省Token（大幅降本70%）", "群聊助手（精准事实/知识优先）", "跑团沉浸扮演（长事件窗口）", "专家自定义（手动自由微调）"],
-    "hint": "直接下拉选择对应场景。预设采用内存 Overlay 遮罩机制接管 10 项核心算法参数（注入预算、初筛条数、核心事实数、关联事实数、近期事件数、抽取阈值、抽取冷却、跨窗口、时间流、实体扩展），绝不擦除您在磁盘上手动保存的配置；随时切回【专家自定义】即可 100% 恢复您的手动微调值。在群聊中输入「/stype preset diff 档位」可直接预览变更清单。",
+    "hint": "直接下拉选择对应场景。预设采用内存 Overlay 遮罩机制接管 15 项核心参数（注入预算、初筛条数、核心事实数、关联事实数、近期事件数、抽取阈值、抽取冷却、跨窗口、时间流、BM25、实体扩展、图片历史瘦身、工具历史瘦身、群身份工具、自动清理缓存），绝不擦除您在磁盘上手动保存的配置；随时切回【专家自定义】即可 100% 恢复您的手动微调值。在群聊中输入「/stype preset diff 档位」可直接预览变更清单。",
     "default": "daily"
   },
   "enabled": {
@@ -926,5 +926,42 @@
     "type": "int",
     "hint": "同一个群两次主动接话的硬间隔（防连续刷屏），0=不限制；比冷却更硬，建议 30-60。",
     "default": 60
+  },
+  "clean_image_history_context": {
+    "description": "优化图片历史上下文",
+    "type": "bool",
+    "hint": "历史消息中的旧 Base64 图片自动替换为轻量占位符，大幅降低多轮对话 Token 消耗（强烈推荐开启）。",
+    "default": true
+  },
+  "clean_tool_history_context": {
+    "description": "优化工具历史上下文",
+    "type": "bool",
+    "hint": "已完成闭环的历史工具返回结果自动压缩为轻量占位符，防止下一轮闲聊被旧搜索/网页结果撑爆（强烈推荐开启）。",
+    "default": true
+  },
+  "group_identity_tools_enabled": {
+    "description": "提供群身份与生日查询工具",
+    "type": "bool",
+    "hint": "为 LLM 提供查询当前群成员身份、群主/管理员名单、成员生日与近期生日的专用工具。",
+    "default": true
+  },
+  "auto_cache_cleanup_enabled": {
+    "description": "自动清理 AstrBot 缓存",
+    "type": "bool",
+    "hint": "每天凌晨 00:00 在系统处于空闲时（无活跃请求、已开机超10分钟）自动打扫 AstrBot 的临时磁盘缓存。",
+    "default": true
+  },
+  "builtin_command_allowlist_enabled": {
+    "description": "自定义开启内置指令",
+    "type": "bool",
+    "hint": "开启后，仅放行白名单中指定的 AstrBot 内置核心指令，其余指令不触发原生唤醒。",
+    "default": false
+  },
+  "builtin_command_allowlist": {
+    "description": "内置指令放行白名单",
+    "type": "list",
+    "hint": "当启用内置指令白名单时允许放行的指令列表，如 help, reset, stats, sid 等。",
+    "default": ["help", "reset", "stats"]
   }
 }
+

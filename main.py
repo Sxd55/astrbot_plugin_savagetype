@@ -26,12 +26,17 @@ try:
     from .savagetype.presets import (
         diff_preset,
         format_preset_diff_text,
+        resolve_effective_config,
         SUPPORTED_PRESETS,
         PRESET_NAMES,
     )
     from .savagetype.slots import apply_slot
     from .savagetype.speak import group_label, parse_intent
     from .savagetype.store import Store
+    from .savagetype.contexthistory import sanitize_request_history
+    from .savagetype.groupidentity import get_all_group_identity_tools, GROUP_IDENTITY_TOOL_NAMES
+    from .savagetype.autoclean import AutoCacheCleanupModule
+    from .savagetype.builtinallow import BuiltinCommandAllowlistModule
     from .savagetype.util import (
         PLUGIN_NAME,
         clip,
@@ -52,12 +57,17 @@ except ImportError:
     from savagetype.presets import (
         diff_preset,
         format_preset_diff_text,
+        resolve_effective_config,
         SUPPORTED_PRESETS,
         PRESET_NAMES,
     )
     from savagetype.slots import apply_slot
     from savagetype.speak import group_label, parse_intent
     from savagetype.store import Store
+    from savagetype.contexthistory import sanitize_request_history
+    from savagetype.groupidentity import get_all_group_identity_tools, GROUP_IDENTITY_TOOL_NAMES
+    from savagetype.autoclean import AutoCacheCleanupModule
+    from savagetype.builtinallow import BuiltinCommandAllowlistModule
     from savagetype.util import (
         PLUGIN_NAME,
         clip,
@@ -108,7 +118,7 @@ def _data_dir() -> Path:
     PLUGIN_NAME,
     "24122",
     "Savage Type 全局人格记忆中枢：事实、改口、审查后的黑话释义与表达样本。",
-    "5.7.0",
+    "5.8.0",
 )
 class SavageTypePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -129,6 +139,8 @@ class SavageTypePlugin(Star):
         self._debounce_hold: dict[str, dict] = {}
         self._debounce_skip: set[str] = set()
         self._gate_pending: dict[str, dict] = {}
+        self.autoclean_module = AutoCacheCleanupModule(logger=logger)
+        self.builtin_allow_module = BuiltinCommandAllowlistModule(logger=logger)
         logger.info("Savage Type loaded, db=%s", self.store.db_path)
 
     async def initialize(self):
@@ -150,11 +162,42 @@ class SavageTypePlugin(Star):
                 logger.warning("Savage Type version backup failed: %s", exc)
         logger.info("Savage Type coexistence: %s", self.service.coexistence.snapshot())
 
+        # 缓存自动定时清理
+        auto_clean = bool(resolve_effective_config(self.config, "auto_cache_cleanup_enabled", True))
+        self.autoclean_module.configure(auto_clean)
+        self.autoclean_module.start()
+
+        # 内置指令白名单放行控制
+        builtin_allow_enabled = bool(resolve_effective_config(self.config, "builtin_command_allowlist_enabled", False))
+        builtin_allowlist = self.config.get("builtin_command_allowlist", ["help", "reset", "stats"])
+        self.builtin_allow_module.configure(enabled=builtin_allow_enabled, allowlist=builtin_allowlist)
+        if builtin_allow_enabled:
+            self.builtin_allow_module.install()
+
+        # 注册群身份/生日查询工具
+        group_tools_enabled = bool(resolve_effective_config(self.config, "group_identity_tools_enabled", True))
+        if group_tools_enabled and hasattr(self.context, "add_llm_tools"):
+            try:
+                tools = get_all_group_identity_tools()
+                if tools:
+                    self.context.add_llm_tools(*tools)
+                    logger.info("Savage Type 已向 LLM 注册 4 个群身份与生日查询工具")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Savage Type 注册群身份工具失败: %s", exc)
+
     async def _send_message(self, umo: str, text: str) -> None:
         chain = MessageChain().message(text)
         await self.context.send_message(umo, chain)
 
     async def terminate(self):
+        self.autoclean_module.terminate()
+        self.builtin_allow_module.terminate()
+        if hasattr(self.context, "unregister_llm_tool"):
+            for tool_name in GROUP_IDENTITY_TOOL_NAMES:
+                try:
+                    self.context.unregister_llm_tool(tool_name)
+                except Exception:
+                    pass
         task = getattr(self.service, "_learn_task", None)
         if task and not task.done():
             task.cancel()
@@ -338,7 +381,17 @@ class SavageTypePlugin(Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        self.autoclean_module.begin_request_activity()
         try:
+            # 优化图片与工具历史上下文（Token 瘦身）
+            clean_images = bool(resolve_effective_config(self.config, "clean_image_history_context", True))
+            clean_tools = bool(resolve_effective_config(self.config, "clean_tool_history_context", True))
+            if clean_images or clean_tools:
+                try:
+                    sanitize_request_history(req, clean_images=clean_images, clean_tools=clean_tools)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Savage Type context history sanitize skipped: %s", exc)
+
             self.service.refresh_coexistence(self.context.get_all_stars())
             if not self.service.inject_ok(event):
                 return
@@ -390,6 +443,8 @@ class SavageTypePlugin(Star):
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Savage Type inject failed: %s", exc)
+        finally:
+            self.autoclean_module.end_request_activity()
 
     @_on_waiting_llm_request()
     async def debounce_collect(self, event: AstrMessageEvent):
