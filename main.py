@@ -543,14 +543,9 @@ class SavageTypePlugin(Star):
         if not merged or event is None:
             return
         self.store.add_diag("debounce", {"chars": len(merged), "fragments": int(hold.get("count", 1))})
+        # 只要能被 debounce 拦截，说明本轮消息本来就已经通过了唤醒检查；
+        # 合并释放重放时必须无条件保持 wake=True 唤醒回复，绝不能降级导致消息丢失。
         wake = True
-        try:
-            if self.service.reply_gate_enabled() and window_kind(event.unified_msg_origin) == "group":
-                # 接话门开着时，合并消息不强制唤醒，交由 reply_gate 按合并文本判定；
-                # 否则概率未中 / 话轮被占也会被强制回复。私聊不受门控，保持唤醒。
-                wake = False
-        except Exception:  # noqa: BLE001
-            wake = True
         await self._reinject(event, merged, wake=wake, extra_components=hold.get("extras"))
 
     async def _reinject(
@@ -676,6 +671,12 @@ class SavageTypePlugin(Star):
             if self_id and has_bot_mention(self.service.addressee_from_event(event), self_id):
                 # 明确 @ 机器人的消息立即回复，不等待。
                 return False
+            # 明确叫了机器人名字/称呼的消息立即回复，不挂起等待
+            names_raw = str(self.config.get("reply_gate_bot_names", "") or "")
+            bot_names = [n.strip() for n in names_raw.replace("，", ",").split(",") if n.strip()]
+            for bname in bot_names:
+                if bname and bname.lower() in text.lower():
+                    return False
         text = str(event.message_str or "").strip()
         if not text or text.startswith(("/", "／", "!", "！")):
             return False
